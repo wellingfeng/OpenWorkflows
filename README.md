@@ -4,19 +4,19 @@
   English | <a href="README.zh-CN.md">中文</a>
 </div>
 
-OpenWorkflow is a visual multi-model AI workflow editor. Its core advantage is that one workflow graph can target different LLM runtimes such as Claude Code, Codex, Gemini, and future local or cloud model adapters.
+Claude Code introduced a Workflow feature for orchestrating multi-agent steps, parallel branches, and pipelines as executable scripts. OpenWorkflow turns that pattern into a visual, multi-model editor: build one Workflow graph, then run or adapt it across Claude Code, Codex, Gemini, and future local or cloud model runtimes.
 
-Build the workflow once, then switch the runtime, tune node-level models, and keep the graph portable through a shared IR.
+The shared IR keeps workflow structure portable while letting each node choose its runtime-facing model, prompt, schema, and execution settings.
 
 ![OpenWorkflow editor screenshot](docs/assets/openworkflow-editor.png)
 
 ## Multi-Model Workflow Support
 
-- Multi-model runtime adapters are the first-class design goal, not an afterthought.
-- The same workflow can be edited visually and targeted at Claude Code, Codex, Gemini, or additional adapters.
-- The canvas stores workflows in a shared IR, so model/runtime choice stays separate from workflow structure.
+- OpenWorkflow extends the Claude Code Workflow idea beyond a single LLM runtime.
+- The same Workflow graph can be edited visually and targeted at Claude Code, Codex, Gemini, or additional adapters.
+- Claude Code-style primitives such as agent steps, parallel branches, and pipelines become portable graph nodes.
 - Each node can carry its own prompt, model tier, schema, and execution settings.
-- The script view compiles the graph into runnable Claude Code-style workflow scripts today, with the adapter layer ready for other model runtimes.
+- The script view compiles the graph into runnable Claude Code-style Workflow scripts today, with the adapter layer ready for other model runtimes.
 
 ## Why OpenWorkflow
 

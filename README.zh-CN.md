@@ -4,19 +4,19 @@
   <a href="README.md">English</a> | 中文
 </div>
 
-OpenWorkflow 是一个面向多种大模型的可视化 AI 工作流编辑器。它最大的亮点是同一份工作流蓝图可以面向 Claude Code、Codex、Gemini，以及未来更多本地或云端大模型运行时。
+Claude Code 引入了 Workflow 功能，可以用脚本编排多智能体步骤、并行分支和流水线。OpenWorkflow 在这个基础上把 Workflow 做成可视化、多大模型的编辑器：同一份 Workflow 蓝图可以面向 Claude Code、Codex、Gemini，以及未来更多本地或云端大模型运行时。
 
-你可以先搭好一套工作流，再切换运行时、调整节点模型，并通过统一 IR 保持工作流结构可复用。
+统一 IR 会保留工作流结构，同时允许每个节点单独配置面向运行时的模型、提示词、schema 和执行参数。
 
 ![OpenWorkflow 编辑器截图](docs/assets/openworkflow-editor.png)
 
 ## 多大模型工作流支持
 
-- 多大模型运行时适配是核心设计目标，不是附加功能。
-- 同一份工作流可以在画布中编辑，并面向 Claude Code、Codex、Gemini 或更多适配器。
-- 画布使用统一 IR 存储工作流，让模型和运行时选择与工作流结构解耦。
+- OpenWorkflow 将 Claude Code 的 Workflow 思路扩展到更多大模型运行时。
+- 同一份 Workflow 蓝图可以在画布中编辑，并面向 Claude Code、Codex、Gemini 或更多适配器。
+- Claude Code 风格的 agent 步骤、并行分支和流水线会变成可复用的图节点。
 - 每个节点都可以单独配置提示词、模型档位、schema 和执行参数。
-- 当前脚本视图可以生成可运行的 Claude Code 风格工作流脚本，适配层也为其他大模型运行时预留了扩展空间。
+- 当前脚本视图可以生成可运行的 Claude Code 风格 Workflow 脚本，适配层也为其他大模型运行时预留了扩展空间。
 
 ## 为什么要做这个
 
