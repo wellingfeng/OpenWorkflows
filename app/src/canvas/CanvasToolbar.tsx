@@ -102,20 +102,22 @@ export default function CanvasToolbar() {
         </span>
         {running && (
           <span
-            className="ml-2 flex shrink-0 items-center gap-1.5 rounded-md border border-accent-2/40 bg-accent-2/10 px-2 py-0.5 text-[11px] font-mono text-accent-2"
+            className="ml-2 flex shrink-0 items-center gap-1.5 rounded-md border border-status-success/40 bg-status-success/10 px-2 py-0.5 text-[11px] font-mono text-status-success"
             title={t(locale, 'canvas.runProgress')}
           >
-            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent-2" />
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-status-success" />
             <span>
               ✓{runStats.success}
               {runStats.error > 0 && (
-                <span className="ml-1 text-[#f78b8b]">✗{runStats.error}</span>
+                <span className="ml-1 text-status-error">✗{runStats.error}</span>
               )}
               {runStats.interrupted > 0 && (
-                <span className="ml-1 text-[#d995a6]">!{runStats.interrupted}</span>
+                <span className="ml-1 text-status-interrupted">
+                  !{runStats.interrupted}
+                </span>
               )}
               {runStats.running > 0 && (
-                <span className="ml-1 text-accent-3">▸{runStats.running}</span>
+                <span className="ml-1 text-status-running">▸{runStats.running}</span>
               )}
             </span>
           </span>
@@ -180,10 +182,10 @@ export default function CanvasToolbar() {
         <button
           type="button"
           onClick={() => stopWorkflow()}
-          className="flex items-center gap-1.5 rounded-md border border-[#f778ba]/40 bg-[#f778ba]/15 px-3 py-1.5 text-xs font-semibold text-[#f778ba] transition-opacity hover:opacity-90"
+          className="flex items-center gap-1.5 rounded-md border border-status-error/40 bg-status-error/15 px-3 py-1.5 text-xs font-semibold text-status-error transition-opacity hover:opacity-90"
           title={t(locale, 'canvas.stopTitle')}
         >
-          <span className="inline-block h-2 w-2 animate-pulse rounded-sm bg-[#f778ba]" />
+          <span className="inline-block h-2 w-2 animate-pulse rounded-sm bg-status-error" />
           <span>{t(locale, 'canvas.runningStop')}</span>
         </button>
       ) : (
@@ -193,8 +195,8 @@ export default function CanvasToolbar() {
           disabled={readOnly}
           className={
             canResume
-              ? 'flex items-center gap-1.5 rounded-md border border-accent-3/50 bg-accent-3/15 px-3 py-1.5 text-xs font-semibold text-accent-3 transition-opacity hover:opacity-90'
-              : 'flex items-center gap-1.5 rounded-md bg-accent-2 px-3 py-1.5 text-xs font-semibold text-[#06231d] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40'
+              ? 'flex items-center gap-1.5 rounded-md border border-status-running/50 bg-status-running/15 px-3 py-1.5 text-xs font-semibold text-status-running transition-opacity hover:opacity-90'
+              : 'flex items-center gap-1.5 rounded-md bg-status-success px-3 py-1.5 text-xs font-semibold text-status-success-contrast transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40'
           }
           title={canResume ? t(locale, 'canvas.resumeTitle') : t(locale, 'canvas.runTitle')}
         >

@@ -323,7 +323,7 @@ describe('Sidebar running progress dot', () => {
     }
   });
 
-  it('locks the new workflow action during an active AI blueprint edit', async () => {
+  it('keeps the new workflow action enabled during an active AI blueprint edit', async () => {
     resetSidebarStore();
     mockState.aiEditingSessions = [SESSION_KEY];
 
@@ -331,7 +331,13 @@ describe('Sidebar running progress dot', () => {
 
     try {
       const button = newWorkflowButton(view.container);
-      expect(button.disabled).toBe(true);
+      expect(button.disabled).toBe(false);
+
+      await act(async () => {
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      });
+
+      expect(mockState.newWorkflow).toHaveBeenCalledTimes(1);
     } finally {
       await view.cleanup();
     }

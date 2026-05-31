@@ -35,6 +35,8 @@ function resetStore(
     runOutputs: {},
     lastRunFailedNodeId: null,
     runningSessionProgress: {},
+    composerDraft: '',
+    composerDrafts: {},
     activeSessionId: ACTIVE_SESSION_KEY.sessionId,
     activeWorkspaceId: ACTIVE_SESSION_KEY.workspaceId,
     historyReady: false,
@@ -124,6 +126,30 @@ describe('workflow read-only guard', () => {
     ).toBe('running');
   });
 
+  it('keeps composer drafts scoped to each workflow session', () => {
+    resetStore('design', false);
+    useStore.setState({
+      activeWorkspaceId: null,
+      activeSessionId: 's_a',
+      composerDraft: '',
+      composerDrafts: {},
+    });
+
+    useStore.getState().setComposerDraft('draft for A');
+    useStore.getState().selectSession('s_b');
+
+    expect(useStore.getState().composerDraft).toBe('');
+
+    useStore.getState().setComposerDraft('draft for B');
+    useStore.getState().selectSession('s_a');
+
+    expect(useStore.getState().composerDraft).toBe('draft for A');
+
+    useStore.getState().selectSession('s_b');
+
+    expect(useStore.getState().composerDraft).toBe('draft for B');
+  });
+
   it.each([
     ['running workflow', 'running', false],
     ['AI blueprint edit', 'design', true],
@@ -161,12 +187,25 @@ describe('workflow read-only guard', () => {
     expect(state.dirty).toBe(false);
   });
 
-  it('keeps new workflow blocked during an active AI blueprint edit', () => {
+  it('allows creating a new workflow during an active AI blueprint edit', () => {
     resetStore('design', true);
-    const before = workflowSnapshot();
 
     useStore.getState().newWorkflow();
 
-    expect(workflowSnapshot()).toBe(before);
+    const state = useStore.getState();
+    const expectedName =
+      state.locale === 'en-US' ? 'Untitled Workflow' : '未命名工作流';
+    expect(state.workflow.meta.name).toBe(expectedName);
+    expect(state.activeSessionId).not.toBe(ACTIVE_SESSION_KEY.sessionId);
+    expect(isWorkflowReadOnly(state)).toBe(false);
+    expect(state.sessions[0]?.id).toBe(state.activeSessionId);
+    expect(state.sessions[0]?.title).toBe(expectedName);
+    expect(state.dirty).toBe(false);
+    expect(
+      sessionLiveStatus(ACTIVE_SESSION_KEY, {
+        runningSessions: [],
+        aiEditingSessions: state.aiEditingSessions,
+      }),
+    ).toBe('aiEditing');
   });
 });

@@ -77,6 +77,7 @@ import {
   initialActiveSessionId,
   modelOptions,
   permissionOptions,
+  PROMPT_DEFAULT_ITEM_MIGRATIONS,
   PROMPT_DEFAULTS_VERSION,
   samplePromptGroups,
   sampleSessions,
@@ -93,6 +94,12 @@ import {
   savePromptGroups,
   savePromptGroupsVersion,
 } from '@/lib/composerStorage';
+import {
+  applyAppearance,
+  type AppearanceSettings,
+  type StylePresetId,
+} from '@/lib/appearance';
+import { loadAppearance, saveAppearance } from '@/lib/appearanceStorage';
 import { autosave, loadLocalWorkflow } from '@/lib/persist';
 import {
   historyStore,
@@ -137,7 +144,9 @@ export type WorkflowSessionKey = {
  * State (pre-existing, unchanged):
  *   workflow, selectedNodeId,
  *   sessions, activeSessionId, messages, promptGroups,
- *   composer, composerDraft, permissionOptions, modelOptions, workspaceHistory
+ *   composer, composerDraft, composerDrafts, permissionOptions, modelOptions,
+ *   workspaceHistory,
+ *   appearance
  * State (added this milestone):
  *   mode ('design'|'running'), runState (Record<id,NodeRunState>),
  *   dirty (boolean), currentFilePath (string|null)
@@ -145,7 +154,8 @@ export type WorkflowSessionKey = {
  * Actions (pre-existing, unchanged signatures):
  *   selectNode(id), setWorkflow(ir), setAdapter(id), runWorkflow(),
  *   newWorkflow(), newSession(), sendPrompt(text), setComposer(patch),
- *   setComposerDraft(text), appendComposerDraft(text), setWorkspace(path)
+ *   setComposerDraft(text), appendComposerDraft(text), setWorkspace(path),
+ *   setStylePresetId(stylePresetId)
  * Actions (added this milestone — graph editing + run/mode control):
  *   addNode(type, params?) -> id, updateNodeParams(id, patch),
  *   updateNodeLabel(id, label), removeNode(id),
@@ -196,11 +206,14 @@ export interface StoreState {
   promptGroups: PromptGroup[];
   locale: Locale;
   promptAutoTranslate: boolean;
+  appearance: AppearanceSettings;
 
   // Composer (AI-input) state — pure UI, never enters the IRGraph.
   composer: ComposerSettings;
   /** Current text in the AI input box. Pure UI state; not persisted. */
   composerDraft: string;
+  /** Per-session draft cache so unsent text stays with its workflow session. */
+  composerDrafts: Record<string, string>;
   /** Incremented when another panel asks the AI input box to focus itself. */
   composerFocusVersion: number;
   permissionOptions: SelectOption[];
@@ -238,8 +251,10 @@ export interface StoreState {
   initHistory: () => void;
   setLocale: (locale: Locale) => void;
   setPromptAutoTranslate: (enabled: boolean) => void;
+  setStylePresetId: (stylePresetId: StylePresetId) => void;
   selectNode: (id: string | null) => void;
   setWorkflow: (ir: IRGraph) => void;
+  openWorkflowSession: (ir: IRGraph, path?: string) => void;
   setAdapter: (adapter: string) => void;
   setGlobalRunSelection: (selection: GatewaySelection) => void;
   /** Clear the composer model pin so it inherits the Settings-active provider. */
@@ -343,6 +358,10 @@ type WorkflowReadOnlyState = Pick<
   StoreState,
   'mode' | 'activeWorkspaceId' | 'activeSessionId' | 'aiEditingSessions'
 >;
+type ComposerDraftState = Pick<
+  StoreState,
+  'activeWorkspaceId' | 'activeSessionId' | 'composerDraft' | 'composerDrafts'
+>;
 type SessionLiveStatusState = Pick<
   StoreState,
   'runningSessions' | 'aiEditingSessions'
@@ -373,6 +392,28 @@ function hasSessionKey(
 
 export function workflowSessionKeyId(sessionKey: WorkflowSessionKey): string {
   return `${sessionKey.workspaceId ?? ''}::${sessionKey.sessionId ?? ''}`;
+}
+
+function composerDraftForSession(
+  drafts: Record<string, string>,
+  sessionKey: WorkflowSessionKey,
+): string {
+  return drafts[workflowSessionKeyId(sessionKey)] ?? '';
+}
+
+function composerDraftPatchForSession(
+  state: ComposerDraftState,
+  sessionKey: WorkflowSessionKey,
+): Pick<StoreState, 'composerDraft' | 'composerDrafts'> {
+  const currentKey = workflowSessionKeyId(activeWorkflowSessionKey(state));
+  const composerDrafts =
+    state.composerDrafts[currentKey] === state.composerDraft
+      ? state.composerDrafts
+      : { ...state.composerDrafts, [currentKey]: state.composerDraft };
+  return {
+    composerDrafts,
+    composerDraft: composerDraftForSession(composerDrafts, sessionKey),
+  };
 }
 
 export function isActiveAiEditingSession(
@@ -665,24 +706,6 @@ function scheduleCanvasViewportPersist(
         .catch(() => undefined);
     }, CANVAS_VIEWPORT_PERSIST_DEBOUNCE_MS),
   );
-}
-
-function addAiEditingSession(sessionKey: WorkflowSessionKey): void {
-  useStore.setState((state) =>
-    hasSessionKey(state.aiEditingSessions, sessionKey)
-      ? state
-      : { aiEditingSessions: [...state.aiEditingSessions, sessionKey] },
-  );
-}
-
-function removeAiEditingSession(sessionKey: WorkflowSessionKey): void {
-  useStore.setState((state) => {
-    const aiEditingSessions = state.aiEditingSessions.filter(
-      (item) => !sameSessionKey(item, sessionKey),
-    );
-    if (aiEditingSessions.length === state.aiEditingSessions.length) return state;
-    return { aiEditingSessions };
-  });
 }
 
 function updateSessionRunStatus(
@@ -990,6 +1013,32 @@ function workflowWithRunSnapshot(
   return { ...workflow, meta: { ...workflow.meta, run: snapshot } };
 }
 
+function prepareGraphEdit(currentWorkflow: IRGraph, ir: IRGraph): IRGraph {
+  const trustedLayout: IRLayout = {};
+  for (const node of ir.nodes) {
+    const pos = currentWorkflow.layout?.[node.id];
+    if (pos) trustedLayout[node.id] = { x: pos.x, y: pos.y };
+  }
+  const irWithTrustedLayout = { ...ir, layout: trustedLayout };
+  const shouldRelayout =
+    hasStructuralChanges(currentWorkflow, ir) ||
+    hasMissingLayout(irWithTrustedLayout);
+  let nextWorkflow = shouldRelayout
+    ? autoLayoutGraph(irWithTrustedLayout, currentWorkflow, { relayout: 'all' })
+    : irWithTrustedLayout;
+  nextWorkflow = workflowWithoutRunSnapshot(nextWorkflow);
+  if (
+    !nextWorkflow.meta.gateway?.defaults &&
+    currentWorkflow.meta.gateway?.defaults
+  ) {
+    nextWorkflow = withGatewayDefaults(
+      nextWorkflow,
+      currentWorkflow.meta.gateway.defaults,
+    );
+  }
+  return nextWorkflow;
+}
+
 function commitGraphEdit(
   ir: IRGraph,
   source: WorkflowWriteSource = 'user',
@@ -997,22 +1046,7 @@ function commitGraphEdit(
 ): boolean {
   let nextWorkflow = ir;
   return applyWorkflowEdit(source, (state) => {
-    const trustedLayout: IRLayout = {};
-    for (const node of ir.nodes) {
-      const pos = state.workflow.layout?.[node.id];
-      if (pos) trustedLayout[node.id] = { x: pos.x, y: pos.y };
-    }
-    const irWithTrustedLayout = { ...ir, layout: trustedLayout };
-    const shouldRelayout =
-      hasStructuralChanges(state.workflow, ir) ||
-      hasMissingLayout(irWithTrustedLayout);
-    nextWorkflow = shouldRelayout
-      ? autoLayoutGraph(irWithTrustedLayout, state.workflow, { relayout: 'all' })
-      : irWithTrustedLayout;
-    nextWorkflow = workflowWithoutRunSnapshot(nextWorkflow);
-    if (!nextWorkflow.meta.gateway?.defaults && state.workflow.meta.gateway?.defaults) {
-      nextWorkflow = withGatewayDefaults(nextWorkflow, state.workflow.meta.gateway.defaults);
-    }
+    nextWorkflow = prepareGraphEdit(state.workflow, ir);
     return {
       workflow: nextWorkflow,
       selectedNodeId: null,
@@ -1165,12 +1199,16 @@ async function createNewChatSession(): Promise<void> {
   const workspaceId = state.activeWorkspaceId;
   if (!state.historyReady || !workspaceId) {
     const session = makeSession(state.locale);
-    useStore.setState({
-      sessions: [session, ...state.sessions],
+    useStore.setState((s) => ({
+      sessions: [session, ...s.sessions],
       activeSessionId: session.id,
       messages: [],
       canvasViewport: null,
-    });
+      ...composerDraftPatchForSession(s, {
+        workspaceId: s.activeWorkspaceId ?? null,
+        sessionId: session.id,
+      }),
+    }));
     return;
   }
 
@@ -1183,14 +1221,18 @@ async function createNewChatSession(): Promise<void> {
   const session = sessionFromRecord(record);
   const workspaces = await historyStore.listWorkspaces();
   const sessionTree = await loadSessionTree(workspaces);
-  useStore.setState({
+  useStore.setState((s) => ({
     workspaces,
     sessions: sessionTree[workspaceId] ?? [session],
     sessionTree,
     activeSessionId: session.id,
     messages: [],
     canvasViewport: null,
-  });
+    ...composerDraftPatchForSession(s, {
+      workspaceId,
+      sessionId: session.id,
+    }),
+  }));
   await historyStore.patchConfig({
     lastActiveWorkspaceId: workspaceId,
     lastActiveSessionId: session.id,
@@ -1199,41 +1241,19 @@ async function createNewChatSession(): Promise<void> {
 
 async function createNewWorkflowSession(): Promise<void> {
   const state = useStore.getState();
-  // New workflow switches context; it does not mutate the running blueprint.
-  // Keep blocking only while the active session has an in-flight AI graph edit.
-  if (isActiveAiEditingSession(state)) return;
-
   const workspaceId = state.activeWorkspaceId;
   const workflow = defaultBlueprint(
     state.locale === 'en-US' ? 'Untitled Workflow' : '未命名工作流',
   );
+  const title =
+    workflow.meta.name ??
+    (state.locale === 'en-US' ? 'New Workflow' : '新建工作流');
+  if (state.mode === 'running' || isActiveAiEditingSession(state)) {
+    await openWorkflowInSession(workflow);
+    return;
+  }
   if (!state.historyReady || !workspaceId) {
-    if (state.mode === 'running') {
-      const createdAt = Date.now();
-      const session: Session = {
-        id: shortId('s'),
-        title:
-          workflow.meta.name ??
-          (state.locale === 'en-US' ? 'New Workflow' : '新建工作流'),
-        createdAt,
-        updatedAt: createdAt,
-        isWorkflow: true,
-      };
-      useStore.setState({
-        workflow,
-        selectedNodeId: null,
-        dirty: false,
-        runState: {},
-        runOutputs: {},
-        lastRunFailedNodeId: null,
-        canvasViewport: null,
-        mode: 'design',
-        sessions: [session, ...state.sessions],
-        activeSessionId: session.id,
-      });
-      return;
-    }
-    useStore.setState({
+    useStore.setState((s) => ({
       workflow,
       selectedNodeId: null,
       dirty: false,
@@ -1242,7 +1262,15 @@ async function createNewWorkflowSession(): Promise<void> {
       lastRunFailedNodeId: null,
       canvasViewport: null,
       mode: 'design',
-    });
+      composerDrafts: {
+        ...s.composerDrafts,
+        [workflowSessionKeyId({
+          workspaceId: s.activeWorkspaceId ?? null,
+          sessionId: s.activeSessionId,
+        })]: '',
+      },
+      composerDraft: '',
+    }));
     return;
   }
 
@@ -1250,14 +1278,12 @@ async function createNewWorkflowSession(): Promise<void> {
     workspaceId,
     isWorkflow: true,
     workflow,
-    title:
-      workflow.meta.name ??
-      (state.locale === 'en-US' ? 'New Workflow' : '新建工作流'),
+    title,
   });
   const session = sessionFromRecord(record);
   const workspaces = await historyStore.listWorkspaces();
   const sessionTree = await loadSessionTree(workspaces);
-  useStore.setState({
+  useStore.setState((s) => ({
     workflow,
     selectedNodeId: null,
     dirty: false,
@@ -1271,7 +1297,97 @@ async function createNewWorkflowSession(): Promise<void> {
     sessionTree,
     activeSessionId: session.id,
     messages: [],
+    ...composerDraftPatchForSession(s, {
+      workspaceId,
+      sessionId: session.id,
+    }),
+  }));
+  await historyStore.patchConfig({
+    lastActiveWorkspaceId: workspaceId,
+    lastActiveSessionId: session.id,
   });
+}
+
+async function openWorkflowInSession(ir: IRGraph, path?: string): Promise<void> {
+  const state = useStore.getState();
+  const workflow = restoreWorkflowRunSnapshot(
+    migrateWorkflowGateway(ir, defaultComposer.model),
+  );
+  const runProgress = runProgressFromSnapshot(workflow, workflow.meta.run ?? null);
+  const title =
+    workflow.meta.name ??
+    (state.locale === 'en-US' ? 'Workflow' : '工作流');
+
+  if (!isWorkflowReadOnly(state)) {
+    applyWorkflowEdit(
+      'user',
+      () => ({ workflow, ...runProgress }),
+      workflow.meta.run ? runMetaFromSnapshot(workflow.meta.run) : emptyRunMeta(),
+    );
+    useStore.getState().markSaved(path);
+    return;
+  }
+
+  const workspaceId = state.activeWorkspaceId;
+  if (!state.historyReady || !workspaceId) {
+    const createdAt = Date.now();
+    const session: Session = {
+      id: shortId('s'),
+      title,
+      createdAt,
+      updatedAt: createdAt,
+      isWorkflow: true,
+    };
+    useStore.setState((s) => ({
+      workflow,
+      selectedNodeId: null,
+      dirty: false,
+      runState: runProgress.runState,
+      runOutputs: runProgress.runOutputs,
+      lastRunFailedNodeId: runProgress.lastRunFailedNodeId,
+      canvasViewport: null,
+      mode: 'design',
+      currentFilePath: path ?? null,
+      sessions: [session, ...s.sessions],
+      activeSessionId: session.id,
+      messages: [],
+      ...composerDraftPatchForSession(s, {
+        workspaceId: s.activeWorkspaceId ?? null,
+        sessionId: session.id,
+      }),
+    }));
+    return;
+  }
+
+  const record = await historyStore.createSession({
+    workspaceId,
+    isWorkflow: true,
+    workflow,
+    title,
+  });
+  const session = sessionFromRecord(record);
+  const workspaces = await historyStore.listWorkspaces();
+  const sessionTree = await loadSessionTree(workspaces);
+  useStore.setState((s) => ({
+    workflow,
+    selectedNodeId: null,
+    dirty: false,
+    runState: runProgress.runState,
+    runOutputs: runProgress.runOutputs,
+    lastRunFailedNodeId: runProgress.lastRunFailedNodeId,
+    canvasViewport: null,
+    mode: 'design',
+    currentFilePath: path ?? null,
+    workspaces,
+    sessions: sessionTree[workspaceId] ?? [session],
+    sessionTree,
+    activeSessionId: session.id,
+    messages: [],
+    ...composerDraftPatchForSession(s, {
+      workspaceId,
+      sessionId: session.id,
+    }),
+  }));
   await historyStore.patchConfig({
     lastActiveWorkspaceId: workspaceId,
     lastActiveSessionId: session.id,
@@ -1285,7 +1401,42 @@ async function activateHistorySession(
   const state = useStore.getState();
   const targetWorkspaceId = workspaceId ?? state.activeWorkspaceId ?? undefined;
   if (!state.historyReady || !targetWorkspaceId) {
-    useStore.setState({ activeSessionId: sessionId, canvasViewport: null });
+    useStore.setState((s) => ({
+      activeSessionId: sessionId,
+      canvasViewport: null,
+      ...(() => {
+        const run = getRunChannel(s.activeWorkspaceId ?? null, sessionId);
+        const liveRun = runActive(run) ? run : null;
+        if (liveRun) {
+          return {
+            messages: liveRun.messages,
+            workflow: liveRun.workflow,
+            runState: liveRun.runState,
+            runOutputs: liveRun.runOutputs,
+            lastRunFailedNodeId: liveRun.failedNodeId,
+            mode: 'running' as const,
+          };
+        }
+        const aiEdit = getAiEditChannel(s.activeWorkspaceId ?? null, sessionId);
+        const liveAiEdit = aiEditActive(aiEdit) ? aiEdit : null;
+        const aiEditSnapshot =
+          liveAiEdit ?? getAiEditSnapshot(s.activeWorkspaceId ?? null, sessionId);
+        if (aiEditSnapshot) {
+          return {
+            messages: aiEditSnapshot.messages,
+            workflow: aiEditSnapshot.workflow,
+            selectedNodeId: null,
+            ...emptyRunProgress(),
+            mode: 'design' as const,
+          };
+        }
+        return {};
+      })(),
+      ...composerDraftPatchForSession(s, {
+        workspaceId: s.activeWorkspaceId ?? null,
+        sessionId,
+      }),
+    }));
     return;
   }
 
@@ -1301,9 +1452,13 @@ async function activateHistorySession(
   // crucially does NOT cancel its CLI processes.
   const ch = getRunChannel(targetWorkspaceId, session.id);
   const liveRun = runActive(ch) ? ch : null;
+  const aiCh = getAiEditChannel(targetWorkspaceId, session.id);
+  const liveAiEdit = aiEditActive(aiCh) ? aiCh : null;
 
   const workflow = liveRun
     ? liveRun.workflow
+    : liveAiEdit
+      ? liveAiEdit.workflow
     : restoreWorkflowRunSnapshot(record.workflow ?? state.workflow, record.meta);
   const runProgress = liveRun
     ? {
@@ -1311,6 +1466,8 @@ async function activateHistorySession(
         runOutputs: liveRun.runOutputs,
         lastRunFailedNodeId: liveRun.failedNodeId,
       }
+    : liveAiEdit
+      ? emptyRunProgress()
     : runProgressFromSnapshot(workflow, workflow.meta.run ?? null);
   const canvasViewport = canvasViewportForSession(
     targetWorkspaceId,
@@ -1318,6 +1475,10 @@ async function activateHistorySession(
     record.meta,
   );
   useStore.setState((s) => {
+    const draftPatch = composerDraftPatchForSession(s, {
+      workspaceId: targetWorkspaceId,
+      sessionId: session.id,
+    });
     const composer = workspace
       ? { ...s.composer, workspace: workspace.path }
       : s.composer;
@@ -1333,6 +1494,7 @@ async function activateHistorySession(
       activeSessionId: session.id,
       composer,
       workspaceHistory,
+      ...draftPatch,
       sessions: s.sessionTree[targetWorkspaceId] ?? [session],
       sessionTree: {
         ...s.sessionTree,
@@ -1343,7 +1505,11 @@ async function activateHistorySession(
           ),
       ],
       },
-      messages: liveRun ? liveRun.messages : record.messages,
+      messages: liveRun
+        ? liveRun.messages
+        : liveAiEdit
+          ? liveAiEdit.messages
+          : record.messages,
       workflow,
       ...runProgress,
       canvasViewport,
@@ -1402,6 +1568,10 @@ async function activateWorkspacePath(path: string): Promise<void> {
     canvasViewport,
     mode: 'design',
     composer: { ...s.composer, workspace: trimmed },
+    ...composerDraftPatchForSession(s, {
+      workspaceId: workspace.id,
+      sessionId: active?.id ?? null,
+    }),
   }));
   await historyStore.patchConfig({
     lastActiveWorkspaceId: workspace.id,
@@ -1481,6 +1651,10 @@ async function initHistoryFromDisk(): Promise<void> {
         ...s.composer,
         workspace: workspace.path || s.composer.workspace,
       },
+      ...composerDraftPatchForSession(s, {
+        workspaceId: workspace.id,
+        sessionId: active?.id ?? null,
+      }),
     }));
     void maybeRunCcSwitchAutoImportOnFirstRun();
     await historyStore.patchConfig({
@@ -1532,6 +1706,7 @@ const seedComposer: ComposerSettings = (() => {
 })();
 const seedLocale = loadLocale();
 const seedPromptAutoTranslate = loadPromptAutoTranslate();
+const seedAppearance = loadAppearance();
 
 // Seed the graph from the last autosaved workflow if present, otherwise start
 // from a fresh default blueprint (start → agent → end). We deliberately do NOT
@@ -1551,15 +1726,15 @@ const seedRunProgress = runProgressFromSnapshot(
 );
 
 /**
- * Seed the prompt library, merging newly-shipped default groups into the user's
- * persisted library.
+ * Seed the prompt library, merging newly-shipped default groups and selected
+ * default prompt items into the user's persisted library.
  *
  * Without this, adding a default group to `samplePromptGroups` would never show
  * up for users who already have a persisted library (loadPromptGroups() wins),
  * silently hiding new defaults. The merge runs once per PROMPT_DEFAULTS_VERSION
  * bump (tracked in localStorage): any default group whose `id` is absent from
- * the persisted set is appended, preserving all of the user's own edits and not
- * resurrecting groups they deliberately deleted in earlier versions.
+ * the persisted set is appended, and item migrations add specific new prompts
+ * inside existing default groups while preserving the user's own edits.
  */
 function seedPromptGroups(): PromptGroup[] {
   const stored = loadPromptGroups();
@@ -1568,8 +1743,29 @@ function seedPromptGroups(): PromptGroup[] {
 
   const existing = new Set(stored.map((g) => g.id));
   const additions = samplePromptGroups.filter((g) => !existing.has(g.id));
-  const merged = additions.length ? [...stored, ...additions] : stored;
-  if (additions.length) savePromptGroups(merged);
+  let merged = additions.length ? [...stored, ...additions] : stored;
+  let changed = additions.length > 0;
+
+  for (const migration of PROMPT_DEFAULT_ITEM_MIGRATIONS) {
+    const defaultGroup = samplePromptGroups.find(
+      (g) => g.id === migration.groupId,
+    );
+    const defaultItem = defaultGroup?.items.find(
+      (item) => item.id === migration.itemId,
+    );
+    if (!defaultItem) continue;
+
+    merged = merged.map((group) => {
+      if (group.id !== migration.groupId) return group;
+      if (group.items.some((item) => item.id === migration.itemId)) {
+        return group;
+      }
+      changed = true;
+      return { ...group, items: [...group.items, defaultItem] };
+    });
+  }
+
+  if (changed) savePromptGroups(merged);
   savePromptGroupsVersion(PROMPT_DEFAULTS_VERSION);
   return merged;
 }
@@ -1605,11 +1801,13 @@ export const useStore = create<StoreState>((set) => ({
   promptGroups: seedPromptGroupsValue,
   locale: seedLocale,
   promptAutoTranslate: seedPromptAutoTranslate,
+  appearance: seedAppearance,
 
   // Composer settings seeded from the sample option lists, overlaid with any
   // persisted selections.
   composer: seedComposer,
   composerDraft: '',
+  composerDrafts: {},
   composerFocusVersion: 0,
   permissionOptions,
   modelOptions,
@@ -1638,6 +1836,13 @@ export const useStore = create<StoreState>((set) => ({
     savePromptAutoTranslate(enabled);
   },
 
+  setStylePresetId: (stylePresetId) => {
+    const appearance: AppearanceSettings = { stylePresetId };
+    set({ appearance });
+    saveAppearance(appearance);
+    applyAppearance(appearance);
+  },
+
   selectNode: (id) => set({ selectedNodeId: id }),
 
   setWorkflow: (ir) => {
@@ -1653,6 +1858,10 @@ export const useStore = create<StoreState>((set) => ({
       () => ({ workflow, ...runProgress }),
       workflow.meta.run ? runMetaFromSnapshot(workflow.meta.run) : emptyRunMeta(),
     );
+  },
+
+  openWorkflowSession: (ir, path) => {
+    void openWorkflowInSession(ir, path).catch(() => {});
   },
 
   // Switch the target runtime adapter (Claude Code / Codex / Gemini). The
@@ -1712,6 +1921,7 @@ export const useStore = create<StoreState>((set) => ({
     void createNewWorkflowSession(),
 
   newSession: () => {
+    if (useStore.getState().aiStreaming) return;
     void createNewChatSession();
   },
 
@@ -1752,7 +1962,7 @@ export const useStore = create<StoreState>((set) => ({
     const trimmed = text.trim();
     if (!trimmed) return;
     const state = useStore.getState();
-    if (isWorkflowReadOnly(state)) return;
+    if (state.aiStreaming || isWorkflowReadOnly(state)) return;
     const aiEditingSession = activeWorkflowSessionKey(state);
     const capturedStartInputs: string[] = [trimmed];
 
@@ -1762,25 +1972,39 @@ export const useStore = create<StoreState>((set) => ({
       text: trimmed,
       createdAt: Date.now(),
     };
-    const promptState = useStore.getState();
     const promptUpdate = applyPromptTitle(
-      promptState,
+      state,
       trimmed,
       userMsg.createdAt,
     );
-    set((s) => ({
-      messages: [...s.messages, userMsg],
-      sessions: promptUpdate.sessions,
-      sessionTree: promptUpdate.sessionTree,
+    const ch: AiEditChannel = {
+      key: runKey(aiEditingSession.workspaceId, aiEditingSession.sessionId),
+      workspaceId: aiEditingSession.workspaceId,
+      sessionId: aiEditingSession.sessionId,
       workflow: promptUpdate.workflow,
-    }));
+      messages: [...state.messages, userMsg],
+    };
+    addAiEditChannel(ch);
+    if (aiEditViewActive(ch)) {
+      set({
+        messages: ch.messages,
+        sessions: promptUpdate.sessions,
+        sessionTree: promptUpdate.sessionTree,
+        workflow: ch.workflow,
+      });
+    }
+    updateAiEditSessionSummary(ch);
     const promptWorkflowName =
       promptUpdate.workflow.meta.name !== state.workflow.meta.name
         ? promptUpdate.workflow.meta.name
         : null;
-    void persistMessage(userMsg);
+    if (ch.workspaceId && ch.sessionId) {
+      void historyStore
+        .appendMessage(ch.workspaceId, ch.sessionId, userMsg)
+        .catch(() => {});
+    }
 
-    const ir = useStore.getState().workflow;
+    const ir = ch.workflow;
     const gatewaySelection = workflowGatewaySelection(ir, state.composer.model);
     const directRoute = resolveDirectGatewayRoute(gatewaySelection);
     const inTauri = isTauri();
@@ -1794,23 +2018,25 @@ export const useStore = create<StoreState>((set) => ({
         text: txt,
         createdAt: Date.now(),
       };
-      set((s) => ({ messages: [...s.messages, msg] }));
-      void persistMessage(msg);
+      ch.messages = [...ch.messages, msg];
+      aiEditCommitMessages(ch, true);
     };
 
     // No API key and no desktop CLI: local keyword fallback.
     if (!useApi && !useCli) {
       const result = applyIntent(ir, trimmed);
       if (result.changed) {
-        useStore
-          .getState()
-          .applyGraphEdit(appendStartUserInputs(result.ir, capturedStartInputs));
+        commitAiChannelBlueprint(
+          ch,
+          appendStartUserInputs(result.ir, capturedStartInputs),
+        );
         pushAssistant(`⟳ 已修改蓝图 (本地意图引擎)。${result.note}`);
       } else {
         pushAssistant(
           `当前环境无法调用所选运行时。请在桌面版中使用本地 CLI，或切回 Claude Code 并配置 API key。\n（本地意图引擎：${result.note}）`,
         );
       }
+      removeAiEditChannel(ch);
       return;
     }
 
@@ -1843,15 +2069,7 @@ export const useStore = create<StoreState>((set) => ({
         capturedStartInputs,
       );
     const commitAiBlueprint = (nextIr: IRGraph): 'ok' | 'stale' | 'locked' => {
-      if (
-        !sameSessionKey(
-          activeWorkflowSessionKey(useStore.getState()),
-          aiEditingSession,
-        )
-      ) {
-        return 'stale';
-      }
-      return commitGraphEdit(nextIr, 'ai', aiEditingSession) ? 'ok' : 'locked';
+      return commitAiChannelBlueprint(ch, nextIr) ? 'ok' : 'locked';
     };
     const capturedAnswerText = (
       req: InteractionRequest,
@@ -1865,27 +2083,23 @@ export const useStore = create<StoreState>((set) => ({
     // Explicit clarification mode may ask questions via the interaction
     // protocol. Normal edit mode goes straight for a blueprint and gets one
     // stricter retry if the model returns prose/markdown without an IRGraph.
-    addAiEditingSession(aiEditingSession);
-    set({ aiStreaming: true });
-
     let activeId = '';
     const newBubble = (initial: string) => {
       const id = shortId('m');
       activeId = id;
-      set((s) => ({
-        messages: [
-          ...s.messages,
-          { id, role: 'assistant', text: initial, createdAt: Date.now() },
-        ],
-      }));
+      ch.messages = [
+        ...ch.messages,
+        { id, role: 'assistant', text: initial, createdAt: Date.now() },
+      ];
+      aiEditCommitMessages(ch, false);
     };
-    const setActive = (txt: string) => {
-      set((s) => ({
-        messages: s.messages.map((m) =>
-          m.id === activeId ? { ...m, text: txt } : m,
-        ),
-      }));
+    const setActive = (txt: string, persist = false) => {
+      ch.messages = ch.messages.map((m) =>
+        m.id === activeId ? { ...m, text: txt } : m,
+      );
+      aiEditCommitMessages(ch, persist);
     };
+    const persistAiMessages = () => aiEditCommitMessages(ch, true);
 
     // Split a full reply into explanation + optional IRGraph and apply it to the
     // active bubble. Only called once the AI is done asking (no interaction block).
@@ -1909,7 +2123,7 @@ export const useStore = create<StoreState>((set) => ({
                       : '⚠ 蓝图未更新：当前 workflow 处于只读状态，无法写入 AI 生成的蓝图。',
                   ),
                 );
-                void persistCurrentMessages();
+                persistAiMessages();
                 return;
               }
               setActive(
@@ -1917,7 +2131,7 @@ export const useStore = create<StoreState>((set) => ({
                   `✓ 已更新蓝图（${nextIr.nodes.length} 节点 / ${nextIr.edges.length} 边）。`,
                 ),
               );
-              void persistCurrentMessages();
+              persistAiMessages();
               return;
             }
           } catch {
@@ -1930,7 +2144,7 @@ export const useStore = create<StoreState>((set) => ({
             `${head}⚠ 蓝图未更新：这次模型只给了说明、没有输出可写入的蓝图。\n请把需求写得更具体（例如“在 X 节点后加一个 Y 节点”），或再发送一次让我据此改图。`,
           ),
         );
-        void persistCurrentMessages();
+        persistAiMessages();
         return;
       }
       try {
@@ -1949,7 +2163,7 @@ export const useStore = create<StoreState>((set) => ({
                 : '⚠ 蓝图未更新：当前 workflow 处于只读状态，无法写入 AI 生成的蓝图。',
             ),
           );
-          void persistCurrentMessages();
+          persistAiMessages();
           return;
         }
         const head = explanation ? `${explanation}\n\n` : '';
@@ -1958,12 +2172,12 @@ export const useStore = create<StoreState>((set) => ({
             `${head}✓ 已更新蓝图（${nextIr.nodes.length} 节点 / ${nextIr.edges.length} 边）。`,
           ),
         );
-        void persistCurrentMessages();
+        persistAiMessages();
       } catch (parseErr) {
         const msg = (parseErr as Error)?.message ?? String(parseErr);
         const head = explanation ? `${explanation}\n\n` : '';
         setActive(withAiTiming(`${head}⚠ 蓝图未更新：返回的 JSON 无法解析 (${msg})。`));
-        void persistCurrentMessages();
+        persistAiMessages();
       }
     };
 
@@ -2066,9 +2280,9 @@ export const useStore = create<StoreState>((set) => ({
           setActive(
             withAiTiming(stripInteraction(full) || '（我有几个问题想先和你确认）'),
           );
-          void persistCurrentMessages();
+          persistAiMessages();
           sawInteraction = true;
-          const answer = await awaitInteraction(null, req);
+          const answer = await awaitInteraction(null, req, ch);
           if (!answer) {
             forceBlueprintOnly = true;
             allowClarification = false;
@@ -2087,16 +2301,15 @@ export const useStore = create<StoreState>((set) => ({
               `⚠ 澄清轮数已达上限（${MAX_INTERACTION_ROUNDS}）。请根据以上对话再发送一次，让我据此生成/优化蓝图。`,
             ),
           );
-          void persistCurrentMessages();
+          persistAiMessages();
         }
       } catch (err) {
         const msg = (err as Error)?.message ?? String(err);
         if (activeId) setActive(withAiTiming(`✗ 调用失败: ${msg}`));
         else pushAssistant(withAiTiming(`✗ 调用失败: ${msg}`));
-        void persistCurrentMessages();
+        persistAiMessages();
       } finally {
-        set({ aiStreaming: false });
-        removeAiEditingSession(aiEditingSession);
+        removeAiEditChannel(ch);
       }
     })();
   },
@@ -2110,15 +2323,21 @@ export const useStore = create<StoreState>((set) => ({
       m.id === messageId && m.interactionStatus === 'pending'
         ? { ...m, interactionAnswer: answer, interactionStatus: 'answered' }
         : m;
-    set((s) => ({ messages: s.messages.map(mark) }));
     const resolver = pendingInteractionResolvers.get(messageId);
     const ch = resolver?.runKey ? getRunChannelByKey(resolver.runKey) : null;
+    const aiCh = resolver?.aiEditKey
+      ? getAiEditChannelByKey(resolver.aiEditKey)
+      : null;
     // Keep the run channel's shadow in sync so a later commit doesn't overwrite
     // the answered status with stale messages.
     if (ch) {
       ch.messages = ch.messages.map(mark);
       channelCommitMessages(ch, true);
+    } else if (aiCh) {
+      aiCh.messages = aiCh.messages.map(mark);
+      aiEditCommitMessages(aiCh, true);
     } else {
+      set((s) => ({ messages: s.messages.map(mark) }));
       void persistCurrentMessages();
     }
     if (resolver) {
@@ -2134,13 +2353,19 @@ export const useStore = create<StoreState>((set) => ({
       m.id === messageId && m.interactionStatus === 'pending'
         ? { ...m, interactionStatus: 'cancelled' }
         : m;
-    set((s) => ({ messages: s.messages.map(mark) }));
     const resolver = pendingInteractionResolvers.get(messageId);
     const ch = resolver?.runKey ? getRunChannelByKey(resolver.runKey) : null;
+    const aiCh = resolver?.aiEditKey
+      ? getAiEditChannelByKey(resolver.aiEditKey)
+      : null;
     if (ch) {
       ch.messages = ch.messages.map(mark);
       channelCommitMessages(ch, true);
+    } else if (aiCh) {
+      aiCh.messages = aiCh.messages.map(mark);
+      aiEditCommitMessages(aiCh, true);
     } else {
+      set((s) => ({ messages: s.messages.map(mark) }));
       void persistCurrentMessages();
     }
     if (resolver) {
@@ -2156,7 +2381,21 @@ export const useStore = create<StoreState>((set) => ({
       return { composer };
     }),
 
-  setComposerDraft: (text) => set({ composerDraft: text }),
+  setComposerDraft: (text) =>
+    set((state) => {
+      const currentKey = workflowSessionKeyId(activeWorkflowSessionKey(state));
+      const composerDrafts =
+        state.composerDrafts[currentKey] === text
+          ? state.composerDrafts
+          : { ...state.composerDrafts, [currentKey]: text };
+      if (
+        state.composerDraft === text &&
+        composerDrafts === state.composerDrafts
+      ) {
+        return state;
+      }
+      return { composerDraft: text, composerDrafts };
+    }),
 
   appendComposerDraft: (text) => {
     const addition = text.trim();
@@ -2168,8 +2407,14 @@ export const useStore = create<StoreState>((set) => ({
         state.mode === 'running',
       );
       if (next.focusVersionDelta === 0) return state;
+      const currentKey = workflowSessionKeyId(activeWorkflowSessionKey(state));
+      const composerDrafts =
+        state.composerDrafts[currentKey] === next.draft
+          ? state.composerDrafts
+          : { ...state.composerDrafts, [currentKey]: next.draft };
       return {
         composerDraft: next.draft,
+        composerDrafts,
         composerFocusVersion:
           state.composerFocusVersion + next.focusVersionDelta,
       };
@@ -2181,6 +2426,7 @@ export const useStore = create<StoreState>((set) => ({
   setWorkspace: (path) => {
     const trimmed = path.trim();
     if (!trimmed) return;
+    if (useStore.getState().aiStreaming) return;
     set((state) => {
       const composer = { ...state.composer, workspace: trimmed };
       const workspaceHistory = [
@@ -2696,6 +2942,16 @@ interface RunChannel {
 }
 const activeRuns = new Map<string, RunChannel>();
 
+interface AiEditChannel {
+  key: string;
+  workspaceId: string | null;
+  sessionId: string | null;
+  workflow: IRGraph;
+  messages: Message[];
+}
+const activeAiEdits = new Map<string, AiEditChannel>();
+const aiEditSnapshots = new Map<string, AiEditChannel>();
+
 function runKey(workspaceId: string | null, sessionId: string | null): string {
   return workflowSessionKeyId({ workspaceId, sessionId });
 }
@@ -2708,8 +2964,30 @@ function getRunChannelByKey(key: string): RunChannel | null {
   return activeRuns.get(key) ?? null;
 }
 
+function getAiEditChannelByKey(key: string): AiEditChannel | null {
+  return activeAiEdits.get(key) ?? null;
+}
+
+function getAiEditChannel(
+  workspaceId: string | null,
+  sessionId: string | null,
+): AiEditChannel | null {
+  return activeAiEdits.get(runKey(workspaceId, sessionId)) ?? null;
+}
+
+function getAiEditSnapshot(
+  workspaceId: string | null,
+  sessionId: string | null,
+): AiEditChannel | null {
+  return aiEditSnapshots.get(runKey(workspaceId, sessionId)) ?? null;
+}
+
 function activeRunChannels(): RunChannel[] {
   return [...activeRuns.values()].filter((ch) => !ch.cancelled);
+}
+
+function activeAiEditChannels(): AiEditChannel[] {
+  return [...activeAiEdits.values()];
 }
 
 function runningProgressFromChannel(ch: RunChannel): RunProgressSummary {
@@ -2742,8 +3020,47 @@ function syncRunningSessions(): void {
   });
 }
 
+function syncAiEditingSessions(): void {
+  const aiEditingSessions = activeAiEditChannels().map((ch) => ({
+    workspaceId: ch.workspaceId,
+    sessionId: ch.sessionId,
+  }));
+  useStore.setState({
+    aiEditingSessions,
+    aiStreaming: aiEditingSessions.length > 0,
+  });
+}
+
 function syncRunningSessionProgress(): void {
   useStore.setState({ runningSessionProgress: runningSessionProgressByKey() });
+}
+
+function aiEditRegistered(ch: AiEditChannel | null): ch is AiEditChannel {
+  return !!ch && activeAiEdits.get(ch.key) === ch;
+}
+
+function aiEditActive(ch: AiEditChannel | null): boolean {
+  return aiEditRegistered(ch);
+}
+
+function aiEditViewActive(ch: AiEditChannel | null): boolean {
+  if (!ch) return false;
+  if (!ch.sessionId) return true;
+  const s = useStore.getState();
+  return s.activeSessionId === ch.sessionId && s.activeWorkspaceId === ch.workspaceId;
+}
+
+function addAiEditChannel(ch: AiEditChannel): void {
+  activeAiEdits.set(ch.key, ch);
+  aiEditSnapshots.set(ch.key, { ...ch, messages: [...ch.messages] });
+  syncAiEditingSessions();
+}
+
+function removeAiEditChannel(ch: AiEditChannel | null): void {
+  if (!aiEditRegistered(ch)) return;
+  aiEditSnapshots.set(ch.key, { ...ch, messages: [...ch.messages] });
+  activeAiEdits.delete(ch.key);
+  syncAiEditingSessions();
 }
 
 /** Is a run alive? (false once the user hits 停止, or the channel is gone.) */
@@ -2865,6 +3182,101 @@ function channelCommitMessages(ch: RunChannel | null, persist: boolean): void {
   }
 }
 
+function updateAiEditSessionSummary(ch: AiEditChannel): void {
+  const last = ch.messages[ch.messages.length - 1]?.text ?? '';
+  const updatedAt = Date.now();
+  const matchesSession = (session: Session): boolean => {
+    if (session.id !== ch.sessionId) return false;
+    if (
+      ch.workspaceId !== null &&
+      session.workspaceId !== undefined &&
+      session.workspaceId !== ch.workspaceId
+    ) {
+      return false;
+    }
+    return true;
+  };
+  const update = (session: Session): Session =>
+    matchesSession(session)
+      ? {
+          ...session,
+          isWorkflow: true,
+          updatedAt,
+          preview: last ? previewFromText(last) : session.preview,
+          messageCount: ch.messages.length,
+        }
+      : session;
+
+  useStore.setState((state) => {
+    const sessions = state.sessions.map(update);
+    const sessionTree =
+      ch.workspaceId && state.sessionTree[ch.workspaceId]
+        ? {
+            ...state.sessionTree,
+            [ch.workspaceId]: state.sessionTree[ch.workspaceId].map(update),
+          }
+        : state.sessionTree;
+    return { sessions, sessionTree };
+  });
+}
+
+function persistAiEditMessages(ch: AiEditChannel): void {
+  if (!ch.workspaceId || !ch.sessionId) return;
+  const { workspaceId, sessionId, messages } = ch;
+  void historyStore
+    .updateSession(workspaceId, sessionId, { messages })
+    .catch(() => {});
+}
+
+function persistAiEditWorkflow(ch: AiEditChannel): void {
+  if (!ch.workspaceId || !ch.sessionId) return;
+  const { workspaceId, sessionId, messages, workflow } = ch;
+  void historyStore
+    .updateSession(workspaceId, sessionId, {
+      messages,
+      workflow,
+      meta: emptyRunMeta(),
+    })
+    .catch(() => {});
+}
+
+function aiEditCommitMessages(ch: AiEditChannel | null, persist: boolean): void {
+  if (!aiEditRegistered(ch)) return;
+  aiEditSnapshots.set(ch.key, { ...ch, messages: [...ch.messages] });
+  if (aiEditViewActive(ch)) {
+    useStore.setState({ messages: ch.messages });
+  }
+  if (persist) {
+    updateAiEditSessionSummary(ch);
+    persistAiEditMessages(ch);
+  }
+}
+
+function aiEditCommitWorkflow(ch: AiEditChannel | null, persist: boolean): void {
+  if (!aiEditRegistered(ch)) return;
+  aiEditSnapshots.set(ch.key, { ...ch, messages: [...ch.messages] });
+  if (aiEditViewActive(ch)) {
+    useStore.setState({
+      messages: ch.messages,
+      workflow: ch.workflow,
+      selectedNodeId: null,
+      dirty: true,
+      ...emptyRunProgress(),
+    });
+  }
+  if (persist) {
+    updateAiEditSessionSummary(ch);
+    persistAiEditWorkflow(ch);
+  }
+}
+
+function commitAiChannelBlueprint(ch: AiEditChannel, ir: IRGraph): boolean {
+  if (!aiEditActive(ch)) return false;
+  ch.workflow = prepareGraphEdit(ch.workflow, ir);
+  aiEditCommitWorkflow(ch, true);
+  return true;
+}
+
 /** Append a message to the run channel (or, with no run, to the live store). */
 function pushChannelMessage(
   ch: RunChannel | null,
@@ -2906,7 +3318,11 @@ function finishRun(ch: RunChannel | null): void {
  */
 const pendingInteractionResolvers = new Map<
   string,
-  { runKey: string | null; resolve: (answer: InteractionAnswer | null) => void }
+  {
+    runKey: string | null;
+    aiEditKey: string | null;
+    resolve: (answer: InteractionAnswer | null) => void;
+  }
 >();
 
 /** Max times a single node may ask the user before we stop re-invoking it. */
@@ -2983,6 +3399,7 @@ ${previousReply.slice(0, 4000)}
 function awaitInteraction(
   ch: RunChannel | null,
   req: InteractionRequest,
+  aiCh: AiEditChannel | null = null,
 ): Promise<InteractionAnswer | null> {
   const id = shortId('m');
   const msg: Message = {
@@ -2993,9 +3410,18 @@ function awaitInteraction(
     interaction: req,
     interactionStatus: 'pending',
   };
-  pushChannelMessage(ch, msg, true);
+  if (aiCh) {
+    aiCh.messages = [...aiCh.messages, msg];
+    aiEditCommitMessages(aiCh, true);
+  } else {
+    pushChannelMessage(ch, msg, true);
+  }
   return new Promise((resolve) => {
-    pendingInteractionResolvers.set(id, { runKey: ch?.key ?? null, resolve });
+    pendingInteractionResolvers.set(id, {
+      runKey: ch?.key ?? null,
+      aiEditKey: aiCh?.key ?? null,
+      resolve,
+    });
   });
 }
 

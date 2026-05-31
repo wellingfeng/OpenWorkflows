@@ -28,12 +28,16 @@ export interface RunStateVisual {
   animation?: string;
 }
 
-/** Tokens — keep in sync with src/index.css design tokens. */
+/** Tokens — keep in sync with src/styles/global.css design tokens. */
 const COLORS = {
-  running: '#e3a008', // accent-3
-  success: '#37c2a8', // accent-2
-  error: '#f778ba', // accent-4
-  interrupted: '#d995a6',
+  running: 'var(--status-running)',
+  runningContrast: 'var(--status-running-contrast)',
+  success: 'var(--status-success)',
+  successContrast: 'var(--status-success-contrast)',
+  error: 'var(--status-error)',
+  errorContrast: 'var(--status-error-contrast)',
+  interrupted: 'var(--status-interrupted)',
+  interruptedContrast: 'var(--status-interrupted-contrast)',
 } as const;
 
 /**
@@ -47,11 +51,11 @@ export function runStateVisual(
   if (state === 'running') {
     return {
       borderColor: COLORS.running,
-      boxShadow: `0 0 0 2px ${COLORS.running}, 0 0 12px ${COLORS.running}66`,
+      boxShadow: `0 0 0 2px ${COLORS.running}`,
       badge: '◐',
       badgeStyle: {
         background: COLORS.running,
-        color: '#1a1300',
+        color: COLORS.runningContrast,
         animation: 'omc-pulse 1.1s ease-in-out infinite',
       },
       animation: 'omc-pulse 1.1s ease-in-out infinite',
@@ -64,7 +68,7 @@ export function runStateVisual(
       badge: '✓',
       badgeStyle: {
         background: COLORS.success,
-        color: '#06231d',
+        color: COLORS.successContrast,
       },
     };
   }
@@ -75,7 +79,7 @@ export function runStateVisual(
       badge: '!',
       badgeStyle: {
         background: COLORS.interrupted,
-        color: '#2a0a1a',
+        color: COLORS.interruptedContrast,
       },
     };
   }
@@ -86,7 +90,7 @@ export function runStateVisual(
     badge: '✕',
     badgeStyle: {
       background: COLORS.error,
-      color: '#2a0a1a',
+      color: COLORS.errorContrast,
     },
   };
 }

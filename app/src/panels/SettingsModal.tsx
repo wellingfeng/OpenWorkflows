@@ -85,6 +85,13 @@ import {
   type Locale,
   type TranslationKey,
 } from '@/lib/i18n';
+import {
+  DEFAULT_STYLE_PRESET_ID,
+  STYLE_PRESET_LIST,
+  isUnsupportedStylePreset,
+  resolveStylePresetId,
+  type StylePresetDefinition,
+} from '@/lib/appearance';
 import { useStore } from '@/store/useStore';
 
 type SettingsTab =
@@ -96,6 +103,10 @@ type SettingsTab =
   | 'advanced'
   | 'about';
 type LanguageOption = (typeof LANGUAGE_SELECT_OPTIONS)[number];
+type PlaceholderTabId = Exclude<
+  SettingsTab,
+  'general' | 'models' | 'shortcuts' | 'appearance' | 'about'
+>;
 
 const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = [
   { id: 'general', labelKey: 'settings.tabs.general', Icon: SlidersHorizontal },
@@ -108,16 +119,12 @@ const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = 
 ];
 
 const placeholderCopy: Record<
-  Exclude<SettingsTab, 'general' | 'models' | 'shortcuts' | 'about'>,
+  PlaceholderTabId,
   { titleKey: TranslationKey; descriptionKey: TranslationKey }
 > = {
   runtime: {
     titleKey: 'settings.runtimeTitle',
     descriptionKey: 'settings.runtimeDescription',
-  },
-  appearance: {
-    titleKey: 'settings.appearanceTitle',
-    descriptionKey: 'settings.appearanceDescription',
   },
   advanced: {
     titleKey: 'settings.advancedTitle',
@@ -252,6 +259,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 <ModelsSettings locale={locale} cliRuntime={cliRuntime} />
               ) : tab === 'shortcuts' ? (
                 <ShortcutsSettings locale={locale} />
+              ) : tab === 'appearance' ? (
+                <AppearanceSettings locale={locale} />
               ) : tab === 'about' ? (
                 <AboutSettings locale={locale} />
               ) : (
@@ -2125,7 +2134,7 @@ function PlaceholderTab({
   tab,
   locale,
 }: {
-  tab: Exclude<SettingsTab, 'general' | 'models' | 'shortcuts' | 'about'>;
+  tab: PlaceholderTabId;
   locale: Locale;
 }) {
   const copy = placeholderCopy[tab];
@@ -2145,6 +2154,121 @@ function PlaceholderTab({
         <div className="h-12 rounded-lg border border-dashed border-border-soft bg-bg-alt/30" />
       </div>
     </div>
+  );
+}
+
+function AppearanceSettings({ locale }: { locale: Locale }) {
+  const appearance = useStore((s) => s.appearance);
+  const setStylePresetId = useStore((s) => s.setStylePresetId);
+  const activePresetId = resolveStylePresetId(appearance.stylePresetId);
+  const hasUnsupportedStyle = isUnsupportedStylePreset(appearance.stylePresetId);
+
+  return (
+    <div className="space-y-5">
+      <header className="space-y-1">
+        <h3 className="text-lg font-semibold text-fg">
+          {t(locale, 'settings.appearanceTitle')}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+          {t(locale, 'settings.appearanceDescription')}
+        </p>
+      </header>
+
+      {hasUnsupportedStyle && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs leading-relaxed text-amber-200">
+          <p>{t(locale, 'settings.appearanceUnsupportedStyle')}</p>
+          <button
+            type="button"
+            onClick={() => setStylePresetId(DEFAULT_STYLE_PRESET_ID)}
+            className="rounded-md border border-accent/40 bg-accent/15 px-2.5 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent/20"
+          >
+            {t(locale, 'settings.appearanceUsePencil')}
+          </button>
+        </div>
+      )}
+
+      <SettingRow
+        title={t(locale, 'settings.appearanceStyleLabel')}
+        description={t(locale, 'settings.appearanceStyleDescription')}
+      >
+        <div className="w-full max-w-[34rem]">
+          <div className="grid gap-3">
+            {STYLE_PRESET_LIST.map((preset) => (
+              <StylePresetCard
+                key={preset.id}
+                preset={preset}
+                active={preset.id === activePresetId}
+                locale={locale}
+                onSelect={() => setStylePresetId(preset.id)}
+              />
+            ))}
+          </div>
+        </div>
+      </SettingRow>
+    </div>
+  );
+}
+
+function StylePresetCard({
+  preset,
+  active,
+  locale,
+  onSelect,
+}: {
+  preset: StylePresetDefinition;
+  active: boolean;
+  locale: Locale;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onSelect}
+      className={cn(
+        'group w-full rounded-lg border p-4 text-left transition-colors',
+        active
+          ? 'border-accent bg-accent/10'
+          : 'border-border bg-panel hover:border-accent/50 hover:bg-bg',
+      )}
+    >
+      <div className="flex items-start gap-4">
+        <div className="grid h-10 w-16 shrink-0 grid-cols-5 overflow-hidden rounded-md border border-border-soft bg-bg-alt">
+          {preset.swatches.map((color, index) => (
+            <span
+              key={`${preset.id}-${index}`}
+              className="h-full"
+              style={{ backgroundColor: color }}
+            />
+          ))}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-fg">
+              {t(locale, preset.labelKey)}
+            </span>
+            {active && (
+              <Check size={12} strokeWidth={2.4} className="text-accent" />
+            )}
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+            {t(locale, preset.descriptionKey)}
+          </p>
+        </div>
+
+        <span
+          className={cn(
+            'shrink-0 rounded-md border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider',
+            active
+              ? 'border-accent/40 bg-accent/10 text-accent'
+              : 'border-border bg-bg-alt text-fg-faint',
+          )}
+        >
+          {preset.colorScheme}
+        </span>
+      </div>
+    </button>
   );
 }
 

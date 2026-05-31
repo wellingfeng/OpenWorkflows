@@ -13,6 +13,29 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      (() => {
+        const fallback = 'pencil';
+        const supported = new Set([fallback]);
+        try {
+          const raw = localStorage.getItem('openworkflow.appearance.v1');
+          const parsed = raw ? JSON.parse(raw) : null;
+          const storedId =
+            parsed && typeof parsed.stylePresetId === 'string'
+              ? parsed.stylePresetId
+              : fallback;
+          const id = supported.has(storedId) ? storedId : fallback;
+          document.documentElement.dataset.owfStyle = id;
+          document.documentElement.classList.toggle(
+            'owf-style-pencil',
+            id === 'pencil',
+          );
+        } catch {
+          document.documentElement.dataset.owfStyle = fallback;
+          document.documentElement.classList.add('owf-style-pencil');
+        }
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

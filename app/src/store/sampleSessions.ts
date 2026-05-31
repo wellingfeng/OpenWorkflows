@@ -106,15 +106,20 @@ export const sampleMessages: Message[] = [
  * mode; their changes persist to localStorage and override these defaults
  * until "恢复默认" resets them back to this list.
  *
- * PROMPT_DEFAULTS_VERSION is bumped whenever NEW default groups are added here.
+ * PROMPT_DEFAULTS_VERSION is bumped whenever NEW default groups or migrated
+ * default items are added here.
  * On load, the store merges any default group whose `id` is missing from the
  * user's persisted library (one-time per version bump), so newly-shipped
  * default groups appear automatically without discarding the user's edits.
  * Bump history: v1 = 9 groups (clarity…security); v2 = +界面与体验 (ui-ux);
  * v4 = +互动澄清 (interactive: grill-me + clarify); v5 = +版本控制
- * (version-control).
+ * (version-control); v6 = +生产级可靠性 prompt.
  */
-export const PROMPT_DEFAULTS_VERSION = 5;
+export const PROMPT_DEFAULTS_VERSION = 6;
+
+export const PROMPT_DEFAULT_ITEM_MIGRATIONS = [
+  { groupId: 'reliability', itemId: 'reliability-production-grade' },
+] as const;
 
 const basePromptGroups: PromptGroup[] = [
   {
@@ -258,6 +263,11 @@ const basePromptGroups: PromptGroup[] = [
         id: 'reliability-loop-fuse',
         label: '循环熔断',
         text: '检查 loop 节点是否设置了明确的最大迭代次数和退出条件，补充熔断逻辑，避免无限循环或反复重试同一失败动作拖垮整个工作流。',
+      },
+      {
+        id: 'reliability-production-grade',
+        label: '生产级可靠性',
+        text: '这是用于生产环境的代码，需要具备企业级可靠性，不要使用MVP(最小可行产品)；',
       },
     ],
   },
@@ -570,6 +580,10 @@ const englishPromptTranslations: Record<string, EnglishPromptGroup> = {
       'reliability-loop-fuse': {
         label: 'Loop fuse',
         text: 'Check that loop nodes have a clear maximum iteration count and exit condition. Add circuit-breaker logic to prevent infinite loops or repeated retries of the same failed action.',
+      },
+      'reliability-production-grade': {
+        label: 'Production reliability',
+        text: 'This code is for production. It must have enterprise-grade reliability; do not use an MVP (minimum viable product) approach.',
       },
     },
   },

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import AIDock from './AIDock';
 import PromptPanel from './PromptPanel';
 import { defaultComposer, samplePromptGroups } from '@/store/sampleSessions';
+import type { Message } from '@/store/types';
 import { useStore } from '@/store/useStore';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -24,8 +25,11 @@ function resetStoreForPromptLock(
     promptGroups: samplePromptGroups,
     composer: defaultComposer,
     composerDraft,
+    composerDrafts: {},
     composerFocusVersion,
     messages: [],
+    activeWorkspaceId: null,
+    activeSessionId: 's_prompt',
     workspaceHistory: [],
     runningSessionProgress: {},
   });
@@ -71,6 +75,31 @@ function aiInput(container: HTMLElement): HTMLTextAreaElement {
   const input = container.querySelector('textarea');
   if (!input) throw new Error('Missing AI input textarea');
   return input;
+}
+
+function searchInput(container: HTMLElement): HTMLInputElement {
+  const input = container.querySelector('input[aria-label="搜索 AI 返回内容"]');
+  if (!input) throw new Error('Missing AI return search input');
+  return input as HTMLInputElement;
+}
+
+function buttonByAriaLabel(
+  container: HTMLElement,
+  ariaLabel: string,
+): HTMLButtonElement {
+  const button = container.querySelector(`button[aria-label="${ariaLabel}"]`);
+  if (!button) throw new Error(`Missing button with aria-label: ${ariaLabel}`);
+  return button as HTMLButtonElement;
+}
+
+function typeIntoInput(input: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype,
+    'value',
+  )?.set;
+  if (setter) setter.call(input, value);
+  else input.value = value;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 afterEach(() => {
@@ -137,6 +166,58 @@ describe('PromptPanel running lock', () => {
       expect(useStore.getState().composerFocusVersion).toBe(8);
       expect(input.value).toBe('existing draft\ngrill-me');
       expect(document.activeElement).toBe(input);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('searches and locates AI output matches in real time', async () => {
+    resetStoreForPromptLock('design');
+    useStore.setState({
+      messages: [
+        {
+          id: 'm_a',
+          role: 'assistant',
+          text: 'alpha beta\nalpha',
+          createdAt: 1,
+        },
+        {
+          id: 'm_b',
+          role: 'system',
+          text: 'gamma alpha',
+          createdAt: 2,
+        },
+      ] as Message[],
+    });
+
+    const view = await renderPanels();
+
+    try {
+      const input = searchInput(view.container);
+
+      await act(async () => {
+        input.focus();
+        typeIntoInput(input, 'alpha');
+      });
+
+      expect(view.container.textContent).toContain('1/3');
+      expect(view.container.querySelectorAll('mark[data-search-match-id]')).toHaveLength(3);
+
+      const nextButton = buttonByAriaLabel(view.container, '下一个匹配');
+      await act(async () => {
+        nextButton.click();
+      });
+
+      expect(view.container.textContent).toContain('2/3');
+
+      const clearButton = buttonByAriaLabel(view.container, '清空搜索');
+      await act(async () => {
+        clearButton.click();
+      });
+
+      expect(searchInput(view.container).value).toBe('');
+      expect(view.container.querySelectorAll('mark[data-search-match-id]')).toHaveLength(0);
+      expect(document.activeElement).toBe(searchInput(view.container));
     } finally {
       await view.cleanup();
     }

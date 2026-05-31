@@ -1,8 +1,6 @@
 import { useState } from 'react';
 import StatusIndicator, { type StatusTone } from '@/components/StatusIndicator';
 import {
-  isActiveAiEditingSession,
-  isWorkflowReadOnly,
   sessionLiveStatus,
   useStore,
   workflowSessionKeyId,
@@ -80,12 +78,9 @@ export default function Sidebar() {
   const runningSessions = useStore((s) => s.runningSessions);
   const runningSessionProgress = useStore((s) => s.runningSessionProgress);
   const aiEditingSessions = useStore((s) => s.aiEditingSessions);
-  const readOnly = useStore((s) => isWorkflowReadOnly(s));
-  const newWorkflowLocked = useStore((s) => isActiveAiEditingSession(s));
   const newWorkflow = useStore((s) => s.newWorkflow);
   const selectSession = useStore((s) => s.selectSession);
-  const setWorkflow = useStore((s) => s.setWorkflow);
-  const markSaved = useStore((s) => s.markSaved);
+  const openWorkflowSession = useStore((s) => s.openWorkflowSession);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const { width, onResizeStart } = useResizableWidth({
@@ -97,15 +92,13 @@ export default function Sidebar() {
   });
 
   // Open a .owf.json from disk (Tauri) or localStorage (browser fallback).
-  // On success we replace the in-memory IR and mark the editor clean so the
-  // toolbar reads "已保存" immediately after load.
+  // The store loads it into the current mutable workflow, or into a new session
+  // when the current workflow is busy running / being AI-edited.
   const handleOpen = async () => {
     try {
-      if (readOnly) return;
       const loaded = await openWorkflow(t(locale, 'dialog.openWorkflow'));
       if (!loaded) return; // user cancelled or nothing to load
-      setWorkflow(loaded.ir);
-      markSaved(loaded.path ?? undefined);
+      openWorkflowSession(loaded.ir, loaded.path ?? undefined);
     } catch {
       /* ignore — open errors stay quiet; user can retry */
     }
@@ -138,7 +131,6 @@ export default function Sidebar() {
         <button
           type="button"
           onClick={newWorkflow}
-          disabled={newWorkflowLocked}
           className="flex items-center gap-2 rounded-md bg-accent px-3 py-2 text-sm font-medium text-bg transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <span className="text-base leading-none">＋</span>
@@ -147,7 +139,6 @@ export default function Sidebar() {
         <button
           type="button"
           onClick={() => void handleOpen()}
-          disabled={readOnly}
           className="flex items-center gap-2 rounded-md border border-border bg-panel-2 px-3 py-2 text-sm text-fg transition-colors hover:border-accent hover:bg-border-soft disabled:cursor-not-allowed disabled:opacity-40"
         >
           <span className="text-base leading-none">⤓</span>
@@ -218,7 +209,8 @@ export default function Sidebar() {
                                   'group flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left transition-colors ' +
                                   (active
                                     ? 'bg-panel-2 text-fg'
-                                    : 'text-fg-dim hover:bg-border-soft hover:text-fg')
+                                    : 'text-fg-dim hover:bg-border-soft hover:text-fg') +
+                                  ' disabled:cursor-not-allowed disabled:opacity-50'
                                 }
                               >
                                 <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
@@ -288,7 +280,8 @@ export default function Sidebar() {
                         'group flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left transition-colors ' +
                         (active
                           ? 'bg-panel-2 text-fg'
-                          : 'text-fg-dim hover:bg-border-soft hover:text-fg')
+                          : 'text-fg-dim hover:bg-border-soft hover:text-fg') +
+                        ' disabled:cursor-not-allowed disabled:opacity-50'
                       }
                     >
                       <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">

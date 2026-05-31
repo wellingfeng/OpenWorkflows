@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Plus } from 'lucide-react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { ChevronDown, ChevronUp, Plus, Search, X } from 'lucide-react';
 import Select from '@/components/Select';
 import WorkspaceSelect from '@/components/WorkspaceSelect';
 import { summarizeAnswer, type InteractionAnswer } from '@/core/interaction';
@@ -55,6 +63,8 @@ const INPUT_WIDTH_KEY = 'openworkflow.aiInputWidth.v1';
 const DEFAULT_INPUT_WIDTH = 384; // matches the former w-96
 const MIN_INPUT_WIDTH = 280;
 const MIN_RETURN_WIDTH = 240; // keep the AI-return pane usable
+const NARROW_INPUT_MIN_WIDTH = 120;
+const NARROW_INPUT_WIDTH_RATIO = 0.4;
 
 function clampHeight(h: number): number {
   const max =
@@ -69,6 +79,122 @@ function formatMessageTime(ts: number): string {
     minute: '2-digit',
     second: '2-digit',
   }).format(new Date(ts));
+}
+
+type SearchMatchSource = 'text' | 'interaction';
+
+interface SearchMatch {
+  id: string;
+  messageId: string;
+  source: SearchMatchSource;
+}
+
+function normalizeSearchQuery(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function interactionSearchText(message: Message): string {
+  if (!message.interaction) return '';
+  const parts = [message.interaction.prompt];
+  if (message.interaction.options?.length) {
+    parts.push(message.interaction.options.join(' '));
+  }
+  if (message.interactionAnswer) {
+    parts.push(summarizeAnswer(message.interaction, message.interactionAnswer));
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
+function buildSearchMatches(messages: Message[], query: string): SearchMatch[] {
+  if (!query) return [];
+
+  const out: SearchMatch[] = [];
+  const lowerQuery = query.toLowerCase();
+
+  for (const message of messages) {
+    const segments: Array<{ source: SearchMatchSource; text: string }> = [];
+    if (message.text.trim()) {
+      segments.push({ source: 'text', text: message.text });
+    }
+    const interactionText = interactionSearchText(message);
+    if (interactionText) {
+      segments.push({ source: 'interaction', text: interactionText });
+    }
+
+    for (const segment of segments) {
+      const lowerText = segment.text.toLowerCase();
+      let start = 0;
+      let hitIndex = 0;
+
+      while (start <= lowerText.length) {
+        const found = lowerText.indexOf(lowerQuery, start);
+        if (found === -1) break;
+        out.push({
+          id: `${message.id}:${segment.source}:${hitIndex}`,
+          messageId: message.id,
+          source: segment.source,
+        });
+        hitIndex += 1;
+        start = found + Math.max(lowerQuery.length, 1);
+      }
+    }
+  }
+
+  return out;
+}
+
+function renderHighlightedText(
+  text: string,
+  messageId: string,
+  query: string,
+  activeMatchId: string | null,
+  onActiveMatchNode: (node: HTMLElement | null) => void,
+): ReactNode {
+  if (!query) return text;
+
+  const lowerText = text.toLowerCase();
+  const lowerQuery = query.toLowerCase();
+  if (!lowerQuery) return text;
+
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let hitIndex = 0;
+
+  while (cursor <= lowerText.length) {
+    const found = lowerText.indexOf(lowerQuery, cursor);
+    if (found === -1) break;
+    if (found > cursor) nodes.push(text.slice(cursor, found));
+
+    const matchId = `${messageId}:text:${hitIndex}`;
+    const isActive = matchId === activeMatchId;
+    nodes.push(
+      <mark
+        key={matchId}
+        data-search-match-id={matchId}
+        ref={
+          isActive
+            ? (node) => {
+                onActiveMatchNode(node);
+              }
+            : undefined
+        }
+        className={
+          'rounded-sm px-0.5 text-fg transition-colors ' +
+          (isActive
+            ? 'bg-accent-3/35 ring-1 ring-inset ring-accent-3/55'
+            : 'bg-accent/20')
+        }
+      >
+        {text.slice(found, found + lowerQuery.length)}
+      </mark>,
+    );
+
+    hitIndex += 1;
+    cursor = found + Math.max(lowerQuery.length, 1);
+  }
+
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes.length > 0 ? nodes : text;
 }
 
 interface TextSelection {
@@ -346,13 +472,20 @@ export default function AIDock() {
   const answerInteraction = useStore((s) => s.answerInteraction);
   const dismissInteraction = useStore((s) => s.dismissInteraction);
   const streamRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const draftRef = useRef(draft);
   const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
   const lastComposerFocusVersion = useRef(composerFocusVersion);
+  const messageRefs = useRef(new Map<string, HTMLLIElement>());
+  const activeSearchMatchNodeRef = useRef<HTMLElement | null>(null);
+  const searchScrollTopRef = useRef<number | null>(null);
+  const lastSearchActiveRef = useRef(false);
 
   const isReadOnly = mode === 'running';
   const [dropActive, setDropActive] = useState(false);
+  const [returnSearch, setReturnSearch] = useState('');
+  const [activeSearchMatchIndex, setActiveSearchMatchIndex] = useState(0);
   const [gatewayRevision, setGatewayRevision] = useState(0);
   const availableGatewayOptions = useMemo(() => {
     void gatewayRevision;
@@ -377,6 +510,22 @@ export default function AIDock() {
   const displayedRunSelection = bestAvailableSelection(
     runSelection,
     gatewayOptions,
+  );
+  const normalizedSearch = useMemo(
+    () => normalizeSearchQuery(returnSearch),
+    [returnSearch],
+  );
+  const searchMatches = useMemo(
+    () => buildSearchMatches(messages, normalizedSearch),
+    [messages, normalizedSearch],
+  );
+  const activeSearchMatch = searchMatches[activeSearchMatchIndex] ?? null;
+  const activeSearchMatchId = activeSearchMatch?.id ?? null;
+  const activeSearchMatchMessageId = activeSearchMatch?.messageId ?? null;
+  const activeSearchMatchSource = activeSearchMatch?.source ?? null;
+  const searchMatchMessageIds = useMemo(
+    () => new Set(searchMatches.map((match) => match.messageId)),
+    [searchMatches],
   );
 
   // Split the flat channel list into the three runtime categories (Claude Code
@@ -441,7 +590,34 @@ export default function AIDock() {
   const [inputWidth, setInputWidth] = useState<number>(
     () => loadPaneWidth(INPUT_WIDTH_KEY) ?? DEFAULT_INPUT_WIDTH,
   );
+  const [renderedInputWidth, setRenderedInputWidth] = useState(inputWidth);
   const dockRef = useRef<HTMLDivElement>(null);
+
+  const setActiveSearchMatchNode = useCallback((node: HTMLElement | null) => {
+    activeSearchMatchNodeRef.current = node;
+  }, []);
+
+  const focusSearchInput = useCallback(() => {
+    searchInputRef.current?.focus();
+    searchInputRef.current?.select();
+  }, []);
+
+  const clearReturnSearch = useCallback(() => {
+    setReturnSearch('');
+    setActiveSearchMatchIndex(0);
+    focusSearchInput();
+  }, [focusSearchInput]);
+
+  const moveSearchMatch = useCallback(
+    (step: number) => {
+      if (searchMatches.length === 0) return;
+      setActiveSearchMatchIndex((current) => {
+        const next = (current + step + searchMatches.length) % searchMatches.length;
+        return next;
+      });
+    },
+    [searchMatches.length],
+  );
 
   useEffect(() => {
     draftRef.current = draft;
@@ -512,16 +688,86 @@ export default function AIDock() {
 
   /** Clamp the input width to keep both panes usable within the dock. */
   const clampInputWidth = useCallback((w: number): number => {
-    const total = dockRef.current?.clientWidth ?? window.innerWidth;
-    const max = Math.max(MIN_INPUT_WIDTH, total - MIN_RETURN_WIDTH);
-    return Math.min(Math.max(w, MIN_INPUT_WIDTH), max);
+    const total = Math.max(0, dockRef.current?.clientWidth ?? window.innerWidth);
+    const constrained = total < MIN_INPUT_WIDTH + MIN_RETURN_WIDTH;
+    const minInput = constrained
+      ? Math.min(
+          MIN_INPUT_WIDTH,
+          Math.max(
+            NARROW_INPUT_MIN_WIDTH,
+            Math.floor(total * NARROW_INPUT_WIDTH_RATIO),
+          ),
+        )
+      : MIN_INPUT_WIDTH;
+    const minReturn = constrained
+      ? Math.max(NARROW_INPUT_MIN_WIDTH, total - minInput)
+      : MIN_RETURN_WIDTH;
+    const max = Math.max(minInput, total - minReturn);
+    return Math.min(Math.max(w, minInput), max);
   }, []);
 
-  // Keep the latest message in view.
   useEffect(() => {
+    setActiveSearchMatchIndex(0);
+  }, [normalizedSearch]);
+
+  useEffect(() => {
+    if (searchMatches.length === 0) {
+      setActiveSearchMatchIndex(0);
+      return;
+    }
+    setActiveSearchMatchIndex((current) =>
+      Math.min(current, searchMatches.length - 1),
+    );
+  }, [searchMatches.length]);
+
+  useEffect(() => {
+    const wasActive = lastSearchActiveRef.current;
+    lastSearchActiveRef.current = normalizedSearch.length > 0;
+    if (normalizedSearch) {
+      searchScrollTopRef.current = null;
+    }
+    if (wasActive && !normalizedSearch) {
+      const el = streamRef.current;
+      searchScrollTopRef.current = el?.scrollTop ?? null;
+      window.requestAnimationFrame(() => {
+        if (lastSearchActiveRef.current) return;
+        const stream = streamRef.current;
+        const top = searchScrollTopRef.current;
+        if (!stream || top === null) return;
+        stream.scrollTop = top;
+        searchScrollTopRef.current = null;
+      });
+    }
+  }, [normalizedSearch]);
+
+  // Keep the latest message in view unless return search is active.
+  useEffect(() => {
+    if (normalizedSearch) return;
+    if (searchScrollTopRef.current !== null) return;
     const el = streamRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages]);
+  }, [messages, normalizedSearch]);
+
+  useEffect(() => {
+    if (!normalizedSearch || !activeSearchMatchId || !activeSearchMatchMessageId) {
+      return;
+    }
+    const target =
+      activeSearchMatchSource === 'text'
+        ? activeSearchMatchNodeRef.current
+        : null;
+    const messageEl = messageRefs.current.get(activeSearchMatchMessageId);
+    const scrollTarget =
+      target && target.dataset.searchMatchId === activeSearchMatchId
+        ? target
+        : messageEl;
+    scrollTarget?.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+  }, [
+    activeSearchMatchId,
+    activeSearchMatchMessageId,
+    activeSearchMatchSource,
+    normalizedSearch,
+  ]);
 
   // PromptPanel can append text into this composer. When it does, move focus to
   // the AI input and place the caret at the end so the user can continue typing.
@@ -590,11 +836,12 @@ export default function AIDock() {
 
   // Re-clamp the input width when the window (and thus the dock) resizes so
   // neither pane collapses below its minimum.
-  useEffect(() => {
-    const onResize = () => setInputWidth((w) => clampInputWidth(w));
+  useLayoutEffect(() => {
+    const onResize = () => setRenderedInputWidth(clampInputWidth(inputWidth));
+    onResize();
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [clampInputWidth]);
+  }, [clampInputWidth, inputWidth]);
 
   // Drag the top edge to resize. The panel is anchored to the bottom, so
   // dragging up (smaller clientY) increases height.
@@ -633,14 +880,16 @@ export default function AIDock() {
     (e: React.MouseEvent) => {
       e.preventDefault();
       const startX = e.clientX;
-      const startWidth = inputWidth;
+      const startWidth = renderedInputWidth;
       const prevUserSelect = document.body.style.userSelect;
       const prevCursor = document.body.style.cursor;
       document.body.style.userSelect = 'none';
       document.body.style.cursor = 'col-resize';
 
       const onMove = (ev: MouseEvent) => {
-        setInputWidth(clampInputWidth(startWidth - (ev.clientX - startX)));
+        const next = clampInputWidth(startWidth - (ev.clientX - startX));
+        setInputWidth(next);
+        setRenderedInputWidth(next);
       };
       const onUp = () => {
         window.removeEventListener('mousemove', onMove);
@@ -655,7 +904,7 @@ export default function AIDock() {
       window.addEventListener('mousemove', onMove);
       window.addEventListener('mouseup', onUp);
     },
-    [inputWidth, clampInputWidth],
+    [renderedInputWidth, clampInputWidth],
   );
 
   const submit = () => {
@@ -691,7 +940,7 @@ export default function AIDock() {
       </div>
       {/* AI return stream */}
       <section className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center gap-2 border-b border-border-soft px-3 py-2">
+        <header className="flex flex-wrap items-center gap-2 border-b border-border-soft px-3 py-2">
           <span className="font-mono text-[10px] uppercase tracking-wider text-accent">
             {t(locale, 'dock.aiReturn')}
           </span>
@@ -701,6 +950,79 @@ export default function AIDock() {
               {t(locale, 'dock.generating')}
             </span>
           )}
+          <div className="flex min-w-0 flex-1 basis-full flex-wrap items-center justify-end gap-1 sm:ml-auto sm:basis-0 sm:flex-nowrap">
+            <div className="flex min-w-0 flex-1 basis-full items-center gap-1 rounded-md border border-border bg-bg px-2 py-1 transition-colors focus-within:border-accent sm:basis-auto">
+              <Search size={13} className="shrink-0 text-fg-faint" />
+              <input
+                ref={searchInputRef}
+                value={returnSearch}
+                onChange={(e) => setReturnSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    moveSearchMatch(e.shiftKey ? -1 : 1);
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    if (returnSearch) clearReturnSearch();
+                    else searchInputRef.current?.blur();
+                  }
+                }}
+                placeholder={t(locale, 'dock.searchPlaceholder')}
+                aria-label={t(locale, 'dock.searchAria')}
+                spellCheck={false}
+                className="min-w-0 flex-1 bg-transparent text-xs text-fg outline-none placeholder:text-fg-faint"
+              />
+              {returnSearch ? (
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={clearReturnSearch}
+                  title={t(locale, 'dock.searchClear')}
+                  aria-label={t(locale, 'dock.searchClear')}
+                  className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-fg-faint transition-colors hover:text-fg"
+                >
+                  <X size={12} />
+                </button>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => moveSearchMatch(-1)}
+              disabled={searchMatches.length === 0}
+              title={t(locale, 'dock.searchPrevious')}
+              aria-label={t(locale, 'dock.searchPrevious')}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <ChevronUp size={14} />
+            </button>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => moveSearchMatch(1)}
+              disabled={searchMatches.length === 0}
+              title={t(locale, 'dock.searchNext')}
+              aria-label={t(locale, 'dock.searchNext')}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <ChevronDown size={14} />
+            </button>
+            <span
+              aria-live="polite"
+              className={
+                'min-w-[3.75rem] whitespace-nowrap text-right font-mono text-[10px] ' +
+                (normalizedSearch && searchMatches.length === 0
+                  ? 'text-accent-3'
+                  : 'text-fg-faint')
+              }
+            >
+              {normalizedSearch
+                ? searchMatches.length === 0
+                  ? t(locale, 'dock.searchNoMatch')
+                  : `${activeSearchMatchIndex + 1}/${searchMatches.length}`
+                : ''}
+            </span>
+          </div>
         </header>
         <div ref={streamRef} className="min-h-0 flex-1 overflow-y-auto p-3">
           {messages.length === 0 ? (
@@ -712,6 +1034,8 @@ export default function AIDock() {
               {messages.map((m) => {
                 const isUser = m.role === 'user';
                 const isSystem = m.role === 'system';
+                const isSearchHit = searchMatchMessageIds.has(m.id);
+                const isCurrentSearchHit = activeSearchMatchMessageId === m.id;
                 const roleLabel = isUser
                   ? '› you'
                   : isSystem
@@ -723,7 +1047,21 @@ export default function AIDock() {
                     ? 'text-accent-3'
                     : 'text-accent-2';
                 return (
-                  <li key={m.id} className="flex flex-col gap-1">
+                  <li
+                    key={m.id}
+                    ref={(node) => {
+                      if (node) messageRefs.current.set(m.id, node);
+                      else messageRefs.current.delete(m.id);
+                    }}
+                    className={
+                      'flex flex-col gap-1 rounded-md px-1 py-0.5 transition-colors ' +
+                      (isCurrentSearchHit
+                        ? 'bg-accent/5 ring-1 ring-inset ring-accent-3/40'
+                        : isSearchHit
+                          ? 'ring-1 ring-inset ring-accent/20'
+                          : '')
+                    }
+                  >
                     <div className="flex items-center gap-2">
                       <span
                         className={
@@ -752,7 +1090,13 @@ export default function AIDock() {
                       />
                     ) : (
                       <span className="whitespace-pre-wrap text-sm leading-relaxed text-fg-dim">
-                        {m.text}
+                        {renderHighlightedText(
+                          m.text,
+                          m.id,
+                          normalizedSearch,
+                          activeSearchMatchId,
+                          setActiveSearchMatchNode,
+                        )}
                       </span>
                     )}
                   </li>
@@ -775,7 +1119,7 @@ export default function AIDock() {
       {/* AI input box */}
       <section
         className="relative flex shrink-0 flex-col"
-        style={{ width: inputWidth }}
+        style={{ width: renderedInputWidth }}
       >
         <header className="flex items-center justify-between gap-2 border-b border-border-soft px-3 py-2">
           <span className="font-mono text-[10px] uppercase tracking-wider text-fg-faint">
@@ -906,6 +1250,7 @@ export default function AIDock() {
               value={composer.workspace}
               history={workspaceHistory}
               onSelect={setWorkspace}
+              disabled={aiStreaming}
             />
             <span className="font-mono text-[10px] text-fg-faint">
               {isReadOnly

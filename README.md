@@ -8,7 +8,13 @@ Claude Code introduced a Workflow feature for orchestrating multi-agent steps, p
 
 The shared IR keeps workflow structure portable while letting each node choose its runtime-facing model, prompt, schema, and execution settings.
 
-![OpenWorkflow editor screenshot](docs/assets/openworkflow-editor.png)
+<p align="center">
+  <img src="app/doc/images/0-标题使用.png" alt="OpenWorkflow editor screenshot" width="960">
+</p>
+
+## Usage Tutorial
+
+- [OpenWorkflow usage tutorial](app/doc/claude-code-workflow-openworkflow.en.md) - step-by-step walkthrough with the screenshots from setup to runtime switching.
 
 ## Multi-Model Workflow Support
 
@@ -71,7 +77,7 @@ app/
     panels/            Sidebar, prompt panel, AI dock
     store/             Zustand application state
   src-tauri/           Rust/Tauri desktop backend and packaging config
-docs/                  Design and workflow references
+  doc/                 Usage tutorial and screenshots
 pencil/                Pencil design files
 run.bat                Build-if-needed and launch the Windows app
 build.bat              Build the Windows installer
@@ -80,8 +86,7 @@ build.bat              Build the Windows installer
 ## More Docs
 
 - [Chinese README](README.zh-CN.md)
-- [Workflow syntax reference](docs/workflow-syntax-reference.html)
-- [Design notes](docs/design.html)
+- [Chinese usage tutorial](app/doc/claude-code-workflow-openworkflow.md)
 
 ## Verification
 

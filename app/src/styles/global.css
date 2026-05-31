@@ -3,28 +3,58 @@
 @tailwind utilities;
 
 :root {
-  /* Design tokens — single source of truth */
-  --bg: #0d1117;
-  --bg-alt: #161b22;
-  --panel: #1c2128;
-  --panel-2: #21262d;
-  --border: #30363d;
-  --border-soft: #262c34;
-  --fg: #e6edf3;
-  --fg-dim: #9da7b3;
-  --fg-faint: #6e7681;
-  --accent: #7c8cff;
-  --accent-2: #37c2a8;
-  --accent-3: #e3a008;
-  --accent-4: #f778ba;
-  --status-ai-edit: #4da3ff;
+  /* Default primitive tokens. Style presets override these on html. */
+  --owf-color-bg: #0d1117;
+  --owf-color-bg-alt: #161b22;
+  --owf-color-panel: #1c2128;
+  --owf-color-panel-2: #21262d;
+  --owf-color-border: #30363d;
+  --owf-color-border-soft: #262c34;
+  --owf-color-text: #e6edf3;
+  --owf-color-text-muted: #9da7b3;
+  --owf-color-text-faint: #6e7681;
+  --owf-color-accent: #7c8cff;
+  --owf-color-accent-2: #37c2a8;
+  --owf-color-accent-3: #e3a008;
+  --owf-color-accent-4: #f778ba;
+  --owf-status-ai-edit: #4da3ff;
+  --owf-status-ai-edit-contrast: #071421;
+  --owf-status-running: #e3a008;
+  --owf-status-running-contrast: #1a1300;
+  --owf-status-success: #37c2a8;
+  --owf-status-success-contrast: #06231d;
+  --owf-status-error: #f778ba;
+  --owf-status-error-contrast: #2a0a1a;
+  --owf-status-interrupted: #d995a6;
+  --owf-status-interrupted-contrast: #2a0a1a;
+
+  /* Semantic tokens consumed by Tailwind and component styles. */
+  --bg: var(--owf-color-bg);
+  --bg-alt: var(--owf-color-bg-alt);
+  --panel: var(--owf-color-panel);
+  --panel-2: var(--owf-color-panel-2);
+  --border: var(--owf-color-border);
+  --border-soft: var(--owf-color-border-soft);
+  --fg: var(--owf-color-text);
+  --fg-dim: var(--owf-color-text-muted);
+  --fg-faint: var(--owf-color-text-faint);
+  --accent: var(--owf-color-accent);
+  --accent-2: var(--owf-color-accent-2);
+  --accent-3: var(--owf-color-accent-3);
+  --accent-4: var(--owf-color-accent-4);
+  --status-ai-edit: var(--owf-status-ai-edit);
+  --status-ai-edit-contrast: var(--owf-status-ai-edit-contrast);
   --status-ai-edit-border: #2c6fb3;
-  --status-running: #22c55e;
-  --status-success: #22c55e;
+  --status-running: var(--owf-status-running);
+  --status-running-contrast: var(--owf-status-running-contrast);
+  --status-success: var(--owf-status-success);
+  --status-success-contrast: var(--owf-status-success-contrast);
   --status-success-border: var(--status-success);
-  --status-error: #ef4444;
+  --status-error: var(--owf-status-error);
+  --status-error-contrast: var(--owf-status-error-contrast);
   --status-error-border: var(--status-error);
-  --status-interrupted: var(--accent-3);
+  --status-interrupted: var(--owf-status-interrupted);
+  --status-interrupted-contrast: var(--owf-status-interrupted-contrast);
   --status-interrupted-border: #9b6a05;
   --status-running-track: var(--border);
   --owf-status-slot-size: 20px;
@@ -32,6 +62,146 @@
   --owf-status-spinner-ring: 2px;
 
   color-scheme: dark;
+}
+
+html[data-owf-style='pencil'],
+html.owf-style-pencil {
+  color-scheme: dark;
+  --owf-color-bg: #0d1117;
+  --owf-color-bg-alt: #161b22;
+  --owf-color-panel: #1c2128;
+  --owf-color-panel-2: #21262d;
+  --owf-color-border: #30363d;
+  --owf-color-border-soft: #262c34;
+  --owf-color-text: #e6edf3;
+  --owf-color-text-muted: #9da7b3;
+  --owf-color-text-faint: #6e7681;
+  --owf-color-accent: #7c8cff;
+  --owf-color-accent-2: #37c2a8;
+  --owf-color-accent-3: #e3a008;
+  --owf-color-accent-4: #f778ba;
+  --owf-status-ai-edit: #4da3ff;
+  --owf-status-ai-edit-contrast: #071421;
+  --owf-status-running: #e3a008;
+  --owf-status-running-contrast: #1a1300;
+  --owf-status-success: #37c2a8;
+  --owf-status-success-contrast: #06231d;
+  --owf-status-error: #f778ba;
+  --owf-status-error-contrast: #2a0a1a;
+  --owf-status-interrupted: #d995a6;
+  --owf-status-interrupted-contrast: #2a0a1a;
+}
+
+html[data-owf-style='midnight'],
+html.owf-style-midnight {
+  color-scheme: dark;
+  --owf-color-bg: #0b0e1a;
+  --owf-color-bg-alt: #11152a;
+  --owf-color-panel: #171c38;
+  --owf-color-panel-2: #1f2547;
+  --owf-color-border: #2e3563;
+  --owf-color-border-soft: #222845;
+  --owf-color-text: #eef1fb;
+  --owf-color-text-muted: #a7aecb;
+  --owf-color-text-faint: #6e7699;
+  --owf-color-accent: #7c6cff;
+  --owf-color-accent-2: #2dd4d4;
+  --owf-color-accent-3: #f5b73c;
+  --owf-color-accent-4: #f062c8;
+  --owf-status-ai-edit: #4d8dff;
+  --owf-status-ai-edit-contrast: #04122b;
+  --owf-status-running: #f0a52a;
+  --owf-status-running-contrast: #2a1a00;
+  --owf-status-success: #23c08a;
+  --owf-status-success-contrast: #03200f;
+  --owf-status-error: #ff5c7a;
+  --owf-status-error-contrast: #2c0710;
+  --owf-status-interrupted: #6b7194;
+  --owf-status-interrupted-contrast: #0a0d18;
+}
+
+html[data-owf-style='aurora'],
+html.owf-style-aurora {
+  color-scheme: dark;
+  --owf-color-bg: #2e3440;
+  --owf-color-bg-alt: #323846;
+  --owf-color-panel: #3b4252;
+  --owf-color-panel-2: #434c5e;
+  --owf-color-border: #4c566a;
+  --owf-color-border-soft: #3b4252;
+  --owf-color-text: #eceff4;
+  --owf-color-text-muted: #c5cddb;
+  --owf-color-text-faint: #8a93a6;
+  --owf-color-accent: #88c0d0;
+  --owf-color-accent-2: #a3be8c;
+  --owf-color-accent-3: #ebcb8b;
+  --owf-color-accent-4: #b48ead;
+  --owf-status-ai-edit: #81a1c1;
+  --owf-status-ai-edit-contrast: #1c2128;
+  --owf-status-running: #ebcb8b;
+  --owf-status-running-contrast: #2e3440;
+  --owf-status-success: #a3be8c;
+  --owf-status-success-contrast: #2e3440;
+  --owf-status-error: #bf616a;
+  --owf-status-error-contrast: #fdf2f3;
+  --owf-status-interrupted: #6b7080;
+  --owf-status-interrupted-contrast: #1c2026;
+}
+
+html[data-owf-style='daylight'],
+html.owf-style-daylight {
+  color-scheme: light;
+  --owf-color-bg: #f6f7f9;
+  --owf-color-bg-alt: #eceef2;
+  --owf-color-panel: #ffffff;
+  --owf-color-panel-2: #f2f4f7;
+  --owf-color-border: #d3d8e0;
+  --owf-color-border-soft: #e5e8ee;
+  --owf-color-text: #11151c;
+  --owf-color-text-muted: #566072;
+  --owf-color-text-faint: #828b9b;
+  --owf-color-accent: #2f6fed;
+  --owf-color-accent-2: #13a07a;
+  --owf-color-accent-3: #d98a07;
+  --owf-color-accent-4: #d6489b;
+  --owf-status-ai-edit: #2f6fed;
+  --owf-status-ai-edit-contrast: #ffffff;
+  --owf-status-running: #e08a00;
+  --owf-status-running-contrast: #2a1a00;
+  --owf-status-success: #13a07a;
+  --owf-status-success-contrast: #ffffff;
+  --owf-status-error: #df3b4e;
+  --owf-status-error-contrast: #ffffff;
+  --owf-status-interrupted: #9aa3b2;
+  --owf-status-interrupted-contrast: #1a1f28;
+}
+
+html[data-owf-style='ember'],
+html.owf-style-ember {
+  color-scheme: dark;
+  --owf-color-bg: #1a1411;
+  --owf-color-bg-alt: #221a15;
+  --owf-color-panel: #2b211a;
+  --owf-color-panel-2: #352920;
+  --owf-color-border: #473628;
+  --owf-color-border-soft: #352a20;
+  --owf-color-text: #f5e9dc;
+  --owf-color-text-muted: #c2a890;
+  --owf-color-text-faint: #8c7461;
+  --owf-color-accent: #ff8c42;
+  --owf-color-accent-2: #3fb8a8;
+  --owf-color-accent-3: #f0b429;
+  --owf-color-accent-4: #e06b8b;
+  --owf-status-ai-edit: #5b9bd5;
+  --owf-status-ai-edit-contrast: #0c1620;
+  --owf-status-running: #f0a830;
+  --owf-status-running-contrast: #241803;
+  --owf-status-success: #3fb8a8;
+  --owf-status-success-contrast: #06201c;
+  --owf-status-error: #e0566b;
+  --owf-status-error-contrast: #2a0810;
+  --owf-status-interrupted: #8c7461;
+  --owf-status-interrupted-contrast: #1c1510;
 }
 
 * {

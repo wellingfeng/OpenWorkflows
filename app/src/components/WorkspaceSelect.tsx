@@ -20,6 +20,7 @@ export interface WorkspaceSelectProps {
   history: string[];
   /** Commit a chosen path (sets current + records in history). */
   onSelect: (path: string) => void;
+  disabled?: boolean;
   className?: string;
 }
 
@@ -27,6 +28,7 @@ export default function WorkspaceSelect({
   value,
   history,
   onSelect,
+  disabled = false,
   className,
 }: WorkspaceSelectProps) {
   const [open, setOpen] = useState(false);
@@ -34,6 +36,10 @@ export default function WorkspaceSelect({
   const locale = useStore((s) => s.locale);
 
   useEffect(() => {
+    if (disabled) {
+      setOpen(false);
+      return;
+    }
     if (!open) return;
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
@@ -42,9 +48,10 @@ export default function WorkspaceSelect({
     };
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
-  }, [open]);
+  }, [disabled, open]);
 
   const browse = async () => {
+    if (disabled) return;
     const path = await pickFolder(t(locale, 'workspace.chooseFolder'));
     setOpen(false);
     if (path) onSelect(path);
@@ -57,12 +64,14 @@ export default function WorkspaceSelect({
       <button
         type="button"
         title={value || t(locale, 'workspace.chooseFolder')}
+        disabled={disabled}
         onClick={() => setOpen((v) => !v)}
         className={cn(
           'flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors',
           open
             ? 'border-accent bg-border-soft text-fg'
             : 'border-border bg-panel-2 text-fg-dim hover:border-accent hover:text-fg',
+          'disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-fg-dim',
         )}
       >
         <span className="text-fg-faint">🗂</span>
@@ -102,6 +111,7 @@ export default function WorkspaceSelect({
                       aria-selected={active}
                       title={path}
                       onClick={() => {
+                        if (disabled) return;
                         onSelect(path);
                         setOpen(false);
                       }}

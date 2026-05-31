@@ -68,6 +68,8 @@ function resetStore(): void {
     dirty: false,
     currentFilePath: null,
     messages: [],
+    composerDraft: '',
+    composerDrafts: {},
     activeSessionId: null,
     activeWorkspaceId: null,
     historyReady: false,
@@ -169,6 +171,67 @@ describe('AI edit interactions', () => {
     expect(start?.params.userInputs).toContain(
       'Question: 默认只落地 Pencil，还是同时落地多套可切换风格？\nAnswer: 同时落地 Pencil 及多套可切换风格',
     );
+    expect(useStore.getState().aiStreaming).toBe(false);
+  });
+
+  it('lets session switching continue while the original AI edit finishes in the background', async () => {
+    resetStore();
+    useStore.setState({
+      activeSessionId: 's_main',
+      activeWorkspaceId: null,
+    });
+    gatewayMocks.resolveDirectGatewayRoute.mockReturnValue({
+      adapter: 'claude-code',
+      apiKey: 'test-key',
+      model: 'sonnet',
+      transport: 'anthropic',
+    });
+
+    let resolveReply!: (value: string) => void;
+    gatewayMocks.completeGatewayText.mockImplementation(async () => {
+      return await new Promise<string>((resolve) => {
+        resolveReply = resolve;
+      });
+    });
+
+    useStore
+      .getState()
+      .sendPrompt('把这个 workflow 改成更完整的三步流程。');
+
+    await waitFor(() => useStore.getState().aiStreaming, 'AI streaming to start');
+
+    useStore.getState().selectSession('s_other');
+    expect(useStore.getState().activeSessionId).toBe('s_other');
+
+    resolveReply(`已根据你的回答更新蓝图。\n\n\`\`\`json\n${JSON.stringify(
+      buildAnsweredGraph(),
+    )}\n\`\`\``);
+
+    await waitFor(
+      () =>
+        !useStore.getState().aiStreaming &&
+        !useStore
+          .getState()
+          .workflow.nodes.some((node) => node.id === 'n_style_decision'),
+      'the background AI edit to finish without affecting the switched view',
+    );
+
+    expect(useStore.getState().activeSessionId).toBe('s_other');
+    expect(
+      useStore.getState().workflow.nodes.some((node) => node.id === 'n_style_decision'),
+    ).toBe(false);
+
+    useStore.getState().selectSession('s_main');
+
+    await waitFor(
+      () =>
+        useStore
+          .getState()
+          .workflow.nodes.some((node) => node.id === 'n_style_decision'),
+      'the committed answered blueprint when switching back',
+    );
+
+    expect(useStore.getState().activeSessionId).toBe('s_main');
     expect(useStore.getState().aiStreaming).toBe(false);
   });
 });
