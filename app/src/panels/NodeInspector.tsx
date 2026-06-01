@@ -10,6 +10,7 @@ import type {
   NodeType,
 } from '@/core/ir';
 import { assessConsensusFit, defaultConsensusLenses } from '@/core/consensusHeuristic';
+import { isNumberedWorkflowNode } from '@/core/nodeNumbers';
 import { autoSuggestEnabled } from '@/lib/consensusSettings';
 import { readStartUserInputs } from '@/core/startInputs';
 import { primeCliRuntime, subscribeCliRuntime } from '@/lib/cliConfig';
@@ -800,6 +801,14 @@ export default function NodeInspector() {
       <div className="flex items-center justify-between">
         <span className="font-mono text-[10px] text-fg-faint">{node.id}</span>
       </div>
+
+      {isNumberedWorkflowNode(node) && (
+        <Field label={t(locale, 'inspector.numberLabel')}>
+          <div className="w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 font-mono text-xs text-fg-dim">
+            #{node.numberLabel ?? '-'}
+          </div>
+        </Field>
+      )}
 
       <Field label="Label">
         <input

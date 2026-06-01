@@ -19,6 +19,7 @@ import {
   type NodeType,
 } from './ir';
 import { CTX_OPEN, CTX_CLOSE } from './emitter';
+import { normalizeWorkflowNodeNumbers } from './nodeNumbers';
 import { shortId } from '@/lib/id';
 
 /**
@@ -171,13 +172,13 @@ class ParseContext {
       this.addExecEdge(spine[i].id, spine[i + 1].id);
     }
 
-    return {
+    return normalizeWorkflowNodeNumbers({
       version: 1,
       meta: this.meta,
       nodes: this.nodes,
       edges: this.edges,
       layout: this.layout,
-    };
+    });
   }
 }
 
@@ -441,6 +442,9 @@ function extractAgentSpec(call: CallExpression): IRAgentSpec {
         case 'isolation':
           if (value === 'worktree') spec.isolation = 'worktree';
           break;
+        case 'contextPolicy':
+          if (value === 'tail' || value === 'full') spec.contextPolicy = value;
+          break;
         // legacy: `agent:` was the old key for the sub-agent type.
         case 'agent':
           if (!spec.agentType) spec.agentType = value;
@@ -471,6 +475,7 @@ function specToParams(spec: IRAgentSpec): Record<string, unknown> {
   if (spec.label) params.label = spec.label;
   if (spec.isolation) params.isolation = spec.isolation;
   if (spec.phase) params.phase = spec.phase;
+  if (spec.contextPolicy) params.contextPolicy = spec.contextPolicy;
   return params;
 }
 
@@ -845,7 +850,7 @@ function wrapUnparseable(src: string): IRGraph {
   };
   const start: IRNode = { id: 'n_start', type: 'start', label: 'Start', params: {} };
   const end: IRNode = { id: 'n_end', type: 'end', label: 'End', params: {} };
-  return {
+  return normalizeWorkflowNodeNumbers({
     version: 1,
     meta: { name: 'unparsed', adapter: 'claude-code' },
     nodes: [start, code, end],
@@ -868,5 +873,5 @@ function wrapUnparseable(src: string): IRGraph {
       [code.id]: { x: 240, y: 160 },
       [end.id]: { x: 480, y: 160 },
     },
-  };
+  });
 }

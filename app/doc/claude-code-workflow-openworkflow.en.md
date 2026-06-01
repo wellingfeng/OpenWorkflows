@@ -174,6 +174,40 @@ But the overall direction is clear: AI coding will not stay forever at "open a c
 
 Complex tasks will eventually become workflows because they can be seen, edited, migrated, and reused.
 
+### Bonus: don't want the UI? Two commands on the CLI are enough
+
+Everything above is the GUI. But plenty of situations don't actually need a canvas — you might want to wire a workflow into CI, drop it into a shell script, or run it headless on a server. So OpenWorkflows also ships a command-line version, exposed through a skill called `/openworkflows`.
+
+I deliberately kept it minimal: **from the user's side, there are only two commands**. On the CLI you don't need to think about blueprints, IRGraph, or compilation — **a workflow is just a `.js` script to you**, and everything else happens automatically.
+
+```bash
+owf gen "build me a code-review workflow" -o review.js   # generate a workflow script from one sentence
+owf gen review.js "add a security-review node"           # modify an existing script with one sentence
+owf run review.js                                        # run the script
+```
+
+That's the whole surface area (really just two commands: `gen` and `run`).
+
+**`owf gen`** generates or modifies workflows from natural language. It's the same capability behind the AI input box at the bottom of the GUI: you describe what you want and it produces a script; you point at an existing script and describe a change, and it edits it for you.
+
+One important detail: **it's zero-config — you don't have to plug in an API key**. It reuses the `claude` CLI that's already logged in on your machine (the same path the runtime uses), so as long as you have claude installed and authenticated, `owf gen` just works. If it isn't installed, it'll nudge you to run `claude login` first.
+
+**`owf run`** executes a script, walking through it node by node and streaming progress to your terminal:
+
+```text
+[14:32:02] ▶ agent n_scan
+[14:32:15] ✓ agent n_scan — 13.2s
+[14:32:15] ▶ parallel n_review (3 branches)
+[14:32:31] ✓ parallel n_review — 16.1s
+done — 29.8s
+```
+
+Parallelism, pipelines, adversarial validation, automatic retries — all of that behaves exactly the same as hitting "Run" in the GUI, because **the CLI and the GUI share the same execution kernel**. One paints the result onto a canvas, the other prints it to a terminal.
+
+A few flags you'll reach for: `--dry-run` does a preflight without spending tokens, `--resume` picks up from the last failed node, `--model` pins a specific model, and `--json` emits machine-readable output for pipelines.
+
+The tradeoff in one line: **the GUI is for "seeing and editing," the CLI is for "running fast and plugging in," but both sit on top of the same workflow.**
+
 QQ group: 149523963
 
 Project:

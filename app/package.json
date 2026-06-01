@@ -1,16 +1,21 @@
 {
   "name": "openworkflow-app",
   "private": true,
-  "version": "0.1.11",
+  "version": "0.1.12",
   "type": "module",
+  "bin": {
+    "owf": "./cli/dist/owf.mjs"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "check:prompt-lock": "node --experimental-strip-types scripts/prompt-entry-lock-check.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.cli.json --noEmit",
     "lint": "eslint . --ext ts,tsx",
     "test": "vitest run --environment jsdom",
+    "cli:build": "node cli/build.mjs",
+    "cli:dev": "node --experimental-strip-types cli/bin/owf.ts",
     "tauri": "tauri",
     "desktop": "tauri dev",
     "package": "tauri build"
@@ -39,6 +44,9 @@
     "@typescript-eslint/parser": "^7.18.0",
     "@vitejs/plugin-react": "^4.3.3",
     "autoprefixer": "^10.4.20",
+    "chalk": "^4.1.2",
+    "commander": "^4.1.1",
+    "esbuild": "^0.21.5",
     "eslint": "^8.57.1",
     "eslint-plugin-react-hooks": "^4.6.2",
     "eslint-plugin-react-refresh": "^0.4.14",

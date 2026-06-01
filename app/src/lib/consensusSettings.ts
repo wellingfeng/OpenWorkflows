@@ -28,7 +28,7 @@ export const CONSENSUS_LIMITS = {
   genCandidates: { min: 2, max: 5, def: 3 },
   voteSamples: { min: 2, max: 7, def: 3 },
   concurrency: { min: 1, max: 16, def: 10 },
-  slowConcurrency: { min: 1, max: 16, def: 2 },
+  slowConcurrency: { min: 1, max: 16, def: 4 },
   standardConcurrency: { min: 1, max: 16, def: 5 },
   fastConcurrency: { min: 1, max: 16, def: 10 },
 } as const;

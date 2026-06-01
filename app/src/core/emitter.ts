@@ -252,6 +252,10 @@ function nodeToSpec(node: IRNode): IRAgentSpec {
     schema: optStr(p.schema),
     isolation: p.isolation === 'worktree' ? 'worktree' : undefined,
     phase: optStr(p.phase),
+    contextPolicy:
+      p.contextPolicy === 'tail' || p.contextPolicy === 'full'
+        ? p.contextPolicy
+        : undefined,
   };
 }
 
@@ -275,6 +279,7 @@ function emitAgentOpts(spec: IRAgentSpec): string {
   if (spec.gateway) opts.push(`gateway: ${emitGatewaySelection(spec.gateway)}`);
   if (spec.schema) opts.push(`schema: ${ident(spec.schema)}`); // bare identifier
   if (spec.isolation) opts.push(`isolation: ${str(spec.isolation)}`);
+  if (spec.contextPolicy) opts.push(`contextPolicy: ${str(spec.contextPolicy)}`);
   if (opts.length === 0) return '';
   return `, { ${opts.join(', ')} }`;
 }

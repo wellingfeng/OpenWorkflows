@@ -1,11 +1,9 @@
 import { create } from 'zustand';
 import {
   DATA,
-  type ConsensusStrategy,
   type IREndpoint,
   type GatewaySelection,
   type IRGraph,
-  type IRLayout,
   type IRNode,
   type IRRunSnapshot,
   type IRRunStatus,
@@ -13,13 +11,16 @@ import {
   type NodeType,
   type PinKind,
 } from '@/core/ir';
-import {
-  autoLayoutGraph,
-  hasMissingLayout,
-  hasStructuralChanges,
-} from '@/core/autoLayout';
+import { autoLayoutGraph } from '@/core/autoLayout';
 import { defaultBlueprint } from '@/core/defaultBlueprint';
 import { isEmptyWorkflow } from '@/core/isEmptyWorkflow';
+import { normalizeWorkflowNodeNumbers } from '@/core/nodeNumbers';
+import {
+  BLUEPRINT_DIRECT_EDIT_CONTRACT,
+  prepareGraphEdit,
+  replyIncludesIRGraph,
+  strictBlueprintRetryAppendix,
+} from '@/core/genPrompt';
 import { applyIntent } from '@/core/intentEngine';
 import {
   generationAngles,
@@ -34,7 +35,6 @@ import {
   timeoutPolicyForSelection,
 } from '@/lib/modelSpeed';
 import { appendStartUserInputs } from '@/core/startInputs';
-import { isRunnable, topoOrderExec } from '@/core/topo';
 import { readApiKey, readBaseUrl } from '@/lib/apiConfig';
 import { appendComposerDraftState } from '@/lib/composerEntryPolicy';
 import {
@@ -77,6 +77,19 @@ import {
   type InteractionAnswer,
   type InteractionRequest,
 } from '@/core/interaction';
+import {
+  executeWorkflowDag,
+  formatClock,
+  formatDuration,
+  getRunnableNodes as runnableOrder,
+  parseRunFailure as describeRunFailure,
+  runFailureMeta,
+  runWithConcurrency,
+  type RunCallbacks,
+  type RunContext as RuntimeRunContext,
+  type RunFailure,
+  type RunGateway,
+} from '@/runtime';
 import {
   DEFAULT_LOCALE,
   languageAdaptationPrompt,
@@ -986,9 +999,9 @@ function applyWorkflowEdit(
     if (!patch) return state;
 
     committed = true;
-    nextWorkflow = patch.workflow;
+    nextWorkflow = normalizeWorkflowNodeNumbers(patch.workflow);
 
-    const next: Partial<StoreState> = { workflow: patch.workflow };
+    const next: Partial<StoreState> = { workflow: nextWorkflow };
     if (patch.selectedNodeId !== undefined) {
       next.selectedNodeId = patch.selectedNodeId;
     }
@@ -1030,32 +1043,6 @@ function workflowWithRunSnapshot(
     return workflowWithoutRunSnapshot(workflow);
   }
   return { ...workflow, meta: { ...workflow.meta, run: snapshot } };
-}
-
-function prepareGraphEdit(currentWorkflow: IRGraph, ir: IRGraph): IRGraph {
-  const trustedLayout: IRLayout = {};
-  for (const node of ir.nodes) {
-    const pos = currentWorkflow.layout?.[node.id];
-    if (pos) trustedLayout[node.id] = { x: pos.x, y: pos.y };
-  }
-  const irWithTrustedLayout = { ...ir, layout: trustedLayout };
-  const shouldRelayout =
-    hasStructuralChanges(currentWorkflow, ir) ||
-    hasMissingLayout(irWithTrustedLayout);
-  let nextWorkflow = shouldRelayout
-    ? autoLayoutGraph(irWithTrustedLayout, currentWorkflow, { relayout: 'all' })
-    : irWithTrustedLayout;
-  nextWorkflow = workflowWithoutRunSnapshot(nextWorkflow);
-  if (
-    !nextWorkflow.meta.gateway?.defaults &&
-    currentWorkflow.meta.gateway?.defaults
-  ) {
-    nextWorkflow = withGatewayDefaults(
-      nextWorkflow,
-      currentWorkflow.meta.gateway.defaults,
-    );
-  }
-  return nextWorkflow;
 }
 
 function commitGraphEdit(
@@ -1128,7 +1115,9 @@ function restoreWorkflowRunSnapshot(
   workflow: IRGraph,
   meta?: SessionMeta,
 ): IRGraph {
-  const migrated = migrateWorkflowGateway(workflow, defaultComposer.model);
+  const migrated = normalizeWorkflowNodeNumbers(
+    migrateWorkflowGateway(workflow, defaultComposer.model),
+  );
   const source = runSnapshotFromMeta(meta) ?? migrated.meta.run ?? null;
   if (!source) return workflowWithoutRunSnapshot(migrated);
   const progress = runProgressFromSnapshot(migrated, source);
@@ -3672,15 +3661,6 @@ const MAX_INTERACTION_ROUNDS = 6;
 /** How many times to force a blueprint-only retry when the model gives prose. */
 const MAX_BLUEPRINT_RETRIES = 2;
 
-const BLUEPRINT_DIRECT_EDIT_CONTRACT = `---
-普通 AI 输入框编辑规则：
-- 默认目标是把用户需求写入 workflow 蓝图，而不是生成 Markdown 计划或让用户确认后再做。
-- 必须基于当前 IRGraph 输出“简短中文说明 + 一个完整 \`\`\`json IRGraph 代码块”。
-- 不要输出交互块，不要提问，不要等待批准，不要创建/修改本地文件。
-- 如果需求提到“规划代码修改/支持某功能/实现某能力”，把它转成 workflow 节点：例如需求理解、代码定位、实现、验证、回归检查、总结等步骤。
-- 信息不足时自行做保守假设，并把需要后续确认的事项放进蓝图中的澄清/验证节点。
-- 蓝图规模要和任务复杂度匹配：简单需求优先最小充分结构，复杂需求才展开更多步骤、分支和验证。`;
-
 /** The two — and only two — option labels for the granularity-choice select. */
 const SIMPLE_OPT_MINIMAL = '直接改图（最小改动）';
 const SIMPLE_OPT_FULL = '生成完整多步工作流蓝图';
@@ -3711,26 +3691,6 @@ function isClarifyingEditRequest(text: string): boolean {
   return /(?:先|动手前|改图前|修改前|执行前).*(?:确认|澄清|追问|提问|询问|反问)|(?:确认|澄清|追问|提问|询问|反问).*(?:再|后).*(?:改图|修改|优化|生成)|(?:用|通过).*(?:交互|select\s*\/\s*input|select|input|confirm).*(?:确认|澄清|提问|询问)|逐个.*(?:确认|澄清|提问|询问)|问清|grill[-\s]?me|clarify|ask me|question me|confirm with me/i.test(
     trimmed,
   );
-}
-
-function replyIncludesIRGraph(text: string): boolean {
-  try {
-    const parsed = JSON.parse(extractJsonObject(text)) as Partial<IRGraph>;
-    return Array.isArray(parsed.nodes) && Array.isArray(parsed.edges);
-  } catch {
-    return false;
-  }
-}
-
-function strictBlueprintRetryAppendix(previousReply: string): string {
-  return `\n\n---
-上一轮输出没有包含可解析的 workflow IRGraph，因此不能写入蓝图。上一轮输出节选如下：
-${previousReply.slice(0, 4000)}
-
-请忽略上一轮的 Markdown/计划/确认请求，直接基于最初的用户需求和当前 IRGraph 返回：
-1) 简短中文说明。
-2) 一个完整、可解析、可直接写入蓝图的 \`\`\`json IRGraph 代码块。
-不得创建或修改本地文件，不得等待用户批准。`;
 }
 
 /**
@@ -3790,28 +3750,6 @@ function pushRunLog(
 ): void {
   const msg: Message = { id: shortId('m'), role, text, createdAt: Date.now() };
   pushChannelMessage(ch, msg, true);
-}
-
-function formatClock(ts: number): string {
-  const d = new Date(ts);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-function formatDuration(ms: number): string {
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const sec = String(seconds).padStart(2, '0');
-  const min = String(minutes).padStart(2, '0');
-  if (hours > 0) return `${hours}h ${min}m ${sec}s`;
-  if (minutes > 0) return `${minutes}m ${sec}s`;
-  return `${seconds}s`;
-}
-
-function runnableOrder(workflow: IRGraph): IRNode[] {
-  return topoOrderExec(workflow).filter(isRunnable);
 }
 
 function findResumeNodeId(state: StoreState): string | null {
@@ -4064,323 +4002,78 @@ async function invokeAgentCli(
   }
 }
 
-async function invokeGatewayAgent(
-  ch: RunChannel,
-  prompt: string,
-  selection: GatewaySelection,
-  opts: {
-    model?: string;
-    omitModel?: boolean;
-    cliCommand?: string;
-    cwd?: string;
-    permission?: string;
-    timeoutSeconds?: number;
-    idleTimeoutSeconds?: number;
-    onProgress?: (text: string) => void;
-    sessionId?: string;
-    resume?: boolean;
-  } = {},
-): Promise<{ text: string; adapter: string }> {
-  const direct = resolveDirectGatewayRoute(selection);
-  if (direct) {
-    const startedAt = Date.now();
-    let firstProgressAt: number | undefined;
-    try {
+/**
+ * Build the injected {@link RunGateway} for the desktop GUI. The "direct HTTP"
+ * path stays `completeGatewayText` (browser fetch); the CLI subprocess path is
+ * the Tauri spawn seam `invokeAgentCli` (which tracks the run's cliRunIds so the
+ * stop button can cancel in-flight processes). Selection resolution and the
+ * speed/timeout heuristics delegate to the existing lib helpers, so behaviour is
+ * identical to the pre-refactor inline implementation.
+ */
+function buildGuiGateway(ch: RunChannel): RunGateway {
+  return {
+    resolveDirectRoute: (selection) => {
+      const direct = resolveDirectGatewayRoute(selection);
+      return direct ? { adapter: direct.adapter, model: direct.model } : null;
+    },
+    resolveCliRoute: async (selection) => {
+      const cli = await resolveCliGatewayRoute(selection);
+      return {
+        adapter: cli.adapter,
+        model: cli.model,
+        cliCommand: cli.cliCommand,
+        env: cli.env,
+      };
+    },
+    completeText: async ({ selection, model, omitModel, prompt, onDelta }) => {
+      // Re-resolve the full direct route (apiKey/baseUrl/transport) off the
+      // selection, then apply the per-call model override exactly as the
+      // pre-refactor invokeGatewayAgent did.
+      const direct = resolveDirectGatewayRoute(selection);
+      if (!direct) throw new Error('NO_MODEL_GATEWAY_BACKEND');
       const text = await completeGatewayText({
-        route: {
-          ...direct,
-          model: opts.omitModel ? undefined : opts.model ?? direct.model,
-        },
+        route: { ...direct, model: omitModel ? undefined : model ?? direct.model },
         system: '',
         userContent: prompt,
         maxTokens: 8192,
-        onDelta: (chunk) => {
-          firstProgressAt ??= Date.now();
-          opts.onProgress?.(chunk);
-        },
-      });
-      recordModelCall(selection, {
-        elapsedMs: Date.now() - startedAt,
-        firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
-        ok: true,
+        onDelta,
       });
       return { text, adapter: direct.adapter };
-    } catch (err) {
-      const failure = describeRunFailure(err);
-      recordModelCall(selection, {
-        elapsedMs: Date.now() - startedAt,
-        firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
-        ok: false,
-        failureCode: failure.code,
-        timeoutSeconds: failure.timeoutSeconds,
-        idleTimeoutSeconds: failure.idleTimeoutSeconds,
-      });
-      throw err;
-    }
-  }
-
-  const cli = await resolveCliGatewayRoute(selection);
-  const startedAt = Date.now();
-  let firstProgressAt: number | undefined;
-  try {
-    const text = await invokeAgentCli(ch, prompt, cli.adapter, {
-      model: opts.omitModel ? undefined : opts.model ?? cli.model,
-      env: cli.env,
-      cwd: opts.cwd,
-      permission: opts.permission,
-      timeoutSeconds: opts.timeoutSeconds,
-      idleTimeoutSeconds: opts.idleTimeoutSeconds,
-      cliCommand: opts.cliCommand ?? cli.cliCommand,
-      onProgress: (chunk) => {
-        firstProgressAt ??= Date.now();
-        opts.onProgress?.(chunk);
-      },
-      sessionId: opts.sessionId,
-      resume: opts.resume,
-    });
-    recordModelCall(selection, {
-      elapsedMs: Date.now() - startedAt,
-      firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
-      ok: true,
-    });
-    return { text, adapter: cli.adapter };
-  } catch (err) {
-    const failure = describeRunFailure(err);
-    recordModelCall(selection, {
-      elapsedMs: Date.now() - startedAt,
-      firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
-      ok: false,
-      failureCode: failure.code,
-      timeoutSeconds: failure.timeoutSeconds,
-      idleTimeoutSeconds: failure.idleTimeoutSeconds,
-    });
-    throw err;
-  }
+    },
+    spawnCliAgent: (prompt, adapter, opts) =>
+      invokeAgentCli(ch, prompt, adapter, {
+        model: opts.model,
+        env: opts.env,
+        cwd: opts.cwd,
+        permission: opts.permission,
+        timeoutSeconds: opts.timeoutSeconds,
+        idleTimeoutSeconds: opts.idleTimeoutSeconds,
+        cliCommand: opts.cliCommand,
+        onProgress: opts.onProgress,
+        sessionId: opts.sessionId,
+        resume: opts.resume,
+      }),
+    applyOverride: (selection, override) =>
+      applyGatewayOverride(selection, override),
+    recordCall: (selection, timing) => recordModelCall(selection, timing),
+    timeoutPolicy: (selection, prompt) =>
+      timeoutPolicyForSelection(selection, prompt),
+    effectiveConcurrency: (configured, selection) =>
+      effectiveRunConcurrency(configured, selection),
+    effectiveConsensusSamples: (configured, selection) =>
+      effectiveConsensusSamples(configured, selection),
+    nodeGatewayOverride: (nodeOrParams) => nodeGatewayOverride(nodeOrParams),
+    modelClassFromModelId: (model) => modelClassFromModelId(model),
+  };
 }
 
-/** A fresh Claude session id (uuid) for chaining warm context across steps. */
-function newSessionId(): string {
-  try {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      return crypto.randomUUID();
-    }
-  } catch {
-    /* fall through */
-  }
-  // Deterministic-enough fallback uuid v4 shape.
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
-
-function withNodeExecutionContract(prompt: string): string {
-  return `${prompt}
-
----
-OpenWorkflows node execution contract:
-- Treat this as one bounded workflow node, not an open-ended session.
-- Finish with a concise final answer even if optional verification remains.
-- Do not start long-running ad-hoc harnesses after the requested checks pass.
-- If a command or investigation stops making progress, stop and report the exact next step instead of waiting indefinitely.`;
-}
-
-/** Collect outputs of nodes that feed `node` via data edges (producer → node). */
-function dataInputsFor(
-  node: IRNode,
-  workflow: IRGraph,
-  results: Map<string, string>,
-): { label: string; text: string }[] {
-  const byId = new Map(workflow.nodes.map((n) => [n.id, n]));
-  const inputs: { label: string; text: string }[] = [];
-  for (const e of workflow.edges) {
-    if (e.kind !== DATA || e.to.node !== node.id) continue;
-    const out = results.get(e.from.node);
-    if (out == null) continue;
-    inputs.push({ label: byId.get(e.from.node)?.label ?? e.from.node, text: out });
-  }
-  return inputs;
-}
-
-/** An agent spec for a parallel branch / pipeline stage (tolerates legacy strings). */
+/** GUI-side {@link RunSpec} mirror (legacy string / object specs). */
 interface RunSpec {
   prompt: string;
   label?: string;
   agentType?: string;
   model?: string;
   gateway?: NodeGatewayOverride;
-}
-
-type RunFailureCode =
-  | 'timeout'
-  | 'idle_timeout'
-  | 'interrupted'
-  | 'exit'
-  | 'spawn'
-  | 'backend'
-  | 'wait'
-  | 'unknown';
-
-interface RunFailure {
-  code: RunFailureCode;
-  message: string;
-  raw: string;
-  cli?: string;
-  exitCode?: number;
-  timeoutSeconds?: number;
-  idleTimeoutSeconds?: number;
-}
-
-const RUN_ERROR_PREVIEW_LIMIT = 1200;
-
-function compactRunError(text: string): string {
-  const trimmed = text.trim();
-  if (trimmed.length <= RUN_ERROR_PREVIEW_LIMIT) return trimmed;
-  return `${trimmed.slice(0, RUN_ERROR_PREVIEW_LIMIT)}\n...（错误信息已截断）`;
-}
-
-function errorText(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === 'string') return err;
-  try {
-    return JSON.stringify(err) ?? String(err);
-  } catch {
-    return String(err);
-  }
-}
-
-function describeRunFailure(err: unknown): RunFailure {
-  const raw = compactRunError(errorText(err));
-
-  if (raw === 'NO_BACKEND') {
-    return {
-      code: 'backend',
-      raw,
-      message: '当前不在 Tauri 桌面壳，无法调用本地 CLI。',
-    };
-  }
-
-  const timeout = /CLI "([^"]+)" 超时[（(](\d+)s[）)]已终止/u.exec(raw);
-  if (timeout) {
-    const seconds = Number(timeout[2]);
-    return {
-      code: 'timeout',
-      raw,
-      cli: timeout[1],
-      timeoutSeconds: seconds,
-      message: `CLI "${timeout[1]}" 超过 ${seconds}s 未完成，已终止。可通过 OPENWORKFLOW_AI_CLI_TIMEOUT_SECS 调整上限。`,
-    };
-  }
-
-  const idleTimeout =
-    /CLI "([^"]+)" 空转超过 (\d+)s 未产生输出，已终止/u.exec(raw);
-  if (idleTimeout) {
-    const seconds = Number(idleTimeout[2]);
-    return {
-      code: 'idle_timeout',
-      raw,
-      cli: idleTimeout[1],
-      idleTimeoutSeconds: seconds,
-      message: `CLI "${idleTimeout[1]}" 超过 ${seconds}s 没有新的输出或结果文件更新，已终止。可通过 OPENWORKFLOW_AI_CLI_IDLE_TIMEOUT_SECS 调整。`,
-    };
-  }
-
-  const interrupted = /CLI "([^"]+)" 已由用户中断/u.exec(raw);
-  if (interrupted) {
-    return {
-      code: 'interrupted',
-      raw,
-      cli: interrupted[1],
-      message: `CLI "${interrupted[1]}" 已由用户中断。`,
-    };
-  }
-
-  const exit = /CLI "([^"]+)" 退出码 (-?\d+):\s*([\s\S]*)/u.exec(raw);
-  if (exit) {
-    const detail = exit[3]?.trim();
-    return {
-      code: 'exit',
-      raw,
-      cli: exit[1],
-      exitCode: Number(exit[2]),
-      message: `CLI "${exit[1]}" 退出码 ${exit[2]}${
-        detail ? `: ${detail}` : ''
-      }`,
-    };
-  }
-
-  const spawn = /启动 CLI "([^"]+)" 失败:\s*([\s\S]*)/u.exec(raw);
-  if (spawn) {
-    return {
-      code: 'spawn',
-      raw,
-      cli: spawn[1],
-      message: `无法启动 CLI "${spawn[1]}"：${spawn[2].trim()}`,
-    };
-  }
-
-  const wait = /等待 CLI "([^"]+)" 失败:\s*([\s\S]*)/u.exec(raw);
-  if (wait) {
-    return {
-      code: 'wait',
-      raw,
-      cli: wait[1],
-      message: `等待 CLI "${wait[1]}" 结束失败：${wait[2].trim()}`,
-    };
-  }
-
-  return { code: 'unknown', raw, message: raw || '未知错误' };
-}
-
-function failureTitle(failure: RunFailure): string {
-  switch (failure.code) {
-    case 'timeout':
-      return '超时';
-    case 'idle_timeout':
-      return '空转超时';
-    case 'interrupted':
-      return '已中断';
-    case 'exit':
-      return '执行失败';
-    case 'spawn':
-      return '启动失败';
-    case 'backend':
-      return '后端不可用';
-    case 'wait':
-      return '等待失败';
-    default:
-      return '失败';
-  }
-}
-
-function formatFailureLine(label: string, failure: RunFailure): string {
-  return `✗ ${label} ${failureTitle(failure)}: ${failure.message}`;
-}
-
-function runFailureMeta(
-  node: IRNode,
-  adapter: string,
-  failure: RunFailure,
-): Record<string, unknown> {
-  return {
-    code: failure.code,
-    message: failure.message,
-    raw: failure.raw,
-    adapter,
-    nodeId: node.id,
-    nodeLabel: node.label ?? node.type,
-    nodeType: node.type,
-    occurredAt: Date.now(),
-    ...(failure.cli ? { cli: failure.cli } : {}),
-    ...(failure.exitCode == null ? {} : { exitCode: failure.exitCode }),
-    ...(failure.timeoutSeconds == null
-      ? {}
-      : { timeoutSeconds: failure.timeoutSeconds }),
-    ...(failure.idleTimeoutSeconds == null
-      ? {}
-      : { idleTimeoutSeconds: failure.idleTimeoutSeconds }),
-  };
 }
 
 /** Coerce a params array into RunSpec[] (objects or legacy string[]). */
@@ -4416,17 +4109,6 @@ function runGlobalGatewaySelection(
   return (
     ch.config.gatewaySelection ??
     workflowDefaultGatewaySelection(workflow, ch.config.model)
-  );
-}
-
-function runNodeGatewaySelection(
-  ch: RunChannel,
-  workflow: IRGraph,
-  node: IRNode,
-): GatewaySelection {
-  return applyGatewayOverride(
-    runGlobalGatewaySelection(ch, workflow),
-    nodeGatewayOverride(node.params) ?? undefined,
   );
 }
 
@@ -4483,19 +4165,6 @@ function createStreamMessage(
 }
 
 /** The "上游输出" context block for a node, or '' when it has no data inputs. */
-function dataContextString(
-  node: IRNode,
-  workflow: IRGraph,
-  results: Map<string, string>,
-): string {
-  const inputs = dataInputsFor(node, workflow, results);
-  if (inputs.length === 0) return '';
-  const ctx = inputs
-    .map((i) => `### 来自「${i.label}」的输出\n${i.text}`)
-    .join('\n\n');
-  return `\n\n---\n以下是上游步骤的输出，供你参考：\n\n${ctx}`;
-}
-
 /**
  * Is the run still active? (false once the user hits 停止 or the run ends.)
  * Keyed on the run channel — NOT the global `mode` — so the loop keeps executing
@@ -4506,234 +4175,72 @@ function stillRunning(ch: RunChannel): boolean {
 }
 
 /**
- * Run one CLI step that may ask the user to choose/type before producing its
- * final result. Streams each attempt into its own dock message. If the model
- * emits an interaction block (see core/interaction.ts) it renders a widget,
- * waits for the answer, appends it to the prompt, and re-invokes — bounded by
- * MAX_INTERACTION_ROUNDS. Returns the final (interaction-stripped) output;
- * throws on CLI failure (after streaming the failure line) so callers can mark
- * the node errored.
+ * GUI implementation of the headless engine's {@link RunCallbacks}. Maps each
+ * run-engine side effect onto the run channel's shadow state + Zustand commits,
+ * preserving the pre-refactor behaviour: node-state colouring, streaming dock
+ * messages, system/assistant log lines, the stop-button cancel check, and the
+ * React interaction widget. The engine's first-failure bookkeeping is mirrored
+ * here (failedNodeId / error / channelCommit) so resume-from-failed keeps
+ * working.
  */
-async function runCliWithInteraction(opts: {
-  ch: RunChannel;
-  /** Streaming header, e.g. `【label】\n`. */
-  head: string;
-  /** Bracket label for the streamed finalize/failure line (no ✓ prefix). */
-  label: string;
-  /** Prompt base — already includes upstream data context / stage feed. */
-  basePrompt: string;
-  selection: GatewaySelection;
-  cli: {
-    model?: string;
-    omitModel?: boolean;
-    cliCommand?: string;
-    cwd?: string;
-    permission?: string;
-    timeoutSeconds?: number;
-    idleTimeoutSeconds?: number;
-  };
-  /**
-   * Optional Claude session continuity. `id` is the shared session; `resume`
-   * marks whether the *first* attempt continues an existing session (a later
-   * pipeline stage) or creates it (the first stage). Interaction re-invokes
-   * always resume, so a clarifying round keeps the same warm context instead of
-   * recreating the id (which would error).
-   */
-  session?: { id: string; resume: boolean };
-}): Promise<string> {
-  const { ch } = opts;
-  let appendix = '';
-  let lastClean = '';
-  for (let round = 0; round < MAX_INTERACTION_ROUNDS; round += 1) {
-    if (!stillRunning(ch)) return lastClean;
-    const sm = createStreamMessage(
-      ch,
-      round === 0 ? opts.head : `${opts.head}（已根据你的回答继续）\n`,
-    );
-    const prompt = `${withNodeExecutionContract(opts.basePrompt)}\n\n${INTERACTION_PROTOCOL}${appendix}`;
-    const timeoutPolicy = timeoutPolicyForSelection(opts.selection, prompt);
-
-    let raw: string;
-    try {
-      raw = (
-        await invokeGatewayAgent(ch, prompt, opts.selection, {
-          model: opts.cli.model,
-          omitModel: opts.cli.omitModel,
-          cliCommand: opts.cli.cliCommand,
-          cwd: opts.cli.cwd,
-          permission: opts.cli.permission,
-          timeoutSeconds: opts.cli.timeoutSeconds ?? timeoutPolicy.timeoutSeconds,
-          idleTimeoutSeconds:
-            opts.cli.idleTimeoutSeconds ?? timeoutPolicy.idleTimeoutSeconds,
-          onProgress: sm.append,
-          sessionId: opts.session?.id,
-          // First attempt uses the caller's resume intent; any re-ask continues
-          // the now-existing session.
-          resume: opts.session ? opts.session.resume || round > 0 : undefined,
-        })
-      ).text.trim();
-    } catch (err) {
-      const failure = describeRunFailure(err);
-      if (stillRunning(ch)) sm.fail(formatFailureLine(opts.label, failure));
-      throw err;
-    }
-
-    const clean = stripInteraction(raw);
-    lastClean = clean;
-
-    // Stopped during the call, or the node produced a plain result → done.
-    const req = stillRunning(ch) ? parseInteraction(raw) : null;
-    if (!req) {
-      if (!stillRunning(ch)) return clean;
-      sm.finalize(`【✓ ${opts.label}】\n${clean || '(无输出)'}`);
-      return clean;
-    }
-
-    // The node is asking. Finalize this attempt (showing any prose it emitted),
-    // render the widget, and block until the user answers.
-    sm.finalize(
-      clean
-        ? `【${opts.label}】\n${clean}`
-        : `【${opts.label}】\n（已向你提出一个问题，请在下方作答）`,
-    );
-    const answer = await awaitInteraction(ch, req);
-    if (!answer || !stillRunning(ch)) return clean; // dismissed or run stopped
-    appendix += `\n\n${formatAnswerForPrompt(req, answer)}`;
-  }
-
-  pushRunLog(
-    ch,
-    `⚠ ${opts.label}：交互轮数已达上限（${MAX_INTERACTION_ROUNDS}），停止追问。`,
-    'system',
-  );
-  return lastClean;
-}
-
-/**
- * Run a `parallel` node: each branch is its own concurrent `claude -p` call
- * (real fan-out, not one lumped prompt). All branches share the node's upstream
- * data context. Per-branch output streams in as it lands; the combined output is
- * threaded to downstream nodes. Throws only if every branch fails.
- */
-async function runParallel(
+function buildGuiCallbacks(
   ch: RunChannel,
-  node: IRNode,
-  workflow: IRGraph,
-  results: Map<string, string>,
-): Promise<string> {
-  const branches = specList(node.params.branches);
-  if (branches.length === 0) return '';
-  const upstream = dataContextString(node, workflow, results);
-  const baseSelection = runNodeGatewaySelection(ch, workflow, node);
-
-  const settled = await runWithConcurrency(
-    branches,
-    Math.min(
-      branches.length,
-      effectiveRunConcurrency(runConcurrency(), baseSelection),
-    ),
-    async (b, i) => {
-      const label = b.label || b.agentType || b.prompt.slice(0, 16) || `分支${i + 1}`;
-      const stepLabel = `并行分支 ${i + 1}/${branches.length} · ${label}`;
-      const branchSelection = applyGatewayOverride(
-        baseSelection,
-        runSpecGatewayOverride(b),
-      );
-      try {
-        const out = (
-          await runCliWithInteraction({
-            ch,
-            head: `【${stepLabel}】\n`,
-            label: stepLabel,
-            basePrompt: b.prompt + upstream,
-            selection: branchSelection,
-            cli: {
-              cwd: ch.config.cwd,
-              permission: ch.config.permission,
-            },
-          })
-        ).trim();
-        return { ok: true as const, label, out };
-      } catch (err) {
-        const failure = describeRunFailure(err);
-        return { ok: false as const, label, out: '', failure };
+  adapter: string,
+  errorRef: { errored: boolean },
+): RunCallbacks {
+  return {
+    onNodeStart: (node) => markRunNode(ch, node.id, 'running'),
+    onNodeSuccess: (node, output) => {
+      if (output !== null) {
+        ch.runOutputs = { ...ch.runOutputs, [node.id]: output };
+        if (!errorRef.errored) ch.failedNodeId = null;
+      }
+      markRunNode(ch, node.id, 'success');
+    },
+    onNodeFailure: (node, failure, state) => {
+      // Only the first failure becomes the run's recorded error / resume point;
+      // still-in-flight siblings that also fail don't clobber it.
+      if (!errorRef.errored) {
+        errorRef.errored = true;
+        const runError = runFailureMeta(node, adapter, failure);
+        ch.runState = { ...ch.runState, [node.id]: state };
+        ch.failedNodeId = node.id;
+        ch.error = runError;
+        channelCommit(ch, state, true);
+      } else {
+        markRunNode(ch, node.id, state);
       }
     },
-  );
-
-  if (settled.every((s) => !s.ok)) {
-    const detail = settled
-      .map((s) => (s.ok ? '' : `${s.label}: ${s.failure.message}`))
-      .filter(Boolean)
-      .join('；');
-    throw new Error(detail ? `所有并行分支均失败：${detail}` : '所有并行分支均失败');
-  }
-  return settled
-    .map((s) =>
-      s.ok ? `【${s.label}】\n${s.out}` : `【${s.label}】\n(失败：${s.failure.message})`,
-    )
-    .join('\n\n');
+    onNodeRetry: (node) => markRunNode(ch, node.id, 'running'),
+    onLog: (text, role) =>
+      pushRunLog(
+        ch,
+        text,
+        role === 'assistant' ? 'assistant' : 'system',
+      ),
+    beginStream: (header) => createStreamMessage(ch, header),
+    isCancelled: () => !stillRunning(ch),
+    promptInteraction: (req) => awaitInteraction(ch, req),
+  };
 }
 
 /**
- * Run a `pipeline` node: stages execute sequentially, each receiving the previous
- * stage's output (the first stage also gets the node's upstream context + items
- * expression). Returns the final stage's output.
+ * Build the engine {@link RuntimeRunContext} from the run channel + the host's
+ * localStorage-tuned knobs (concurrency / retries / consensus samples) and the
+ * GUI gateway. The engine never reads these globals — they are resolved here and
+ * injected.
  */
-async function runPipeline(
-  ch: RunChannel,
-  node: IRNode,
-  workflow: IRGraph,
-  results: Map<string, string>,
-): Promise<string> {
-  const stages = specList(node.params.stages);
-  if (stages.length === 0) return '';
-  const items = String(node.params.items ?? '').trim();
-  let prev = '';
-  const baseSelection = runNodeGatewaySelection(ch, workflow, node);
-
-  // A pipeline is one agent working through sequential stages, so share a single
-  // Claude session across the stages (claude adapter only): each stage continues
-  // the previous stage's warm context instead of cold-starting and re-exploring
-  // the project — the dominant per-node cost. Other adapters ignore the flags.
-  const isClaude =
-    baseSelection.adapter === 'claude-code' || baseSelection.adapter === 'claude';
-  const sessionId = isClaude ? newSessionId() : undefined;
-
-  for (let i = 0; i < stages.length; i += 1) {
-    if (!stillRunning(ch)) break;
-    const s = stages[i];
-    const label = s.label || s.prompt.slice(0, 16) || `阶段${i + 1}`;
-    const stepLabel = `流水线阶段 ${i + 1}/${stages.length} · ${label}`;
-    const feed =
-      i === 0
-        ? dataContextString(node, workflow, results) +
-          (items ? `\n\n输入数据: ${items}` : '')
-        : `\n\n---\n上一步输出：\n${prev}`;
-    const stageSelection = applyGatewayOverride(
-      baseSelection,
-      runSpecGatewayOverride(s),
-    );
-    prev = (
-      await runCliWithInteraction({
-        ch,
-        head: `【${stepLabel}】\n`,
-        label: stepLabel,
-        basePrompt: s.prompt + feed,
-        selection: stageSelection,
-        cli: {
-          // On a resumed stage the session already carries its model; passing a
-          // different --model alongside --resume can conflict, so only set it
-          // through the gateway route when creating the session.
-          omitModel: !!(sessionId && i > 0),
-          cwd: ch.config.cwd,
-          permission: ch.config.permission,
-        },
-        session: sessionId ? { id: sessionId, resume: i > 0 } : undefined,
-      })
-    ).trim();
-  }
-  return prev;
+function buildGuiRunContext(ch: RunChannel, workflow: IRGraph): RuntimeRunContext {
+  return {
+    selection: runGlobalGatewaySelection(ch, workflow),
+    cwd: ch.config.cwd,
+    permission: ch.config.permission,
+    concurrency: runConcurrency(),
+    maxRetries: runMaxRetries(),
+    consensusSamples: defaultConsensusSamples(),
+    gateway: buildGuiGateway(ch),
+    cliCommand: ch.config.cliCommand,
+  };
 }
 
 /** Default fan-out samples for a consensus node (localStorage owf_consensus_default_samples). */
@@ -4750,232 +4257,6 @@ function defaultConsensusSamples(): number {
     /* ignore */
   }
   return 3;
-}
-
-/** Clamp a samples value to the supported 2..7 range. */
-function clampSamples(value: unknown): number {
-  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : defaultConsensusSamples();
-  return Math.min(7, Math.max(2, n || 3));
-}
-
-/** Coerce an arbitrary value into a known ConsensusStrategy (default multi-lens). */
-function consensusStrategy(value: unknown): ConsensusStrategy {
-  return value === 'adversarial' ||
-    value === 'tournament' ||
-    value === 'self-consistency'
-    ? value
-    : 'multi-lens';
-}
-
-/** Run `fn` over `items` with bounded concurrency, preserving result order. */
-async function runWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const i = next;
-      next += 1;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i], i);
-    }
-  };
-  const workers = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return results;
-}
-
-type ConsensusSample =
-  | { ok: true; label: string; out: string }
-  | { ok: false; label: string; out: ''; failure?: RunFailure };
-
-/**
- * Run a `consensus` node: fan out N voters over the SAME target (multi-angle
- * exploration), then cross-validate + vote per strategy and return the single
- * winning answer downstream (Claude-Code-style "win by adversarial verification").
- * Sample concurrency is capped at min(N, runConcurrency()) so an N-way vote can't
- * spawn unbounded `claude -p` processes. Mirrors runParallel's failure policy:
- * throws only when too few samples succeed to vote, so node-level auto-retry and
- * resume-from-failed-node keep working.
- */
-async function runConsensus(
-  ch: RunChannel,
-  node: IRNode,
-  workflow: IRGraph,
-  results: Map<string, string>,
-): Promise<string> {
-  const voters = specList(node.params.voters);
-  if (voters.length === 0) return '';
-  const strategy = consensusStrategy(node.params.strategy);
-  const upstream = dataContextString(node, workflow, results);
-  const baseSelection = runNodeGatewaySelection(ch, workflow, node);
-
-  // self-consistency replicates the first voter; other strategies use distinct lenses.
-  const samples =
-    strategy === 'self-consistency'
-      ? Array.from(
-          { length: effectiveConsensusSamples(clampSamples(node.params.samples), baseSelection) },
-          () => voters[0],
-        )
-      : voters;
-  const total = samples.length;
-  const quorum =
-    typeof node.params.quorum === 'number' && node.params.quorum > 0
-      ? node.params.quorum
-      : Math.ceil(total / 2);
-
-  const settled = await runWithConcurrency<RunSpec, ConsensusSample>(
-    samples,
-    Math.min(total, effectiveRunConcurrency(runConcurrency(), baseSelection)),
-    async (s, i) => {
-      if (!stillRunning(ch)) return { ok: false, label: `样本${i + 1}`, out: '' };
-      const label = s.label || s.agentType || s.prompt.slice(0, 16) || `样本${i + 1}`;
-      const stepLabel = `共识样本 ${i + 1}/${total} · ${label}`;
-      const sampleSelection = applyGatewayOverride(baseSelection, runSpecGatewayOverride(s));
-      try {
-        const out = (
-          await runCliWithInteraction({
-            ch,
-            head: `【${stepLabel}】\n`,
-            label: stepLabel,
-            basePrompt: s.prompt + upstream,
-            selection: sampleSelection,
-            cli: { cwd: ch.config.cwd, permission: ch.config.permission },
-          })
-        ).trim();
-        return { ok: true, label, out };
-      } catch (err) {
-        return { ok: false, label, out: '', failure: describeRunFailure(err) };
-      }
-    },
-  );
-
-  const oks = settled.filter((s): s is { ok: true; label: string; out: string } => s.ok && !!s.out);
-  if (oks.length < 2) {
-    if (oks.length === 1) return oks[0].out; // single survivor — return rather than dead-end
-    const detail = settled
-      .map((s) => (s.ok ? '' : `${s.label}: ${s.failure?.message ?? '无输出'}`))
-      .filter(Boolean)
-      .join('；');
-    throw new Error(detail ? `共识失败：可用样本不足以投票（${detail}）` : '共识失败：可用样本不足以投票');
-  }
-  if (!stillRunning(ch)) return oks[0].out;
-
-  return resolveConsensus(
-    ch,
-    node,
-    oks.map((s) => s.out),
-    strategy,
-    quorum,
-    baseSelection,
-  );
-}
-
-/** Cross-validate the candidate outputs and return the consensus answer. */
-async function resolveConsensus(
-  ch: RunChannel,
-  node: IRNode,
-  candidates: string[],
-  strategy: ConsensusStrategy,
-  quorum: number,
-  baseSelection: GatewaySelection,
-): Promise<string> {
-  // self-consistency: deterministic majority over normalized text (no model call).
-  if (strategy === 'self-consistency') {
-    const buckets = new Map<string, { rep: string; n: number }>();
-    for (const c of candidates) {
-      const key = c.trim().toLowerCase().replace(/\s+/g, ' ');
-      const b = buckets.get(key);
-      if (b) b.n += 1;
-      else buckets.set(key, { rep: c, n: 1 });
-    }
-    let best = { rep: candidates[0], n: 0 };
-    for (const b of buckets.values()) if (b.n > best.n) best = b;
-    pushRunLog(ch, `共识(自一致投票)：最高一致 ${best.n}/${candidates.length}`, 'system');
-    if (best.n >= quorum) return best.rep;
-    // No quorum → fall through to an arbiter so the node never dead-ends.
-  }
-
-  const instruction =
-    strategy === 'adversarial'
-      ? '下面是多个独立得出的结论。请逐条尝试证伪，丢弃站不住脚的，只综合那些扛住反驳的结论，给出最终答案。'
-      : strategy === 'tournament'
-        ? '下面是多个独立方案。请按质量择优选出最佳方案，并把其它方案中值得借鉴的亮点合并进去，输出最终方案。'
-        : '下面是多个独立角度对同一目标的判定。请按多数意见综合，给出最可信的最终结论，并简述理由。';
-  const block = candidates.map((c, i) => `【候选 ${i + 1}】\n${c}`).join('\n\n');
-  const label = `${node.label ?? '共识'} · 评审/投票`;
-  return (
-    await runCliWithInteraction({
-      ch,
-      head: `【${label}】\n`,
-      label,
-      basePrompt: `${instruction}\n\n${block}`,
-      selection: baseSelection,
-      cli: { cwd: ch.config.cwd, permission: ch.config.permission },
-    })
-  ).trim();
-}
-
-/**
- * Execute one node, returning its result string (stored for downstream data
- * edges), or null when there is nothing to run (control / log / variable /
- * codeblock). Streams sub-results for parallel/pipeline. Throws on hard error.
- */
-async function runNode(
-  ch: RunChannel,
-  node: IRNode,
-  workflow: IRGraph,
-  results: Map<string, string>,
-): Promise<string | null> {
-  const label = node.label ?? node.type;
-  const nodeSelection = runNodeGatewaySelection(ch, workflow, node);
-  switch (node.type) {
-    case 'agent': {
-      const base = String(node.params.prompt ?? node.label ?? '').trim();
-      if (!base) return '';
-      return runCliWithInteraction({
-        ch,
-        head: `【${label}】\n`,
-        label,
-        basePrompt: base + dataContextString(node, workflow, results),
-        selection: nodeSelection,
-        cli: {
-          cwd: ch.config.cwd,
-          permission: ch.config.permission,
-        },
-      });
-    }
-    case 'workflow': {
-      const base = `运行子工作流 "${String(node.params.name ?? node.label ?? 'sub')}" 并返回结果。`;
-      return runCliWithInteraction({
-        ch,
-        head: `【${label}】\n`,
-        label,
-        basePrompt: base + dataContextString(node, workflow, results),
-        selection: nodeSelection,
-        cli: {
-          cwd: ch.config.cwd,
-          permission: ch.config.permission,
-        },
-      });
-    }
-    case 'parallel':
-      return runParallel(ch, node, workflow, results);
-    case 'pipeline':
-      return runPipeline(ch, node, workflow, results);
-    case 'consensus':
-      return runConsensus(ch, node, workflow, results);
-    case 'log': {
-      const msg = String(node.params.message ?? node.params.msg ?? '').trim();
-      if (msg) pushRunLog(ch, msg);
-      return null;
-    }
-    default:
-      return null; // start/end/branch/loop/variable/codeblock
-  }
 }
 
 /** Default number of workflow nodes executed concurrently (see runConcurrency). */
@@ -5010,23 +4291,6 @@ function runConcurrency(): number {
 const DEFAULT_RUN_MAX_RETRIES = 2;
 
 /**
- * Failure codes worth re-attempting automatically. These are transient or
- * non-deterministic: a CLI timeout / idle-timeout (the common case — the model
- * was simply slow and a fresh attempt usually clears it), a non-zero exit, a
- * wait error, or an unclassified failure. User interruptions (`interrupted`),
- * a missing desktop backend (`backend`), and unresolvable launch errors
- * (`spawn`, e.g. the binary isn't found) are NOT retried — re-running can't fix
- * them and would only waste time.
- */
-const RETRYABLE_FAILURE_CODES: ReadonlySet<RunFailureCode> = new Set([
-  'timeout',
-  'idle_timeout',
-  'exit',
-  'wait',
-  'unknown',
-]);
-
-/**
  * How many times a failed node is automatically re-run before it is recorded as
  * failed. Only transient failures (see RETRYABLE_FAILURE_CODES) are retried.
  * Tune via localStorage (`owf_run_max_retries`, clamped 0–10); set 0 to disable
@@ -5045,32 +4309,6 @@ function runMaxRetries(): number {
     /* ignore — fall through to default */
   }
   return DEFAULT_RUN_MAX_RETRIES;
-}
-
-function isRetryableFailure(failure: RunFailure): boolean {
-  return RETRYABLE_FAILURE_CODES.has(failure.code);
-}
-
-/**
- * Build the runtime dependency map: a node depends on every other *runnable*
- * node that feeds it via an exec OR data edge. This is the true graph topology,
- * so connected nodes never reorder (a step always waits for what flows into it),
- * while independent nodes — multiple roots, exec forks, sibling branches — have
- * disjoint dependency sets and are free to run concurrently.
- */
-function buildRunDependencies(
-  order: IRNode[],
-  workflow: IRGraph,
-): Map<string, Set<string>> {
-  const idSet = new Set(order.map((n) => n.id));
-  const deps = new Map<string, Set<string>>();
-  for (const n of order) deps.set(n.id, new Set());
-  for (const e of workflow.edges) {
-    if (!idSet.has(e.from.node) || !idSet.has(e.to.node)) continue;
-    if (e.from.node === e.to.node) continue;
-    deps.get(e.to.node)!.add(e.from.node);
-  }
-  return deps;
 }
 
 /**
@@ -5119,189 +4357,23 @@ async function executeViaCliInterpreter(
   }
   if (!stillRunning(ch)) return;
 
-  const order = runnableOrder(workflow);
-  const resumeFromNodeId =
-    options.resumeFromNodeId && order.some((node) => node.id === options.resumeFromNodeId)
-      ? options.resumeFromNodeId
-      : null;
-  const results = new Map<string, string>(Object.entries(options.seedOutputs ?? {}));
-  const deps = buildRunDependencies(order, workflow);
+  // The decoupled run engine (runtime/dag.ts) owns the DAG scheduling, per-node
+  // dispatch, streaming, interaction, and auto-retry. The GUI supplies the host
+  // side effects (callbacks) and host capabilities (gateway + tuned knobs via
+  // context); the channel stays the run's shadow-state source of truth.
+  const errorRef = { errored: false };
+  const callbacks = buildGuiCallbacks(ch, adapter, errorRef);
+  const context = buildGuiRunContext(ch, workflow);
 
-  // Seed completed nodes so they are never re-run: prior outputs / successes,
-  // and — when resuming from a node — everything topologically before it (those
-  // steps already ran; resume re-executes only the failed node onward).
-  const liveRunState = ch.runState;
-  const resumeIdx = resumeFromNodeId
-    ? order.findIndex((n) => n.id === resumeFromNodeId)
-    : -1;
-  const done = new Set<string>();
-  order.forEach((node, i) => {
-    if (results.has(node.id) || liveRunState[node.id] === 'success') {
-      done.add(node.id);
-    } else if (resumeIdx >= 0 && i < resumeIdx) {
-      done.add(node.id);
-    }
-  });
-  if (resumeFromNodeId) done.delete(resumeFromNodeId); // force the target to re-run
-
-  let errored = false;
-  let runError: Record<string, unknown> | null = null;
-
-  // Execute one node: trivial sentinels resolve immediately; real nodes stream
-  // their own labelled message(s) and store the result for downstream data
-  // edges. Returns true on success (node may be marked done).
-  const processNode = async (node: IRNode): Promise<boolean> => {
-    if (node.type === 'start' || node.type === 'end') {
-      markRunNode(ch, node.id, 'success');
-      return true;
-    }
-
-    const nodeStartedAt = Date.now();
-    markRunNode(ch, node.id, 'running');
-    pushRunLog(ch, `▸ ${node.label ?? node.type} · 开始 ${formatClock(nodeStartedAt)}`);
-
-    const maxRetries = runMaxRetries();
-    let attempt = 0; // how many retries have been consumed so far
-
-    // Attempt loop: transient failures (timeouts, idle-timeouts, non-deterministic
-    // CLI exits) are re-run up to maxRetries times before the node is recorded as
-    // failed. A genuine success or a non-retryable failure exits immediately.
-    for (;;) {
-      try {
-        const out = await runNode(ch, node, workflow, results);
-        if (!stillRunning(ch)) return false; // stopped during the call(s)
-        if (out !== null) {
-          results.set(node.id, out);
-          ch.runOutputs = { ...ch.runOutputs, [node.id]: out };
-          if (!errored) ch.failedNodeId = null;
-        }
-        markRunNode(ch, node.id, 'success');
-        const nodeFinishedAt = Date.now();
-        pushRunLog(
-          ch,
-          `✓ ${node.label ?? node.type} · 完成 ${formatClock(nodeFinishedAt)} · 耗时 ${formatDuration(
-            nodeFinishedAt - nodeStartedAt,
-          )}${attempt > 0 ? ` · 重试 ${attempt} 次后成功` : ''}`,
-          'assistant',
-        );
-        return true;
-      } catch (err) {
-        const failure = describeRunFailure(err);
-        if (!stillRunning(ch)) return false;
-
-        // Auto-retry transient failures (e.g. a CLI timeout) before recording the
-        // node as failed. Back off a little between attempts; bail if the run was
-        // stopped while waiting.
-        if (attempt < maxRetries && isRetryableFailure(failure)) {
-          attempt += 1;
-          const backoffMs = Math.min(15000, 1500 * attempt);
-          pushRunLog(
-            ch,
-            `⟳ ${node.label ?? node.type} · ${failureTitle(
-              failure,
-            )}，正在自动重试（第 ${attempt}/${maxRetries} 次，${Math.round(
-              backoffMs / 1000,
-            )}s 后重试）：${failure.message}`,
-            'assistant',
-          );
-          markRunNode(ch, node.id, 'running');
-          await delay(backoffMs);
-          if (!stillRunning(ch)) return false;
-          continue;
-        }
-
-        const nodeFinishedAt = Date.now();
-        const retriedNote = attempt > 0 ? `（已自动重试 ${attempt} 次仍失败）` : '';
-        pushRunLog(
-          ch,
-          `✗ ${node.label ?? node.type} · 失败 ${formatClock(nodeFinishedAt)} · 耗时 ${formatDuration(
-            nodeFinishedAt - nodeStartedAt,
-          )}${retriedNote}: ${failure.message}`,
-          'assistant',
-        );
-        const state = failure.code === 'interrupted' ? 'interrupted' : 'error';
-        // Only the first failure becomes the run's recorded error / resume point;
-        // any still-in-flight siblings that also fail don't clobber it.
-        if (!errored) {
-          errored = true;
-          runError = runFailureMeta(node, adapter, failure);
-          ch.runState = { ...ch.runState, [node.id]: state };
-          ch.failedNodeId = node.id;
-          ch.error = runError;
-          channelCommit(ch, state, true);
-        } else {
-          markRunNode(ch, node.id, state);
-        }
-        return false;
-      }
-    }
-  };
-
-  const concurrency = effectiveRunConcurrency(
-    runConcurrency(),
-    runGlobalGatewaySelection(ch, workflow),
-  );
-  const claimed = new Set<string>(done); // nodes already picked or completed
-
-  // Bounded-concurrency pump over the dependency DAG.
-  await new Promise<void>((resolve) => {
-    let active = 0;
-    let finished = false;
-    const finish = () => {
-      if (!finished) {
-        finished = true;
-        resolve();
-      }
-    };
-
-    // The next node whose dependencies are all satisfied, or — to stay robust
-    // against cycles / unsatisfiable deps when nothing is in flight — the
-    // earliest unclaimed node (mirrors topoOrderExec's cycle tolerance).
-    const pickReady = (): IRNode | null => {
-      for (const node of order) {
-        if (claimed.has(node.id)) continue;
-        let ready = true;
-        for (const dep of deps.get(node.id)!) {
-          if (!done.has(dep)) {
-            ready = false;
-            break;
-          }
-        }
-        if (ready) return node;
-      }
-      if (active === 0) {
-        for (const node of order) if (!claimed.has(node.id)) return node;
-      }
-      return null;
-    };
-
-    const pump = (): void => {
-      if (finished) return;
-      if (!stillRunning(ch)) {
-        if (active === 0) finish();
-        return;
-      }
-      while (active < concurrency && !errored && stillRunning(ch)) {
-        const next = pickReady();
-        if (!next) break;
-        claimed.add(next.id);
-        active += 1;
-        void processNode(next).then((ok) => {
-          active -= 1;
-          if (ok) done.add(next.id);
-          pump();
-        });
-      }
-      if (active === 0 && (errored || !stillRunning(ch) || !pickReady())) {
-        finish();
-      }
-    };
-
-    pump();
+  const result = await executeWorkflowDag(workflow, callbacks, context, {
+    resumeFromNodeId: options.resumeFromNodeId,
+    seedOutputs: options.seedOutputs,
+    seedRunState: ch.runState,
   });
 
   if (runActive(ch)) {
     const runFinishedAt = Date.now();
+    const errored = !result.success;
     pushRunLog(
       ch,
       errored
@@ -5313,7 +4385,7 @@ async function executeViaCliInterpreter(
           )}`,
       'assistant',
     );
-    if (errored) ch.error = runError;
+    if (errored && result.error) ch.error = result.error;
     channelCommit(ch, errored ? 'error' : 'success', true);
     // Only the live view should drop back to design mode; a backgrounded run's
     // owning session reverts when the user next opens it (its persisted snapshot

@@ -174,6 +174,40 @@ Die Richtung ist aber klar: KI-Coding wird nicht dauerhaft bei "Chatfenster öff
 
 Komplexe Aufgaben werden am Ende zu workflows, weil sie sichtbar, editierbar, migrierbar und wiederverwendbar sind.
 
+### Ergänzung: Keine Lust auf die UI? Zwei Kommandos auf der Kommandozeile reichen
+
+Alles bisher Beschriebene betraf die grafische Oberfläche. Aber in vielen Szenarien braucht man die Leinwand gar nicht — etwa wenn man einen Ablauf in eine CI-Pipeline einhängen, in ein Skript einbauen oder headless auf einem Server laufen lassen will. Deshalb gibt es von OpenWorkflows auch eine Kommandozeilen-Variante, die zugehörige Skill heißt `/openworkflows`.
+
+Beim Design habe ich sie bewusst sehr zurückhaltend gehalten: **auf der Anwenderseite gibt es nur zwei Kommandos**. Denn auf der Kommandozeile musst du dich nicht um Blueprints, IRGraph oder Kompilierung kümmern — **ein workflow ist für dich einfach ein `.js`-Skript**, alle Umwandlungen dazwischen passieren automatisch.
+
+```bash
+owf gen "Erstelle einen Code-Review-Ablauf" -o review.js   # workflow-Skript aus einem Satz generieren
+owf gen review.js "Füge noch einen Security-Review-Knoten hinzu"      # bestehendes Skript per Satz anpassen
+owf run review.js                          # das Skript ausführen
+```
+
+Mehr Verwendungsarten gibt es nicht (eigentlich sind es nur die beiden Kommandos `gen` und `run`).
+
+**`owf gen`** erzeugt oder ändert einen workflow per natürlicher Sprache. Es ist dieselbe Fähigkeit wie das AI-Eingabefeld am unteren Rand der Oberfläche: du beschreibst, was du willst, und es generiert das Skript; du zeigst auf ein bestehendes Skript und sagst, wie es geändert werden soll, und es ändert es für dich.
+
+Ein wichtiger Punkt: **es läuft ohne Konfiguration, du musst keinen API Key eintragen**. Denn es benutzt einfach die `claude`-CLI, die auf deinem Rechner bereits eingeloggt ist (denselben Weg wie die Runtime). Sobald claude installiert und eingeloggt ist, kannst du `owf gen` direkt verwenden. Andernfalls weist es dich darauf hin, zuerst `claude login` auszuführen.
+
+**`owf run`** führt das Skript aus, Knoten für Knoten, und gibt den Fortschritt live im Terminal aus:
+
+```text
+[14:32:02] ▶ agent n_scan
+[14:32:15] ✓ agent n_scan — 13.2s
+[14:32:15] ▶ parallel n_review (3 Zweige)
+[14:32:31] ✓ parallel n_review — 16.1s
+Fertig — 29.8s
+```
+
+Parallelität, Pipelines, adversariale Verifikation, automatische Wiederholungsversuche — all diese Mechanismen verhalten sich exakt so wie beim Klick auf „Ausführen" in der Oberfläche, denn **Kommandozeile und Oberfläche teilen sich denselben Ausführungskern**, nur dass das eine das Ergebnis auf die Leinwand zeichnet und das andere es ins Terminal schreibt.
+
+Ein paar nützliche Schalter: `--dry-run` führt nur eine Vorprüfung durch, ohne tatsächlich zu starten (spart token); `--resume` setzt beim zuletzt gescheiterten Knoten fort; `--model` legt das Modell fest; `--json` gibt ein maschinenlesbares Ergebnis aus, das sich gut in Pipelines einhängen lässt.
+
+Die Abwägung dieser Kommandozeile in einem Satz: **Die Oberfläche steht für „sichtbar und veränderbar", die Kommandozeile für „schnell ausführbar und gut anschließbar" — aber dahinter steckt derselbe workflow.**
+
 QQ-Gruppe: 149523963
 
 Projekt:

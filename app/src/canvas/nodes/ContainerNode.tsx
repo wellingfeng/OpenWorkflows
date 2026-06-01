@@ -3,6 +3,7 @@ import type { NodeProps } from '@xyflow/react';
 import type { FlowNodeData } from '@/canvas/irToFlow';
 import { t } from '@/lib/i18n';
 import { ExecIn, ExecOut } from './handles';
+import { NodeNumberBadge } from './NodeNumberBadge';
 import { BADGE_BASE_STYLE, runStateVisual } from './runStateStyles';
 
 /**
@@ -27,9 +28,11 @@ function ContainerNodeImpl({ data, selected }: NodeProps) {
 
   return (
     <div
-      className="relative flex h-full w-full flex-col rounded-md border bg-panel font-sans shadow-md"
+      className="relative flex h-full w-full flex-col overflow-visible rounded-md border bg-panel font-sans shadow-md"
       style={{ borderColor, boxShadow }}
     >
+      <NodeNumberBadge value={d.numberLabel} accent="var(--accent-3)" />
+
       <div
         className="flex items-center gap-2 rounded-t-md px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide"
         style={{ background: 'var(--panel-2)', color: 'var(--accent-3)' }}

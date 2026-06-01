@@ -174,6 +174,40 @@ Mas a direção geral está clara: a programação com IA não ficará para semp
 
 Tarefas complexas acabarão virando workflows porque podem ser vistas, editadas, migradas e reutilizadas.
 
+### Bônus: não quer abrir a interface? Dois comandos no terminal bastam
+
+Tudo o que mostrei acima é interface gráfica. Mas em muitos cenários ela simplesmente não é necessária — por exemplo, quando você quer plugar um fluxo no CI, embutir num script ou rodar headless num servidor. Por isso o OpenWorkflows também oferece uma versão de linha de comando, com a skill correspondente chamada `/openworkflows`.
+
+No design eu fui deliberadamente comedido: **do lado do usuário, são só dois comandos**. Porque no terminal você não precisa se preocupar com blueprint, IRGraph, compilação e outros conceitos intermediários — **um workflow, para você, é apenas um script `.js`**, e todo o resto da conversão acontece automaticamente.
+
+```bash
+owf gen "criar um fluxo de revisão de código" -o review.js   # gera um script de workflow a partir de uma frase
+owf gen review.js "adicionar mais um nó de revisão de segurança"   # modifica um script existente com uma frase
+owf run review.js                                           # executa o script
+```
+
+São basicamente essas três formas de uso (na prática, só dois comandos: `gen` e `run`).
+
+**`owf gen`** serve para gerar ou modificar um workflow em linguagem natural. É a mesma capacidade daquela caixa de entrada de IA no rodapé da interface: você descreve o que quer e ele gera o script; você aponta para um script existente e diz como mudá-lo, e ele faz a alteração.
+
+Tem um detalhe importante aqui: **é zero configuração, você não precisa preencher API Key nenhuma**. Porque ele reaproveita a CLI `claude` que já está logada na sua máquina (o mesmo caminho usado pelo runtime), então, se você tiver o claude instalado e logado, o `owf gen` funciona direto. Se não tiver, ele te avisa para rodar `claude login` primeiro.
+
+**`owf run`** simplesmente executa o script, percorrendo nó por nó e imprimindo o progresso em tempo real no terminal:
+
+```text
+[14:32:02] ▶ agent n_scan
+[14:32:15] ✓ agent n_scan — 13,2s
+[14:32:15] ▶ parallel n_review (3 ramificações)
+[14:32:31] ✓ parallel n_review — 16,1s
+concluído — 29,8s
+```
+
+Paralelismo, pipelines, validação adversarial, retentativa automática — tudo isso funciona exatamente igual a clicar em "Executar" na interface, porque **o terminal e a interface compartilham o mesmo núcleo de execução**: um pinta o resultado na tela, o outro joga o resultado no terminal.
+
+Algumas flags úteis no dia a dia: `--dry-run` só faz a pré-verificação sem executar de verdade (economiza tokens), `--resume` retoma a partir do último nó que falhou, `--model` especifica o modelo e `--json` produz saída legível por máquina, ideal para plugar em pipelines.
+
+Resumindo em uma frase o trade-off dessa CLI: **a interface cuida do "ver e editar", o terminal cuida do "rodar rápido e integrar", mas por trás dos dois está exatamente o mesmo workflow.**
+
 Grupo QQ: 149523963
 
 Projeto:

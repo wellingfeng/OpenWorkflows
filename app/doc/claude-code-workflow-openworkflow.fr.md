@@ -174,6 +174,40 @@ Mais la direction générale est claire : la programmation IA ne restera pas lon
 
 Les tâches complexes finiront par devenir des workflows, parce qu'elles peuvent être vues, éditées, migrées et réutilisées.
 
+### En complément : pas envie d'ouvrir l'interface ? Deux commandes en ligne de commande suffisent
+
+Tout ce qui précède concerne l'interface graphique. Mais dans bien des cas, on n'a pas besoin du canevas — par exemple lorsqu'on veut brancher un flux dans un pipeline CI, l'intégrer à un script, ou l'exécuter en mode headless sur un serveur. C'est pourquoi OpenWorkflows fournit aussi une version en ligne de commande, exposée via le skill `/openworkflows`.
+
+J'ai volontairement gardé le design très sobre : **du côté de l'utilisateur, il n'y a que deux commandes**. Parce qu'en ligne de commande, vous n'avez pas à vous soucier du blueprint, de l'IRGraph ou de la compilation — **un workflow, pour vous, c'est juste un script `.js`**, et tout le reste se fait automatiquement.
+
+```bash
+owf gen "crée un workflow de revue de code" -o review.js   # générer un script de workflow en une phrase
+owf gen review.js "ajoute un nœud d'audit de sécurité"      # modifier un script existant en une phrase
+owf run review.js                                           # lancer le script
+```
+
+Voilà les trois usages (en réalité, seulement deux commandes : `gen` et `run`).
+
+**`owf gen`** sert à générer ou modifier un workflow en langage naturel. Cela s'appuie exactement sur la même capacité que la zone de saisie IA en bas de l'interface : vous décrivez le besoin, elle produit le script ; vous pointez vers un script existant en disant ce qu'il faut changer, elle s'en occupe.
+
+Un point clé ici : **c'est zéro configuration, vous n'avez pas à renseigner de clé API**. Parce que cela réutilise directement la CLI `claude` déjà connectée sur votre machine (le même chemin que celui utilisé à l'exécution). Donc, dès que vous avez installé claude et que vous êtes connecté, `owf gen` fonctionne immédiatement. Sinon, il vous rappellera de faire d'abord `claude login`.
+
+**`owf run`**, c'est tout simplement lancer le script : les nœuds s'exécutent un à un, et la progression s'affiche en direct dans le terminal :
+
+```text
+[14:32:02] ▶ agent n_scan
+[14:32:15] ✓ agent n_scan — 13,2 s
+[14:32:15] ▶ parallel n_review (3 branches)
+[14:32:31] ✓ parallel n_review — 16,1 s
+Terminé — 29,8 s
+```
+
+Parallélisme, pipeline, validation adversariale, réessai automatique : tous ces mécanismes sont identiques au clic sur « Exécuter » dans l'interface — parce que **la ligne de commande et l'interface partagent le même noyau d'exécution**. La seule différence, c'est que l'une dessine le résultat sur le canevas, et l'autre l'imprime dans le terminal.
+
+Quelques options utiles : `--dry-run` pour ne faire qu'une pré-vérification sans exécuter (et économiser des tokens), `--resume` pour reprendre à partir du dernier nœud en échec, `--model` pour spécifier le modèle, et `--json` pour produire une sortie lisible par une machine, pratique pour s'intégrer à un pipeline.
+
+En une phrase, le compromis de cette ligne de commande : **l'interface se charge de « voir et modifier », la ligne de commande se charge de « tourner vite et s'intégrer partout », mais derrière, c'est le même workflow.**
+
 Groupe QQ : 149523963
 
 Projet :

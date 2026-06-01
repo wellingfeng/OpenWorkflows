@@ -1,6 +1,7 @@
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
 import { DATA, EXEC, type IRGraph, type NodeType } from '@/core/ir';
+import { nodeNumberLabelMap } from '@/core/nodeNumbers';
 import type { NodeRunState } from '@/store/types';
 import type { Locale } from '@/lib/i18n';
 
@@ -17,6 +18,7 @@ import type { Locale } from '@/lib/i18n';
 /** Extra payload carried on each React Flow node's `data` field. */
 export interface FlowNodeData extends Record<string, unknown> {
   label: string;
+  numberLabel?: number;
   irType: NodeType;
   params: Record<string, unknown>;
   /** Current UI locale for i18n lookups. */
@@ -73,6 +75,7 @@ function toFlowNode(
   node: IRGraph['nodes'][number],
   index: number,
   graph: IRGraph,
+  numberLabels: Map<string, number>,
   runState: Record<string, NodeRunState> | undefined,
   locale: Locale,
 ): FlowNode {
@@ -83,6 +86,9 @@ function toFlowNode(
     position: graph.layout?.[node.id] ?? { x: index * DEFAULT_DX, y: DEFAULT_Y },
     data: {
       label: nodeLabel(node),
+      ...(numberLabels.has(node.id)
+        ? { numberLabel: numberLabels.get(node.id) }
+        : null),
       irType: node.type,
       params: node.params,
       locale,
@@ -172,8 +178,9 @@ export function irToFlow(
   runState?: Record<string, NodeRunState>,
   locale?: Locale,
 ): FlowGraph {
+  const numberLabels = nodeNumberLabelMap(graph);
   const nodes = graph.nodes.map((node, i) =>
-    toFlowNode(node, i, graph, runState, locale ?? 'en-US'),
+    toFlowNode(node, i, graph, numberLabels, runState, locale ?? 'en-US'),
   );
   const edges = graph.edges.map((edge) => toFlowEdge(edge, runState));
   return { nodes, edges };

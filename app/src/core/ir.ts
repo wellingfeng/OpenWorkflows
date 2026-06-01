@@ -63,6 +63,13 @@ export interface IRAgentSpec {
   schema?: string;
   isolation?: 'worktree';
   phase?: string;
+  /**
+   * Upstream-context convergence policy applied when building this node's data
+   * block (see runtime/context.ts). 'full' (default) concatenates upstream
+   * outputs verbatim; 'tail' head/tail-truncates over-long inputs. Omitted ⇒
+   * 'full', so this is opt-in and never changes existing output.
+   */
+  contextPolicy?: 'full' | 'tail';
 }
 
 /**
@@ -126,6 +133,11 @@ export interface IRNode {
   /** Display label. */
   label?: string;
   /**
+   * Auto-assigned numeric tag shown on ordinary workflow nodes. Scoped to this
+   * IRGraph, contiguous, and never set for Start/End.
+   */
+  numberLabel?: number;
+  /**
    * JS variable name this node binds to in the emitted script (e.g. `scan` in
    * `const scan = await agent(...)`). Recovered on parse and reused on re-emit so
    * var names — and the `${var}` data-flow references that depend on them — stay
@@ -136,7 +148,7 @@ export interface IRNode {
   /**
    * Arbitrary, type-specific parameters. Notable shapes:
    *   start:    { userInputs?: string[] }        — source requirements shown on the Start node
-   *   agent:    { prompt, label?, agentType?, model?, gateway?, schema?, isolation?, phase? }
+   *   agent:    { prompt, label?, agentType?, model?, gateway?, schema?, isolation?, phase?, contextPolicy? }
    *   parallel: { branches: IRAgentSpec[] }       — emitted as a thunk array
    *   pipeline: { items: string, stages: IRAgentSpec[] } — items is an expr ref
    *   branch:   { condition: string }             — children carry parent=this.id

@@ -1,4 +1,5 @@
 import { EXEC, type IRGraph } from './ir';
+import { normalizeWorkflowNodeNumbers } from './nodeNumbers';
 import {
   DEFAULT_LOCALE,
   type Locale,
@@ -54,7 +55,7 @@ export function defaultBlueprint(
   const placeholder = t(localeCode, 'defaultBlueprint.agentPlaceholder');
   const workflowName =
     name ?? t(localeCode, 'defaultBlueprint.untitledWorkflow');
-  return {
+  return normalizeWorkflowNodeNumbers({
     version: 1,
     meta: {
       name: workflowName,
@@ -102,5 +103,5 @@ export function defaultBlueprint(
       n_step1: { x: 240, y: 160 },
       n_end: { x: 480, y: 160 },
     },
-  };
+  });
 }

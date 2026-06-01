@@ -42,7 +42,7 @@ describe('model speed policy', () => {
       count: 1,
       concurrency: 1,
     });
-    expect(effectiveRunConcurrency(16, selection)).toBe(2);
+    expect(effectiveRunConcurrency(16, selection)).toBe(4);
     expect(effectiveRunConcurrency(1, selection)).toBe(1);
 
     const timeout = timeoutPolicyForSelection(selection, 'x'.repeat(12_000));
