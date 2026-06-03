@@ -290,6 +290,15 @@ export function getFreeChannelModel(id: string): string {
   return freeChannelById(id)?.defaultModel ?? '';
 }
 
+/**
+ * The user's raw model override for a channel (empty when none is set). Unlike
+ * getFreeChannelModel this does NOT fall back to the channel default, so a
+ * settings input can show an empty field with the default as placeholder.
+ */
+export function getFreeChannelModelOverride(id: string): string {
+  return (readRecord(MODELS_STORAGE)[id] ?? '').trim();
+}
+
 export function setFreeChannelModel(id: string, model: string): void {
   const next = readRecord(MODELS_STORAGE);
   const trimmed = model.trim();

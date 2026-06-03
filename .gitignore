@@ -42,3 +42,4 @@ Thumbs.db
 
 # Native debug artifacts
 *.pdb
+app/src-tauri/icons.bak.old/

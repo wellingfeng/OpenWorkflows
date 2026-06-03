@@ -1,6 +1,9 @@
 import type { IRGraph } from '@/core/ir';
 import type { RuntimeAdapterId } from '@/lib/adapters';
-import { freeChannelGatewayProviders } from '@/lib/freeChannels';
+import {
+  FREE_CHANNEL_PROVIDER_PREFIX,
+  freeChannelGatewayProviders,
+} from '@/lib/freeChannels';
 import {
   DEFAULT_GATEWAY_SELECTION,
   type GatewayConfig,
@@ -273,7 +276,15 @@ export function preferredGatewayProvider(
   providers: GatewayProvider[],
   adapter: RuntimeAdapterId,
 ): GatewayProvider | undefined {
-  const matches = providers.filter((provider) => provider.adapter === adapter);
+  // Free channels (freecc:*) are synthetic providers that must only be used
+  // when the user explicitly selects them. Exclude them from the implicit
+  // default so an unconfigured user keeps the plain system claude-code default
+  // instead of being silently routed to a free upstream they never set up.
+  const matches = providers.filter(
+    (provider) =>
+      provider.adapter === adapter &&
+      !provider.id.startsWith(FREE_CHANNEL_PROVIDER_PREFIX),
+  );
   return (
     matches.find((provider) =>
       provider.channels.some((channel) => channel.route.transport === 'cli'),

@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.2.0"
+version = "0.2.1"
 description = "OpenWorkflows - Visual AI Workflow Editor"
 authors = ["OpenWorkflows"]
 license = ""

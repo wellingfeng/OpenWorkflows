@@ -1,7 +1,7 @@
 {
   "name": "openworkflow-app",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "bin": {
     "owf": "./cli/dist/owf.mjs"

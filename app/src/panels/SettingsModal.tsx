@@ -21,9 +21,20 @@ import {
   SquareTerminal,
   Trash2,
   X,
+  Zap,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import {
+  FREE_CHANNELS,
+  ensureFreeProxy,
+  freeChannelReady,
+  getFreeChannelKey,
+  getFreeChannelModelOverride,
+  setFreeChannelKey,
+  setFreeChannelModel,
+  type FreeChannel,
+} from '@/lib/freeChannels';
 import {
   RUNTIME_ADAPTERS,
   runtimeAdapterLabel,
@@ -100,6 +111,7 @@ import {
 type SettingsTab =
   | 'general'
   | 'models'
+  | 'freeChannels'
   | 'consensus'
   | 'shortcuts'
   | 'appearance'
@@ -108,6 +120,7 @@ type LanguageOption = (typeof LANGUAGE_SELECT_OPTIONS)[number];
 
 const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = [
   { id: 'general', labelKey: 'settings.tabs.general', Icon: SlidersHorizontal },
+  { id: 'freeChannels', labelKey: 'settings.tabs.freeChannels', Icon: Zap },
   { id: 'consensus', labelKey: 'settings.tabs.consensus', Icon: Sparkles },
   { id: 'shortcuts', labelKey: 'settings.tabs.shortcuts', Icon: Keyboard },
   { id: 'appearance', labelKey: 'settings.tabs.appearance', Icon: Palette },
@@ -237,6 +250,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 />
               ) : tab === 'models' ? (
                 <ModelsSettings locale={locale} cliRuntime={cliRuntime} />
+              ) : tab === 'freeChannels' ? (
+                <FreeChannelsSettings locale={locale} />
               ) : tab === 'consensus' ? (
                 <ConsensusSettings locale={locale} />
               ) : tab === 'shortcuts' ? (
@@ -2262,6 +2277,194 @@ function StepperControl({
       >
         +
       </button>
+    </div>
+  );
+}
+
+function FreeChannelsSettings({ locale }: { locale: Locale }) {
+  // Bumped after each row edit so status badges (ready / needs-key) re-read.
+  const [, setRevision] = useState(0);
+  const refresh = () => setRevision((n) => n + 1);
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h3 className="text-lg font-semibold text-fg">
+          {t(locale, 'settings.freeChannels.title')}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+          {t(locale, 'settings.freeChannels.description')}
+        </p>
+      </div>
+      <div className="space-y-2.5">
+        {FREE_CHANNELS.map((channel) => (
+          <FreeChannelRow
+            key={channel.id}
+            channel={channel}
+            locale={locale}
+            onChange={refresh}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FreeChannelRow({
+  channel,
+  locale,
+  onChange,
+}: {
+  channel: FreeChannel;
+  locale: Locale;
+  onChange: () => void;
+}) {
+  const [keyValue, setKeyValue] = useState(() => getFreeChannelKey(channel.id));
+  const [modelValue, setModelValue] = useState(() =>
+    getFreeChannelModelOverride(channel.id),
+  );
+  const [showKey, setShowKey] = useState(false);
+
+  const ready = freeChannelReady(channel.id);
+  const transportLabel =
+    channel.transport === 'anthropic'
+      ? t(locale, 'settings.freeChannels.transportAnthropic')
+      : t(locale, 'settings.freeChannels.transportOpenai');
+
+  // Re-register the proxy with the latest keys/models. Cheap + idempotent;
+  // fired on blur rather than per keystroke.
+  const reproxy = () => {
+    void ensureFreeProxy();
+  };
+  const commitKey = (value: string) => {
+    setKeyValue(value);
+    setFreeChannelKey(channel.id, value);
+    onChange();
+  };
+  const commitModel = (value: string) => {
+    setModelValue(value);
+    setFreeChannelModel(channel.id, value);
+    onChange();
+  };
+
+  const status = channel.local
+    ? {
+        label: t(locale, 'settings.freeChannels.localReady'),
+        cls: 'border-sky-500/40 text-sky-300',
+      }
+    : ready
+      ? {
+          label: t(locale, 'settings.freeChannels.ready'),
+          cls: 'border-emerald-500/40 text-emerald-300',
+        }
+      : {
+          label: t(locale, 'settings.freeChannels.needsKey'),
+          cls: 'border-amber-500/40 text-amber-300',
+        };
+
+  const KeyIcon = showKey ? EyeOff : Eye;
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-bg-alt p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium text-fg">{channel.label}</span>
+        <span
+          className={cn(
+            'rounded border px-1.5 py-0.5 text-[10px] font-medium',
+            status.cls,
+          )}
+        >
+          {status.label}
+        </span>
+        <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-fg-faint">
+          {transportLabel}
+        </span>
+        <span className="min-w-0 flex-1" />
+        {channel.credentialUrl && (
+          <button
+            type="button"
+            onClick={() => void openExternal(channel.credentialUrl as string)}
+            className="inline-flex items-center gap-1 text-[11px] text-accent transition-colors hover:underline"
+          >
+            {t(locale, 'settings.freeChannels.getKey')}
+            <ExternalLink size={11} strokeWidth={2} />
+          </button>
+        )}
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        {channel.needsKey && (
+          <label className="block space-y-1">
+            <span className="text-[11px] font-medium text-fg-dim">
+              {t(locale, 'settings.freeChannels.apiKeyLabel')}
+            </span>
+            <div className="relative">
+              <input
+                type={showKey ? 'text' : 'password'}
+                value={keyValue}
+                onChange={(event) => commitKey(event.target.value)}
+                onBlur={reproxy}
+                placeholder={t(locale, 'settings.freeChannels.apiKeyPlaceholder')}
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full rounded-md border border-border bg-panel px-2.5 py-1.5 pr-14 text-sm text-fg outline-none transition-colors focus:border-accent"
+              />
+              <div className="absolute inset-y-0 right-1 flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => setShowKey((v) => !v)}
+                  title={t(
+                    locale,
+                    showKey
+                      ? 'settings.models.hideKey'
+                      : 'settings.models.showKey',
+                  )}
+                  className="flex h-6 w-6 items-center justify-center rounded text-fg-faint transition-colors hover:text-fg"
+                >
+                  <KeyIcon size={13} strokeWidth={2} />
+                </button>
+                {keyValue && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      commitKey('');
+                      reproxy();
+                    }}
+                    title={t(locale, 'settings.freeChannels.clear')}
+                    className="flex h-6 w-6 items-center justify-center rounded text-fg-faint transition-colors hover:text-rose-300"
+                  >
+                    <Trash2 size={13} strokeWidth={2} />
+                  </button>
+                )}
+              </div>
+            </div>
+          </label>
+        )}
+        <label className="block space-y-1">
+          <span className="text-[11px] font-medium text-fg-dim">
+            {t(locale, 'settings.freeChannels.modelLabel')}
+          </span>
+          <input
+            type="text"
+            value={modelValue}
+            onChange={(event) => commitModel(event.target.value)}
+            onBlur={reproxy}
+            placeholder={
+              channel.defaultModel ||
+              t(locale, 'settings.freeChannels.modelPlaceholderLocal')
+            }
+            autoComplete="off"
+            spellCheck={false}
+            className="w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-sm text-fg outline-none transition-colors focus:border-accent"
+          />
+        </label>
+      </div>
+
+      {channel.note && (
+        <p className="text-[11px] leading-relaxed text-fg-faint">
+          {channel.note}
+        </p>
+      )}
     </div>
   );
 }

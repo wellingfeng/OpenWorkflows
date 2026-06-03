@@ -888,22 +888,44 @@ struct ToolAccum {
     pending_args: String,
 }
 
-fn translate_openai_stream(request: Request, response: ureq::Response, incoming_model: &str) {
+fn translate_openai_stream(request: Request, response: ureq::Response, echo_model: &str) {
     let mut writer = request.into_writer();
     if write_stream_head(&mut writer, 200, "text/event-stream").is_err() {
         return;
     }
-
     let message_id = next_message_id();
+    let reader = BufReader::new(response.into_reader());
 
-    // Helper to write one Anthropic SSE event as a chunked-transfer chunk.
+    // Sink: write each Anthropic SSE event as one chunked-transfer chunk.
+    let mut sink = |event: &str, data: &Value| -> bool {
+        let s = sse_event(event, data);
+        if write_chunk(&mut writer, s.as_bytes()).is_err() {
+            return false;
+        }
+        let _ = writer.flush();
+        true
+    };
+    run_openai_translation(reader, echo_model, &message_id, &mut sink);
+
+    // Terminate the chunked body.
+    let _ = writer.write_all(b"0\r\n\r\n");
+    let _ = writer.flush();
+}
+
+/// Drive the OpenAI-SSE -> Anthropic-SSE translation, emitting each Anthropic
+/// event via `sink` (return false to abort). Kept independent of the socket
+/// writer so it can be unit-tested by collecting events into a Vec.
+fn run_openai_translation<R: BufRead>(
+    reader: R,
+    echo_model: &str,
+    message_id: &str,
+    sink: &mut dyn FnMut(&str, &Value) -> bool,
+) {
     macro_rules! emit {
         ($event:expr, $data:expr) => {{
-            let s = sse_event($event, &$data);
-            if write_chunk(&mut writer, s.as_bytes()).is_err() {
+            if !sink($event, &$data) {
                 return;
             }
-            let _ = writer.flush();
         }};
     }
 
@@ -916,7 +938,7 @@ fn translate_openai_stream(request: Request, response: ureq::Response, incoming_
                 "id": message_id,
                 "type": "message",
                 "role": "assistant",
-                "model": incoming_model,
+                "model": echo_model,
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
@@ -938,8 +960,6 @@ fn translate_openai_stream(request: Request, response: ureq::Response, incoming_
     let mut finish_reason: Option<String> = None;
     let mut output_tokens: u64 = 0;
     let mut text_char_count: usize = 0;
-
-    let reader = BufReader::new(response.into_reader());
 
     for line in reader.lines() {
         let line = match line {
@@ -1144,8 +1164,173 @@ fn translate_openai_stream(request: Request, response: ureq::Response, incoming_
         })
     );
     emit!("message_stop", json!({ "type": "message_stop" }));
+}
 
-    // Terminate the chunked body.
-    let _ = writer.write_all(b"0\r\n\r\n");
-    let _ = writer.flush();
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the translator over a literal OpenAI SSE string and collect the
+    /// emitted Anthropic events.
+    fn collect(sse: &str, echo_model: &str) -> Vec<(String, Value)> {
+        let mut events: Vec<(String, Value)> = Vec::new();
+        let mut sink = |event: &str, data: &Value| -> bool {
+            events.push((event.to_string(), data.clone()));
+            true
+        };
+        run_openai_translation(sse.as_bytes(), echo_model, "msg_test", &mut sink);
+        events
+    }
+
+    fn first<'a>(events: &'a [(String, Value)], kind: &str) -> &'a Value {
+        &events
+            .iter()
+            .find(|(k, _)| k == kind)
+            .unwrap_or_else(|| panic!("no event of kind {kind}"))
+            .1
+    }
+
+    #[test]
+    fn route_parsing_distinguishes_messages_and_count_tokens() {
+        assert_eq!(
+            parse_channel_route("/ch/groq/v1/messages"),
+            Some(("groq".to_string(), ProxyEndpoint::Messages))
+        );
+        assert_eq!(
+            parse_channel_route("/ch/groq/v1/messages/count_tokens"),
+            Some(("groq".to_string(), ProxyEndpoint::CountTokens))
+        );
+        assert_eq!(
+            parse_channel_route("/ch/groq/v1/messages/"),
+            Some(("groq".to_string(), ProxyEndpoint::Messages))
+        );
+        assert_eq!(parse_channel_route("/ch//v1/messages"), None);
+        assert_eq!(parse_channel_route("/ch/groq/v1/other"), None);
+        assert_eq!(parse_channel_route("/health"), None);
+    }
+
+    #[test]
+    fn finish_reason_mapping() {
+        assert_eq!(map_finish_reason(Some("stop")), "end_turn");
+        assert_eq!(map_finish_reason(Some("length")), "max_tokens");
+        assert_eq!(map_finish_reason(Some("tool_calls")), "tool_use");
+        assert_eq!(map_finish_reason(None), "end_turn");
+    }
+
+    #[test]
+    fn estimate_input_tokens_counts_text() {
+        let body = json!({ "messages": [{ "role": "user", "content": "12345678" }] });
+        assert_eq!(estimate_input_tokens(&body), 2); // 8 chars / 4
+        let empty = json!({ "messages": [] });
+        assert_eq!(estimate_input_tokens(&empty), 1); // floored to 1
+    }
+
+    #[test]
+    fn anthropic_body_translates_to_openai_shape() {
+        let body = json!({
+            "model": "ignored-by-override",
+            "system": "You are helpful",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 100,
+            "tools": [{ "name": "foo", "description": "d", "input_schema": { "type": "object" } }],
+            "tool_choice": { "type": "auto" }
+        });
+        let out = anthropic_to_openai_body(&body, "gpt-x");
+        assert_eq!(out["model"], "gpt-x");
+        assert_eq!(out["stream"], true);
+        assert_eq!(out["max_tokens"], 100);
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are helpful");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "foo");
+        assert_eq!(out["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn text_stream_translates_and_echoes_requested_model() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                   data: [DONE]\n";
+        let events = collect(sse, "claude-sonnet-4-5");
+        let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        // message_start echoes the REQUESTED model, not the upstream model.
+        assert_eq!(first(&events, "message_start")["message"]["model"], "claude-sonnet-4-5");
+        assert_eq!(first(&events, "message_delta")["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn tool_call_canonical_order_produces_named_block() {
+        // OpenAI canonical: id + name in the first delta, arguments stream after.
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\"\"}}]}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"SF\\\"}\"}}]}}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\
+                   data: [DONE]\n";
+        let events = collect(sse, "claude-x");
+        let start = first(&events, "content_block_start");
+        assert_eq!(start["content_block"]["type"], "tool_use");
+        assert_eq!(start["content_block"]["name"], "get_weather");
+        assert_eq!(start["content_block"]["id"], "call_1");
+        // Arguments arrive as input_json_delta fragments.
+        let joined: String = events
+            .iter()
+            .filter(|(k, _)| k == "content_block_delta")
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(joined, "{\"city\":\"SF\"}");
+        assert_eq!(first(&events, "message_delta")["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn tool_call_with_arguments_before_name_never_emits_empty_name() {
+        // Regression: some OpenAI-compatible providers send arguments (and id)
+        // before the tool name. The block must NOT open with an empty name; it
+        // must defer until the name arrives and then flush the buffered args.
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"function\":{\"arguments\":\"{\\\"x\\\":1}\"}}]},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"do_thing\"}}]}}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\
+                   data: [DONE]\n";
+        let events = collect(sse, "claude-x");
+        let start = first(&events, "content_block_start");
+        assert_eq!(start["content_block"]["type"], "tool_use");
+        assert_eq!(
+            start["content_block"]["name"], "do_thing",
+            "tool name must be populated, not empty"
+        );
+        assert_eq!(start["content_block"]["id"], "call_2");
+        // The buffered arguments must be flushed after the block opens.
+        let joined: String = events
+            .iter()
+            .filter(|(k, _)| k == "content_block_delta")
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(joined, "{\"x\":1}");
+    }
+
+    #[test]
+    fn message_start_usage_includes_cache_fields() {
+        let events = collect("data: [DONE]\n", "claude-x");
+        let usage = &first(&events, "message_start")["message"]["usage"];
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+    }
 }
