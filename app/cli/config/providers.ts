@@ -69,6 +69,49 @@ function normalizeAdapter(value: unknown): string {
   return typeof value === 'string' && value ? value : 'claude-code';
 }
 
+function providerHost(baseUrl: string | undefined): string {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) return '';
+  try {
+    return new URL(trimmed).host.toLowerCase();
+  } catch {
+    return trimmed.toLowerCase();
+  }
+}
+
+function normalizeKnownProviderModel(
+  baseUrl: string | undefined,
+  model: string | undefined,
+): string | undefined {
+  const trimmed = model?.trim();
+  if (!trimmed) return undefined;
+
+  const host = providerHost(baseUrl);
+  const lower = trimmed.toLowerCase();
+  if (host.includes('integrate.api.nvidia.com')) {
+    if (!trimmed.includes('/') && lower.includes('nemotron')) {
+      return `nvidia/${lower}`;
+    }
+  }
+  if (host.includes('openrouter.ai')) {
+    if (/^glm-\d/i.test(trimmed)) return `z-ai/${lower}`;
+    if (lower.startsWith('z-ai/glm-')) return lower;
+  }
+  if (host.includes('fireworks.ai')) {
+    if (!trimmed.includes('/') && lower.startsWith('llama-')) {
+      return `accounts/fireworks/models/${lower}`;
+    }
+  }
+  if (
+    host.includes('opencode.ai') ||
+    host.includes('z.ai') ||
+    host.includes('bigmodel.cn')
+  ) {
+    if (/^glm-\d/i.test(trimmed)) return lower;
+  }
+  return trimmed;
+}
+
 /** Merge a per-node/spec override onto a selection (mirror of mergeGatewaySelection). */
 export function applyOverride(
   selection: GatewaySelection,
@@ -295,8 +338,11 @@ function resolveModel(
   transport: GatewayTransport,
 ): string | undefined {
   const tierModel = provider?.models?.[modelClass];
-  if (tierModel) return tierModel;
-  const channelModel = provider?.model?.trim() || undefined;
+  if (tierModel) return normalizeKnownProviderModel(provider?.baseUrl, tierModel);
+  const channelModel = normalizeKnownProviderModel(
+    provider?.baseUrl,
+    provider?.model,
+  );
 
   if (adapter === 'claude-code') {
     if (channelModel) return channelModel;

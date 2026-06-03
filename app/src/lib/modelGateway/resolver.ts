@@ -578,6 +578,39 @@ export function gatewayRouteEnv(
   return Object.keys(env).length > 0 ? env : undefined;
 }
 
+function normalizeKnownProviderModel(
+  baseUrl: string | undefined,
+  model: string | undefined,
+): string | undefined {
+  const trimmed = model?.trim();
+  if (!trimmed) return undefined;
+
+  const host = providerBaseUrlHost(baseUrl ?? '').toLowerCase();
+  const lower = trimmed.toLowerCase();
+  if (host.includes('integrate.api.nvidia.com')) {
+    if (!trimmed.includes('/') && lower.includes('nemotron')) {
+      return `nvidia/${lower}`;
+    }
+  }
+  if (host.includes('openrouter.ai')) {
+    if (/^glm-\d/i.test(trimmed)) return `z-ai/${lower}`;
+    if (lower.startsWith('z-ai/glm-')) return lower;
+  }
+  if (host.includes('fireworks.ai')) {
+    if (!trimmed.includes('/') && lower.startsWith('llama-')) {
+      return `accounts/fireworks/models/${lower}`;
+    }
+  }
+  if (
+    host.includes('opencode.ai') ||
+    host.includes('z.ai') ||
+    host.includes('bigmodel.cn')
+  ) {
+    if (/^glm-\d/i.test(trimmed)) return lower;
+  }
+  return trimmed;
+}
+
 function adapterToProviderKind(adapter: string): ProviderKind {
   if (adapter === 'codex') return 'codex';
   if (adapter === 'gemini') return 'gemini';
@@ -593,7 +626,13 @@ function resolveProvider(
     const selected = providers.find(
       (provider) => provider.id === selection.providerId,
     );
-    if (selected && selected.adapter === adapter) return selected;
+    if (selected && selected.adapter === adapter) {
+      if (selected.id.startsWith(FREE_CHANNEL_PROVIDER_PREFIX)) {
+        const freeId = selected.id.slice(FREE_CHANNEL_PROVIDER_PREFIX.length);
+        if (!freeChannelReady(freeId)) return undefined;
+      }
+      return selected;
+    }
   }
   // No (or stale) channel pinned → fall back to the category default, then
   // prefer any CLI-backed provider for the adapter before taking the first
@@ -659,13 +698,17 @@ function resolveChannelModel(
   channel: GatewayProvider['channels'][number],
   modelClass: ModelClass,
 ): string | undefined {
+  const baseUrl = channel.route.baseUrl ?? channel.baseUrl;
   // litellm-style per-tier maps win: an explicit tier->modelId mapping is a
   // deliberate real model id, so it is always honoured (claude-code included).
   const tierModel =
     channel.route.models?.[modelClass] ?? channel.models?.[modelClass];
-  if (tierModel) return tierModel;
+  if (tierModel) return normalizeKnownProviderModel(baseUrl, tierModel);
 
-  const channelModel = (channel.route.model ?? channel.model)?.trim() || undefined;
+  const channelModel = normalizeKnownProviderModel(
+    baseUrl,
+    channel.route.model ?? channel.model,
+  );
 
   if (provider.adapter === 'claude-code') {
     if (channelModel) {

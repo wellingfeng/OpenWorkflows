@@ -2,7 +2,7 @@
  * Store-domain types: session and UI state, decoupled from the IR.
  */
 
-import type { IRRunStatus } from '@/core/ir';
+import type { GatewaySelection, IRRunStatus } from '@/core/ir';
 import type {
   InteractionAnswer,
   InteractionRequest,
@@ -66,7 +66,7 @@ export interface Session {
   isWorkflow: boolean;
   /**
    * True when this workflow session is a "simple workflow" (meta.simple) — a
-   * single nameless node used for easy one-shot questions. Drives the "SW"
+   * single nameless node used for easy one-shot questions. Drives the chat
    * history badge (vs "WF"). Always false/undefined for chat sessions.
    */
   simple?: boolean;
@@ -134,4 +134,9 @@ export interface ComposerSettings {
   workspace: string;
   /** AI 改图时为每个节点自动选模型的策略 */
   modelStrategy: ModelStrategy;
+}
+
+export interface SessionComposerSettings {
+  composer: ComposerSettings;
+  gatewaySelection: GatewaySelection;
 }

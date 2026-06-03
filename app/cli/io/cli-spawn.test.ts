@@ -71,6 +71,19 @@ function fakeHangBody(): string {
   return `process.stdin.resume(); setInterval(() => {}, 1000);`;
 }
 
+function fakeEnvBody(envOut: string): string {
+  return `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(envOut)}, JSON.stringify({
+  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || '',
+}));
+process.stdin.resume();
+process.stdin.on('end', () => {
+  process.stdout.write(JSON.stringify({ type: 'result', result: 'OK' }) + '\\n');
+});
+`;
+}
+
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'owf-spawn-test-'));
 });
@@ -131,6 +144,40 @@ describe('spawnCliAgent (claude stream-json)', () => {
     expect(argv).toContain('--permission-mode');
     expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('plan');
     expect(argv).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('uses bare mode for Anthropic-compatible relay env so user hooks do not run', async () => {
+    const argvOut = join(dir, 'argv-claude-relay.json');
+    const bin = makeFakeCli('fake-claude-relay', fakeClaudeBody(argvOut));
+    await spawnCliAgent('p', {
+      adapter: 'claude-code',
+      cliCommand: bin,
+      permission: 'full',
+      env: {
+        ANTHROPIC_API_KEY: 'freecc',
+        ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/ch/open_router',
+        ANTHROPIC_MODEL: 'z-ai/glm-4.6',
+      },
+    });
+    const argv: string[] = JSON.parse(readFileSync(argvOut, 'utf8'));
+    expect(argv).toContain('--bare');
+  });
+
+  it('normalizes known provider model env before spawning claude', async () => {
+    const envOut = join(dir, 'env-claude-provider.json');
+    const bin = makeFakeCli('fake-claude-env', fakeEnvBody(envOut));
+    await spawnCliAgent('p', {
+      adapter: 'claude-code',
+      cliCommand: bin,
+      permission: 'full',
+      env: {
+        ANTHROPIC_API_KEY: 'freecc',
+        ANTHROPIC_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+        ANTHROPIC_MODEL: 'nemotron-3-super-120b-a12b',
+      },
+    });
+    const env = JSON.parse(readFileSync(envOut, 'utf8'));
+    expect(env.ANTHROPIC_MODEL).toBe('nvidia/nemotron-3-super-120b-a12b');
   });
 
   it('returns accumulated text when no result event is emitted', async () => {

@@ -1,6 +1,6 @@
 import type { GatewaySelection } from '@/core/ir';
 import type { GatewayProvider } from '@/lib/modelGateway/types';
-import { freeProxyEnsure, isTauri } from '@/lib/tauri';
+import { freeChannelAutoKeys, freeProxyEnsure, isTauri } from '@/lib/tauri';
 
 /**
  * CONTRACT: catalog + helpers for the built-in "free channels" feature.
@@ -39,8 +39,12 @@ export interface FreeChannel {
   upstreamBaseUrl: string;
   /** Default model id sent upstream. */
   defaultModel: string;
+  /** Extra model ids to try when the upstream rejects the selected model. */
+  fallbackModels?: string[];
   /** Where to obtain an API key (shown in UI). */
   credentialUrl?: string;
+  /** Where to install/configure a local runtime (shown for local channels). */
+  setupUrl?: string;
   /** Local runtime (ollama/lmstudio/llamacpp) — no key needed. */
   local: boolean;
   /** Whether an API key is required. */
@@ -63,6 +67,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://integrate.api.nvidia.com/v1',
     defaultModel: 'nvidia/nemotron-3-super-120b-a12b',
+    fallbackModels: ['nvidia/llama-3.1-nemotron-ultra-253b-v1'],
     credentialUrl: 'https://build.nvidia.com/settings/api-keys',
     local: false,
     needsKey: true,
@@ -70,9 +75,10 @@ export const FREE_CHANNELS: FreeChannel[] = [
   {
     id: 'open_router',
     label: 'OpenRouter',
-    transport: 'anthropic',
-    upstreamBaseUrl: 'https://openrouter.ai/api',
+    transport: 'openai',
+    upstreamBaseUrl: 'https://openrouter.ai/api/v1',
     defaultModel: 'z-ai/glm-4.6',
+    fallbackModels: ['z-ai/glm-5.1', 'z-ai/glm-4.7', 'z-ai/glm-4.5-air:free'],
     credentialUrl: 'https://openrouter.ai/keys',
     local: false,
     needsKey: true,
@@ -83,6 +89,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     defaultModel: 'gemini-2.5-flash',
+    fallbackModels: ['gemini-2.5-flash-lite', 'gemini-2.0-flash'],
     credentialUrl: 'https://aistudio.google.com/apikey',
     local: false,
     needsKey: true,
@@ -93,6 +100,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'anthropic',
     upstreamBaseUrl: 'https://api.deepseek.com/anthropic',
     defaultModel: 'deepseek-chat',
+    fallbackModels: ['deepseek-reasoner'],
     credentialUrl: 'https://platform.deepseek.com/api_keys',
     local: false,
     needsKey: true,
@@ -103,6 +111,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://api.mistral.ai/v1',
     defaultModel: 'mistral-large-latest',
+    fallbackModels: ['mistral-small-latest'],
     credentialUrl: 'https://console.mistral.ai/',
     local: false,
     needsKey: true,
@@ -113,6 +122,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://codestral.mistral.ai/v1',
     defaultModel: 'codestral-latest',
+    fallbackModels: ['codestral-2405'],
     credentialUrl: 'https://console.mistral.ai/',
     local: false,
     needsKey: true,
@@ -123,6 +133,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://opencode.ai/zen/v1',
     defaultModel: 'glm-5.1',
+    fallbackModels: ['glm-4.6'],
     credentialUrl: 'https://opencode.ai/auth',
     local: false,
     needsKey: true,
@@ -133,6 +144,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://opencode.ai/zen/go/v1',
     defaultModel: 'glm-5.1',
+    fallbackModels: ['glm-4.6'],
     credentialUrl: 'https://opencode.ai/auth',
     local: false,
     needsKey: true,
@@ -143,6 +155,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'anthropic',
     upstreamBaseUrl: 'https://pass.wafer.ai',
     defaultModel: 'GLM-5.1',
+    fallbackModels: ['glm-5.1', 'glm-4.6'],
     credentialUrl: 'https://www.wafer.ai/pass',
     local: false,
     needsKey: true,
@@ -153,6 +166,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'anthropic',
     upstreamBaseUrl: 'https://api.moonshot.ai/anthropic',
     defaultModel: 'kimi-k2.5',
+    fallbackModels: ['kimi-k2-0905-preview', 'moonshot-v1-32k'],
     credentialUrl: 'https://platform.moonshot.cn/console/api-keys',
     local: false,
     needsKey: true,
@@ -163,6 +177,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://api.cerebras.ai/v1',
     defaultModel: 'llama-3.3-70b',
+    fallbackModels: ['llama3.1-8b'],
     credentialUrl: 'https://cloud.cerebras.ai',
     local: false,
     needsKey: true,
@@ -173,6 +188,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'https://api.groq.com/openai/v1',
     defaultModel: 'llama-3.3-70b-versatile',
+    fallbackModels: ['llama-3.1-8b-instant', 'openai/gpt-oss-120b'],
     credentialUrl: 'https://console.groq.com/keys',
     local: false,
     needsKey: true,
@@ -183,6 +199,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'anthropic',
     upstreamBaseUrl: 'https://api.fireworks.ai/inference',
     defaultModel: 'accounts/fireworks/models/llama-v3p3-70b-instruct',
+    fallbackModels: ['accounts/fireworks/models/llama-v3p1-8b-instruct'],
     credentialUrl: 'https://fireworks.ai/account/api-keys',
     local: false,
     needsKey: true,
@@ -193,6 +210,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'anthropic',
     upstreamBaseUrl: 'https://api.z.ai/api/anthropic',
     defaultModel: 'glm-5.1',
+    fallbackModels: ['glm-4.6'],
     credentialUrl: 'https://z.ai/manage-apikey/apikey-list',
     local: false,
     needsKey: true,
@@ -207,6 +225,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'http://localhost:1234/v1',
     defaultModel: '',
+    setupUrl: 'https://lmstudio.ai/download',
     local: true,
     needsKey: false,
     note: 'Set a model override to the id you loaded in LM Studio.',
@@ -219,6 +238,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'http://localhost:8080/v1',
     defaultModel: '',
+    setupUrl: 'https://github.com/ggml-org/llama.cpp/releases',
     local: true,
     needsKey: false,
     note: 'Set a model override to the model your llama.cpp server is hosting.',
@@ -231,6 +251,7 @@ export const FREE_CHANNELS: FreeChannel[] = [
     transport: 'openai',
     upstreamBaseUrl: 'http://localhost:11434/v1',
     defaultModel: 'llama3.1',
+    setupUrl: 'https://ollama.com/download',
     local: true,
     needsKey: false,
     note: 'Override the model to match a tag you have pulled (e.g. llama3.3).',
@@ -286,8 +307,60 @@ export function setFreeChannelKey(id: string, key: string): void {
 
 export function getFreeChannelModel(id: string): string {
   const override = (readRecord(MODELS_STORAGE)[id] ?? '').trim();
-  if (override) return override;
+  if (override) return normalizeFreeChannelModel(id, override);
   return freeChannelById(id)?.defaultModel ?? '';
+}
+
+export function getFreeChannelFallbackModels(id: string): string[] {
+  const channel = freeChannelById(id);
+  if (!channel) return [];
+  const primary = getFreeChannelModel(id);
+  return uniqueModels([
+    ...(channel.fallbackModels ?? []).map((model) =>
+      normalizeFreeChannelModel(id, model),
+    ),
+    normalizeFreeChannelModel(id, channel.defaultModel),
+  ]).filter((model) => model && model !== primary);
+}
+
+function normalizeFreeChannelModel(id: string, model: string): string {
+  const normalized = model.trim();
+  const lower = normalized.toLowerCase();
+  switch (id) {
+    case 'open_router':
+      if (/^glm-\d/i.test(normalized)) return `z-ai/${lower}`;
+      if (lower.startsWith('z-ai/glm-')) return lower;
+      return normalized;
+    case 'nvidia_nim':
+      if (!normalized.includes('/') && lower.includes('nemotron')) {
+        return `nvidia/${lower}`;
+      }
+      return normalized;
+    case 'fireworks':
+      if (!normalized.includes('/') && lower.startsWith('llama-')) {
+        return `accounts/fireworks/models/${lower}`;
+      }
+      return normalized;
+    case 'opencode':
+    case 'opencode_go':
+    case 'zai':
+      if (/^glm-\d/i.test(normalized)) return lower;
+      return normalized;
+    default:
+      return normalized;
+  }
+}
+
+function uniqueModels(models: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const model of models) {
+    const trimmed = model.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
 }
 
 /**
@@ -310,8 +383,43 @@ export function setFreeChannelModel(id: string, model: string): void {
 export function freeChannelReady(id: string): boolean {
   const channel = freeChannelById(id);
   if (!channel) return false;
-  if (channel.local || !channel.needsKey) return true;
+  if (channel.local) return getFreeChannelModelOverride(id).length > 0;
+  if (!channel.needsKey) return true;
   return getFreeChannelKey(id).length > 0;
+}
+
+export function applyFreeChannelEnvKeys(keys: Record<string, string>): string[] {
+  const imported: string[] = [];
+  for (const channel of FREE_CHANNELS) {
+    if (channel.local || !channel.needsKey) continue;
+    if (getFreeChannelKey(channel.id)) continue;
+    const key = keys[channel.id]?.trim();
+    if (!key) continue;
+    setFreeChannelKey(channel.id, key);
+    imported.push(channel.id);
+  }
+  return imported;
+}
+
+export async function importFreeChannelKeysFromAutoConfig(): Promise<string[]> {
+  if (!isTauri()) return [];
+  try {
+    return applyFreeChannelEnvKeys(await freeChannelAutoKeys());
+  } catch {
+    return [];
+  }
+}
+
+export async function loadFreeChannelKeyFromAutoConfig(id: string): Promise<string> {
+  const stored = getFreeChannelKey(id);
+  if (stored) return stored;
+  if (!isTauri()) return '';
+  try {
+    applyFreeChannelEnvKeys(await freeChannelAutoKeys());
+  } catch {
+    return '';
+  }
+  return getFreeChannelKey(id);
 }
 
 export function getCachedFreeProxyPort(): number {
@@ -421,6 +529,7 @@ export async function ensureFreeProxy(): Promise<number> {
       baseUrl: c.upstreamBaseUrl,
       apiKey: c.local ? '' : getFreeChannelKey(c.id),
       model: getFreeChannelModel(c.id),
+      fallbackModels: getFreeChannelFallbackModels(c.id),
     }),
   );
   try {

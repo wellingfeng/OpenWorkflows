@@ -4,6 +4,7 @@ import type { ToolEvent } from './lib/toolEvent';
 import ToolIcon from './ToolIcon';
 import { scanFileRefs } from './lib/fileScan';
 import FileChip, { type OpenFileFn } from './FileChip';
+import { compactToolSubject, toolSubjectAllowsFileRefs } from './lib/toolDisplay';
 
 /** Format a duration in ms as a compact human string. */
 function fmtDuration(ms: number): string {
@@ -52,16 +53,17 @@ export default function ToolCard({
   onOpenFile?: OpenFileFn;
   depth?: number;
 }) {
-  const hasBody =
-    (event.args !== undefined && event.args !== null) ||
-    (event.result != null && event.result !== '') ||
-    (childrenEvents?.length ?? 0) > 0;
   const [open, setOpen] = useState(false);
 
   const subject = event.subject ?? '';
-  const renderSubject = () => {
-    if (!subject) return null;
-    const parts = scanFileRefs(subject);
+  const collapsedSubject = compactToolSubject(event.name, subject);
+  const subjectCompacted =
+    !!subject && collapsedSubject !== subject.replace(/[\r\n]+/g, ' ').trim();
+  const linkFileRefs = toolSubjectAllowsFileRefs(event.name);
+  const renderSubject = (text: string) => {
+    if (!text) return null;
+    if (!linkFileRefs) return text;
+    const parts = scanFileRefs(text);
     return parts.map((p, i) =>
       typeof p === 'string' ? (
         <span key={i}>{p}</span>
@@ -77,6 +79,11 @@ export default function ToolCard({
       : typeof event.args === 'string'
         ? event.args
         : safeJson(event.args);
+  const hasBody =
+    (event.args !== undefined && event.args !== null) ||
+    (event.result != null && event.result !== '') ||
+    (childrenEvents?.length ?? 0) > 0 ||
+    (subjectCompacted && !argsBody);
 
   return (
     <div
@@ -102,10 +109,12 @@ export default function ToolCard({
         )}
         <ToolIcon name={event.name} size={12} className="shrink-0 text-accent/70" />
         <span className="shrink-0 font-medium text-accent-2">{event.name}</span>
-        {subject && (
-          <span className="min-w-0 flex-1 truncate text-fg-dim">{renderSubject()}</span>
+        {collapsedSubject && (
+          <span className="min-w-0 flex-1 truncate text-fg-dim">
+            {renderSubject(collapsedSubject)}
+          </span>
         )}
-        {!subject && <span className="flex-1" />}
+        {!collapsedSubject && <span className="flex-1" />}
         {event.durationMs != null && (
           <span className="shrink-0 tabular-nums text-fg-faint">
             {fmtDuration(event.durationMs)}
@@ -116,6 +125,7 @@ export default function ToolCard({
 
       {open && hasBody && (
         <div className="border-t border-border-soft px-2.5 py-1.5">
+          {subjectCompacted && !argsBody && <Panel label="详情" body={subject} />}
           {argsBody && <Panel label="请求" body={argsBody} />}
           {event.result != null && event.result !== '' && (
             <Panel

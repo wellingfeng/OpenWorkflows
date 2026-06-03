@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
@@ -105,6 +106,155 @@ fn unregister_ai_cli(run_id: &str) {
     if let Ok(mut active) = active_ai_cli_pids().lock() {
         active.remove(run_id);
     }
+}
+
+const FREE_CHANNEL_ENV_MAPPINGS: &[(&str, &[&str])] = &[
+    ("nvidia_nim", &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"]),
+    (
+        "open_router",
+        &["OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY"],
+    ),
+    ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    ("deepseek", &["DEEPSEEK_API_KEY"]),
+    ("mistral", &["MISTRAL_API_KEY"]),
+    (
+        "mistral_codestral",
+        &[
+            "CODESTRAL_API_KEY",
+            "MISTRAL_CODESTRAL_API_KEY",
+            "MISTRAL_API_KEY",
+        ],
+    ),
+    ("opencode", &["OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"]),
+    ("opencode_go", &["OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"]),
+    ("wafer", &["WAFER_API_KEY"]),
+    ("kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
+    ("cerebras", &["CEREBRAS_API_KEY"]),
+    ("groq", &["GROQ_API_KEY"]),
+    ("fireworks", &["FIREWORKS_API_KEY", "FIREWORKS_API_TOKEN"]),
+    (
+        "zai",
+        &[
+            "ZAI_API_KEY",
+            "Z_AI_API_KEY",
+            "GLM_API_KEY",
+            "ZHIPU_API_KEY",
+        ],
+    ),
+];
+
+const LOCAL_MODEL_SETUP_PS1: &str = include_str!("../../scripts/setup-local-model.ps1");
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelHardware {
+    ram_gb: Option<f64>,
+    cpu_threads: Option<u32>,
+    gpu_vram_gb: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelRuntimeStatus {
+    channel_id: String,
+    configured_model: String,
+    reachable: bool,
+    ready: bool,
+    state: String,
+    models: Vec<String>,
+    message: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalFilePreview {
+    path: String,
+    file_name: String,
+    kind: String,
+    mime: Option<String>,
+    size_bytes: u64,
+    truncated: bool,
+    text: Option<String>,
+    base64: Option<String>,
+}
+
+fn known_free_channel_ids() -> HashSet<&'static str> {
+    FREE_CHANNEL_ENV_MAPPINGS
+        .iter()
+        .map(|(channel_id, _)| *channel_id)
+        .collect()
+}
+
+fn read_free_channel_key_file(path: PathBuf) -> HashMap<String, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return HashMap::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return HashMap::new(),
+    };
+    let keys = parsed.get("keys").unwrap_or(&parsed);
+    let known = known_free_channel_ids();
+    let mut out = HashMap::new();
+    if let Some(obj) = keys.as_object() {
+        for (channel_id, value) in obj {
+            if !known.contains(channel_id.as_str()) {
+                continue;
+            }
+            if let Some(key) = value.as_str() {
+                let trimmed = key.trim();
+                if !trimmed.is_empty() {
+                    out.insert(channel_id.clone(), trimmed.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn free_channel_key_file_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(path) = std::env::var("OPENWORKFLOWS_FREE_CHANNELS_CONFIG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            out.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("free-channels.private.json"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        out.push(cwd.join("free-channels.private.json"));
+        out.push(cwd.join("app").join("free-channels.private.json"));
+        out.push(cwd.join("..").join("free-channels.private.json"));
+    }
+    out
+}
+
+#[tauri::command]
+fn free_channel_auto_keys() -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for path in free_channel_key_file_candidates() {
+        for (channel_id, key) in read_free_channel_key_file(path) {
+            out.entry(channel_id).or_insert(key);
+        }
+    }
+    for (channel_id, vars) in FREE_CHANNEL_ENV_MAPPINGS {
+        for var in *vars {
+            if let Ok(value) = std::env::var(var) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    out.entry((*channel_id).to_string())
+                        .or_insert_with(|| trimmed.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Map a frontend adapter id to the local CLI binary that runs it.
@@ -368,6 +518,433 @@ fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+const PREVIEW_TEXT_LIMIT: u64 = 1_500_000;
+const PREVIEW_IMAGE_LIMIT: u64 = 12 * 1024 * 1024;
+
+fn preview_path(path: &str, cwd: Option<&str>) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("路径为空。".to_string());
+    }
+    let raw = PathBuf::from(trimmed);
+    if raw.is_absolute() || cwd.unwrap_or("").trim().is_empty() {
+        return Ok(raw);
+    }
+    Ok(PathBuf::from(cwd.unwrap()).join(raw))
+}
+
+fn image_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+fn probably_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let sample = &bytes[..bytes.len().min(4096)];
+    if sample.iter().any(|b| *b == 0) {
+        return true;
+    }
+    let control = sample
+        .iter()
+        .filter(|b| **b < 0x08 || (**b > 0x0d && **b < 0x20))
+        .count();
+    control * 100 > sample.len() * 10
+}
+
+fn decode_preview_text(bytes: Vec<u8>) -> Option<String> {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16(&units).ok();
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16(&units).ok();
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .map(|text| text.trim_start_matches('\u{feff}').to_string())
+}
+
+#[tauri::command]
+fn preview_local_file(path: String, cwd: Option<String>) -> Result<LocalFilePreview, String> {
+    let resolved = preview_path(&path, cwd.as_deref())?;
+    let metadata = std::fs::metadata(&resolved).map_err(|e| format!("读取文件信息失败：{e}"))?;
+    if !metadata.is_file() {
+        return Err("目标不是文件。".to_string());
+    }
+
+    let size_bytes = metadata.len();
+    let file_name = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let path = resolved.to_string_lossy().to_string();
+
+    if let Some(mime) = image_mime_for_path(&resolved) {
+        if size_bytes > PREVIEW_IMAGE_LIMIT {
+            return Ok(LocalFilePreview {
+                path,
+                file_name,
+                kind: "binary".to_string(),
+                mime: Some(mime.to_string()),
+                size_bytes,
+                truncated: false,
+                text: None,
+                base64: None,
+            });
+        }
+        let bytes = std::fs::read(&resolved).map_err(|e| format!("读取图片失败：{e}"))?;
+        use base64::Engine;
+        return Ok(LocalFilePreview {
+            path,
+            file_name,
+            kind: "image".to_string(),
+            mime: Some(mime.to_string()),
+            size_bytes,
+            truncated: false,
+            text: None,
+            base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        });
+    }
+
+    let mut file = std::fs::File::open(&resolved).map_err(|e| format!("打开文件失败：{e}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(PREVIEW_TEXT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取文件失败：{e}"))?;
+    let truncated = bytes.len() as u64 > PREVIEW_TEXT_LIMIT || size_bytes > PREVIEW_TEXT_LIMIT;
+    if bytes.len() as u64 > PREVIEW_TEXT_LIMIT {
+        bytes.truncate(PREVIEW_TEXT_LIMIT as usize);
+    }
+
+    if probably_binary(&bytes) {
+        return Ok(LocalFilePreview {
+            path,
+            file_name,
+            kind: "binary".to_string(),
+            mime: None,
+            size_bytes,
+            truncated: false,
+            text: None,
+            base64: None,
+        });
+    }
+
+    let Some(text) = decode_preview_text(bytes) else {
+        return Ok(LocalFilePreview {
+            path,
+            file_name,
+            kind: "binary".to_string(),
+            mime: None,
+            size_bytes,
+            truncated: false,
+            text: None,
+            base64: None,
+        });
+    };
+
+    Ok(LocalFilePreview {
+        path,
+        file_name,
+        kind: "text".to_string(),
+        mime: Some("text/plain".to_string()),
+        size_bytes,
+        truncated,
+        text: Some(text),
+        base64: None,
+    })
+}
+
+fn fallback_local_model_hardware() -> LocalModelHardware {
+    LocalModelHardware {
+        ram_gb: None,
+        cpu_threads: std::thread::available_parallelism()
+            .ok()
+            .map(|n| n.get() as u32),
+        gpu_vram_gb: None,
+    }
+}
+
+#[tauri::command]
+fn local_model_hardware() -> LocalModelHardware {
+    let fallback = fallback_local_model_hardware();
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$ramGb = $null
+$cpuThreads = [Environment]::ProcessorCount
+$gpuVramGb = $null
+$cs = Get-CimInstance Win32_ComputerSystem
+if ($cs.TotalPhysicalMemory) { $ramGb = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1) }
+$cpu = Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum
+if ($cpu.Sum) { $cpuThreads = [int]$cpu.Sum }
+$gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterRAM -gt 0 } | Measure-Object -Property AdapterRAM -Maximum
+if ($gpu.Maximum) { $gpuVramGb = [math]::Round($gpu.Maximum / 1GB, 1) }
+[pscustomobject]@{ ramGb = $ramGb; cpuThreads = $cpuThreads; gpuVramGb = $gpuVramGb } | ConvertTo-Json -Compress
+"#;
+        let mut cmd = Command::new("powershell");
+        hide_console(&mut cmd);
+        let output = cmd.arg("-NoProfile").arg("-Command").arg(script).output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    let cpu_threads = value
+                        .get("cpuThreads")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .or(fallback.cpu_threads);
+                    return LocalModelHardware {
+                        ram_gb: value.get("ramGb").and_then(|v| v.as_f64()),
+                        cpu_threads,
+                        gpu_vram_gb: value.get("gpuVramGb").and_then(|v| v.as_f64()),
+                    };
+                }
+            }
+        }
+    }
+    fallback
+}
+
+fn local_model_status_payload(
+    channel_id: &str,
+    configured_model: &str,
+    reachable: bool,
+    ready: bool,
+    state: &str,
+    models: Vec<String>,
+    message: Option<String>,
+) -> LocalModelRuntimeStatus {
+    LocalModelRuntimeStatus {
+        channel_id: channel_id.to_string(),
+        configured_model: configured_model.to_string(),
+        reachable,
+        ready,
+        state: state.to_string(),
+        models,
+        message,
+    }
+}
+
+fn local_model_status_endpoint(channel_id: &str) -> Option<&'static str> {
+    match channel_id {
+        "ollama" => Some("http://127.0.0.1:11434/api/tags"),
+        "lmstudio" => Some("http://127.0.0.1:1234/v1/models"),
+        "llamacpp" => Some("http://127.0.0.1:8080/v1/models"),
+        _ => None,
+    }
+}
+
+fn push_unique_model_id(out: &mut Vec<String>, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if out
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+    {
+        return;
+    }
+    out.push(trimmed.to_string());
+}
+
+fn extract_local_model_ids(channel_id: &str, value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if channel_id == "ollama" {
+        if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
+            for model in models {
+                push_unique_model_id(&mut out, model.get("name").and_then(|v| v.as_str()));
+                push_unique_model_id(&mut out, model.get("model").and_then(|v| v.as_str()));
+            }
+        }
+    }
+    if let Some(data) = value.get("data").and_then(|v| v.as_array()) {
+        for model in data {
+            push_unique_model_id(&mut out, model.get("id").and_then(|v| v.as_str()));
+        }
+    }
+    if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
+        for model in models {
+            if let Some(name) = model.as_str() {
+                push_unique_model_id(&mut out, Some(name));
+            } else {
+                push_unique_model_id(&mut out, model.get("id").and_then(|v| v.as_str()));
+                push_unique_model_id(&mut out, model.get("name").and_then(|v| v.as_str()));
+                push_unique_model_id(&mut out, model.get("model").and_then(|v| v.as_str()));
+            }
+        }
+    }
+    out
+}
+
+fn local_model_id_matches(configured: &str, available: &str) -> bool {
+    let configured = configured.trim().to_ascii_lowercase();
+    let available = available.trim().to_ascii_lowercase();
+    if configured.is_empty() || available.is_empty() {
+        return false;
+    }
+    configured == available
+        || format!("{configured}:latest") == available
+        || configured == format!("{available}:latest")
+}
+
+#[tauri::command]
+fn local_model_status(channel_id: String, model: Option<String>) -> LocalModelRuntimeStatus {
+    let channel_id = channel_id.trim().to_ascii_lowercase();
+    let configured_model = model.unwrap_or_default().trim().to_string();
+    if configured_model.is_empty() {
+        return local_model_status_payload(
+            &channel_id,
+            "",
+            false,
+            false,
+            "missing_model",
+            Vec::new(),
+            Some("未填写本地模型 id。".to_string()),
+        );
+    }
+    let Some(url) = local_model_status_endpoint(&channel_id) else {
+        return local_model_status_payload(
+            &channel_id,
+            &configured_model,
+            false,
+            false,
+            "unsupported",
+            Vec::new(),
+            Some("不支持检测该本地渠道。".to_string()),
+        );
+    };
+    let result = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(2))
+        .call();
+    match result {
+        Ok(response) => {
+            let body = response.into_string().unwrap_or_default();
+            let value: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(value) => value,
+                Err(err) => {
+                    return local_model_status_payload(
+                        &channel_id,
+                        &configured_model,
+                        true,
+                        false,
+                        "service_error",
+                        Vec::new(),
+                        Some(format!("本地服务响应不是有效 JSON: {err}")),
+                    );
+                }
+            };
+            let models = extract_local_model_ids(&channel_id, &value);
+            let has_model = models
+                .iter()
+                .any(|available| local_model_id_matches(&configured_model, available));
+            if has_model {
+                local_model_status_payload(
+                    &channel_id,
+                    &configured_model,
+                    true,
+                    true,
+                    "ready",
+                    models,
+                    None,
+                )
+            } else {
+                local_model_status_payload(
+                    &channel_id,
+                    &configured_model,
+                    true,
+                    false,
+                    "model_missing",
+                    models,
+                    Some("本地服务已启动，但未发现已配置模型。".to_string()),
+                )
+            }
+        }
+        Err(ureq::Error::Status(code, _)) => local_model_status_payload(
+            &channel_id,
+            &configured_model,
+            true,
+            false,
+            "service_error",
+            Vec::new(),
+            Some(format!("本地服务返回 HTTP {code}。")),
+        ),
+        Err(err) => local_model_status_payload(
+            &channel_id,
+            &configured_model,
+            false,
+            false,
+            "service_unavailable",
+            Vec::new(),
+            Some(format!("无法连接本地服务: {err}")),
+        ),
+    }
+}
+
+fn validate_ollama_model_id(model: &str) -> Result<String, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err("请选择要安装的本地模型。".to_string());
+    }
+    if trimmed.len() > 128 {
+        return Err("模型名称过长。".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
+    {
+        return Err("模型名称只能包含字母、数字、点、下划线、短横线、冒号或斜杠。".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+#[tauri::command]
+fn setup_local_model(model: String) -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Err("本地模型一键配置目前只支持 Windows + Ollama。".to_string());
+    }
+    let model = validate_ollama_model_id(&model)?;
+    let script_path = std::env::temp_dir().join("openworkflows-setup-local-model.ps1");
+    std::fs::write(&script_path, LOCAL_MODEL_SETUP_PS1.as_bytes())
+        .map_err(|e| format!("写入本地模型安装脚本失败: {e}"))?;
+
+    Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&script_path)
+        .arg("-Provider")
+        .arg("ollama")
+        .arg("-Model")
+        .arg(model)
+        .spawn()
+        .map_err(|e| format!("启动本地模型安装脚本失败: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn scan_model_clis() -> cli_runtime::CliScanResult {
     cli_runtime::scan_model_clis()
@@ -579,6 +1156,132 @@ fn mcp_enabled() -> bool {
             v == "1" || v == "true" || v == "yes"
         })
         .unwrap_or(false)
+}
+
+fn claude_bare_mode_disabled() -> bool {
+    std::env::var("OPENWORKFLOW_DISABLE_CLAUDE_BARE")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+fn env_has_value(env_vars: &HashMap<String, String>, key: &str) -> bool {
+    env_vars
+        .get(key)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn known_provider_model_variant(base_url: Option<&str>, model: Option<&str>) -> Option<String> {
+    let trimmed = model?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = base_url.unwrap_or("").trim().to_ascii_lowercase();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if base.contains("openrouter.ai") || base.contains("/ch/open_router") {
+        if lower.starts_with("glm-") {
+            return Some(format!("z-ai/{lower}"));
+        }
+        if lower.starts_with("z-ai/glm-") {
+            return Some(lower);
+        }
+    }
+    if base.contains("integrate.api.nvidia.com") || base.contains("/ch/nvidia_nim") {
+        if !trimmed.contains('/') && lower.contains("nemotron") {
+            return Some(format!("nvidia/{lower}"));
+        }
+    }
+    if base.contains("fireworks.ai") || base.contains("/ch/fireworks") {
+        if !trimmed.contains('/') && lower.starts_with("llama-") {
+            return Some(format!("accounts/fireworks/models/{lower}"));
+        }
+    }
+    if base.contains("opencode.ai")
+        || base.contains("z.ai")
+        || base.contains("bigmodel.cn")
+        || base.contains("/ch/opencode")
+        || base.contains("/ch/opencode_go")
+        || base.contains("/ch/zai")
+    {
+        if lower.starts_with("glm-") {
+            return Some(lower);
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn normalize_spawn_env(
+    mut env_vars: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    let mut out = env_vars.take().unwrap_or_default();
+    let had_overlay = !out.is_empty();
+    let mut changed = false;
+
+    let anthropic_base = out
+        .get("ANTHROPIC_BASE_URL")
+        .cloned()
+        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
+    let anthropic_model = out
+        .get("ANTHROPIC_MODEL")
+        .cloned()
+        .or_else(|| std::env::var("ANTHROPIC_MODEL").ok());
+    if let Some(model) = known_provider_model_variant(
+        anthropic_base.as_deref(),
+        anthropic_model.as_deref(),
+    ) {
+        if anthropic_model.as_deref().map(str::trim) != Some(model.as_str()) {
+            out.insert("ANTHROPIC_MODEL".to_string(), model);
+            changed = true;
+        }
+    }
+
+    let openai_base = out
+        .get("OPENAI_BASE_URL")
+        .cloned()
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
+    let openai_model = out
+        .get("OPENAI_MODEL")
+        .cloned()
+        .or_else(|| std::env::var("OPENAI_MODEL").ok());
+    if let Some(model) =
+        known_provider_model_variant(openai_base.as_deref(), openai_model.as_deref())
+    {
+        if openai_model.as_deref().map(str::trim) != Some(model.as_str()) {
+            out.insert("OPENAI_MODEL".to_string(), model);
+            changed = true;
+        }
+    }
+
+    if had_overlay || changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn should_run_claude_bare(env_vars: Option<&HashMap<String, String>>) -> bool {
+    should_run_claude_bare_with_disable(env_vars, claude_bare_mode_disabled())
+}
+
+fn should_run_claude_bare_with_disable(
+    env_vars: Option<&HashMap<String, String>>,
+    disabled: bool,
+) -> bool {
+    if disabled {
+        return false;
+    }
+    let Some(env_vars) = env_vars else {
+        return false;
+    };
+    let has_api_key = env_has_value(env_vars, "ANTHROPIC_API_KEY");
+    let has_gateway_route =
+        env_has_value(env_vars, "ANTHROPIC_BASE_URL") || env_has_value(env_vars, "ANTHROPIC_MODEL");
+    has_api_key && has_gateway_route
 }
 
 /// Whether to request token-level partial streaming from the claude CLI via
@@ -929,6 +1632,7 @@ async fn ai_cli(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let env_vars = normalize_spawn_env(env_vars);
         let binary = match cli_command
             .as_deref()
             .map(cli_runtime::normalize_cli_command_override)
@@ -1019,6 +1723,13 @@ async fn ai_cli(
             args.push("--output-format".into());
             args.push("stream-json".into());
             args.push("--verbose".into());
+            // Free/relay channels inject their own Anthropic-compatible key and
+            // base URL. Use Claude Code's minimal print mode there so user-level
+            // plugins/hooks (especially SessionEnd hooks) cannot turn a
+            // successful model call into exit=1.
+            if should_run_claude_bare(env_vars.as_ref()) {
+                args.push("--bare".into());
+            }
             // Token-level streaming so the run log fills in as text/thinking is
             // generated, instead of staying blank until a whole message lands.
             if partial_enabled() {
@@ -1602,6 +2313,101 @@ mod tests {
         assert!(trimmed.starts_with("...\n"));
         assert!(trimmed.len() < text.len());
     }
+
+    #[test]
+    fn extracts_local_model_ids_from_ollama_tags() {
+        let value = serde_json::json!({
+            "models": [
+                { "name": "qwen2.5-coder:7b", "model": "qwen2.5-coder:7b" },
+                { "name": "llama3.2:3b" }
+            ]
+        });
+        assert_eq!(
+            extract_local_model_ids("ollama", &value),
+            vec!["qwen2.5-coder:7b", "llama3.2:3b"]
+        );
+    }
+
+    #[test]
+    fn extracts_local_model_ids_from_openai_models() {
+        let value = serde_json::json!({
+            "data": [
+                { "id": "local-model-a" },
+                { "id": "local-model-b" }
+            ]
+        });
+        assert_eq!(
+            extract_local_model_ids("lmstudio", &value),
+            vec!["local-model-a", "local-model-b"]
+        );
+    }
+
+    #[test]
+    fn matches_ollama_latest_alias() {
+        assert!(local_model_id_matches("llama3.1", "llama3.1:latest"));
+        assert!(local_model_id_matches("llama3.1:latest", "llama3.1"));
+        assert!(!local_model_id_matches("llama3.1", "llama3.2:latest"));
+    }
+
+    #[test]
+    fn claude_bare_mode_requires_gateway_api_env() {
+        let mut env = HashMap::new();
+        assert!(!should_run_claude_bare_with_disable(Some(&env), false));
+
+        env.insert("ANTHROPIC_API_KEY".to_string(), "freecc".to_string());
+        assert!(!should_run_claude_bare_with_disable(Some(&env), false));
+
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://127.0.0.1:8765/ch/open_router".to_string(),
+        );
+        assert!(should_run_claude_bare_with_disable(Some(&env), false));
+    }
+
+    #[test]
+    fn claude_bare_mode_can_be_disabled() {
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), "freecc".to_string());
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://127.0.0.1:8765/ch/open_router".to_string(),
+        );
+
+        assert!(!should_run_claude_bare_with_disable(Some(&env), true));
+    }
+
+    #[test]
+    fn normalizes_spawn_env_known_provider_models() {
+        let mut env = HashMap::new();
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://integrate.api.nvidia.com/v1".to_string(),
+        );
+        env.insert(
+            "ANTHROPIC_MODEL".to_string(),
+            "nemotron-3-super-120b-a12b".to_string(),
+        );
+        let normalized = normalize_spawn_env(Some(env)).unwrap();
+        assert_eq!(
+            normalized.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("nvidia/nemotron-3-super-120b-a12b")
+        );
+    }
+
+    #[test]
+    fn normalizes_spawn_env_free_proxy_channel_models() {
+        let mut env = HashMap::new();
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://127.0.0.1:8765/ch/open_router".to_string(),
+        );
+        env.insert("ANTHROPIC_MODEL".to_string(), "glm-4.6".to_string());
+        let normalized = normalize_spawn_env(Some(env)).unwrap();
+        assert_eq!(
+            normalized.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("z-ai/glm-4.6")
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1628,7 +2434,12 @@ pub fn run() {
             scan_model_clis,
             validate_cli_path,
             validate_shell_path,
+            free_channel_auto_keys,
+            local_model_hardware,
+            local_model_status,
+            setup_local_model,
             open_external,
+            preview_local_file,
             history::history_root,
             history::history_read_json,
             history::history_write_json,

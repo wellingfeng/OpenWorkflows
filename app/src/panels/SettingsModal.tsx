@@ -31,6 +31,7 @@ import {
   freeChannelReady,
   getFreeChannelKey,
   getFreeChannelModelOverride,
+  importFreeChannelKeysFromAutoConfig,
   setFreeChannelKey,
   setFreeChannelModel,
   type FreeChannel,
@@ -57,10 +58,13 @@ import {
 import { importCcSwitchProviders } from '@/lib/ccSwitchAutoImport';
 import {
   isTauri,
+  localModelStatus,
   openExternal,
+  type LocalModelRuntimeStatus,
   validateCliPath,
   validateShellPath,
 } from '@/lib/tauri';
+import LocalModelSetupDialog from '@/components/LocalModelSetupDialog';
 import {
   APP_VERSION,
   REPO_URL,
@@ -138,7 +142,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      if (document.querySelector('[data-provider-editor="true"]')) return;
+      if (document.querySelector('[data-settings-child-modal="true"]')) return;
       onClose();
     };
     window.addEventListener('keydown', onKeyDown);
@@ -1769,6 +1773,7 @@ function ProviderEditor({
         aria-modal="true"
         aria-labelledby="provider-editor-title"
         data-provider-editor="true"
+        data-settings-child-modal="true"
         className="fixed inset-x-0 bottom-0 flex max-h-[calc(100vh-1rem)] flex-col overflow-hidden rounded-t-lg border border-border bg-panel shadow-2xl sm:relative sm:inset-auto sm:max-h-[calc(100vh-3rem)] sm:w-[min(720px,calc(100vw-2rem))] sm:rounded-lg"
         onClick={(event) => event.stopPropagation()}
       >
@@ -2283,8 +2288,18 @@ function StepperControl({
 
 function FreeChannelsSettings({ locale }: { locale: Locale }) {
   // Bumped after each row edit so status badges (ready / needs-key) re-read.
-  const [, setRevision] = useState(0);
+  const [revision, setRevision] = useState(0);
+  const [localSetupOpen, setLocalSetupOpen] = useState(false);
   const refresh = () => setRevision((n) => n + 1);
+  useEffect(() => {
+    let disposed = false;
+    void importFreeChannelKeysFromAutoConfig().then((ids) => {
+      if (!disposed && ids.length > 0) refresh();
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   return (
     <div className="space-y-5">
@@ -2302,28 +2317,162 @@ function FreeChannelsSettings({ locale }: { locale: Locale }) {
             key={channel.id}
             channel={channel}
             locale={locale}
+            revision={revision}
             onChange={refresh}
+            onLocalSetup={() => setLocalSetupOpen(true)}
           />
         ))}
       </div>
+      {localSetupOpen && (
+        <LocalModelSetupDialog
+          locale={locale}
+          downloadUrl={FREE_CHANNELS.find((c) => c.id === 'ollama')?.setupUrl}
+          onClose={() => setLocalSetupOpen(false)}
+          onModelSelected={(model) => {
+            setFreeChannelModel('ollama', model);
+            refresh();
+            void ensureFreeProxy();
+          }}
+        />
+      )}
     </div>
   );
+}
+
+function localChannelStatusBadge(
+  locale: Locale,
+  status: LocalModelRuntimeStatus | null,
+  checking: boolean,
+  configured: boolean,
+): { label: string; cls: string; title?: string } {
+  if (checking) {
+    return {
+      label: t(locale, 'settings.freeChannels.localChecking'),
+      cls: 'border-sky-500/40 text-sky-300',
+    };
+  }
+  if (!configured || status?.state === 'missing_model') {
+    return {
+      label: t(locale, 'settings.freeChannels.localMissingModel'),
+      cls: 'border-amber-500/40 text-amber-300',
+      title: status?.message ?? undefined,
+    };
+  }
+  if (!status) {
+    return {
+      label: t(locale, 'settings.freeChannels.localConfigured'),
+      cls: 'border-sky-500/40 text-sky-300',
+    };
+  }
+  if (status.ready) {
+    return {
+      label: t(locale, 'settings.freeChannels.localReady'),
+      cls: 'border-emerald-500/40 text-emerald-300',
+    };
+  }
+  if (status.state === 'service_unavailable') {
+    return {
+      label: t(locale, 'settings.freeChannels.localServiceDown'),
+      cls: 'border-amber-500/40 text-amber-300',
+      title: status.message ?? undefined,
+    };
+  }
+  if (status.state === 'model_missing') {
+    return {
+      label: t(locale, 'settings.freeChannels.localModelMissing'),
+      cls: 'border-amber-500/40 text-amber-300',
+      title: status.message ?? undefined,
+    };
+  }
+  if (status.state === 'desktop_unavailable') {
+    return {
+      label: t(locale, 'settings.freeChannels.localDesktopOnly'),
+      cls: 'border-sky-500/40 text-sky-300',
+      title: status.message ?? undefined,
+    };
+  }
+  if (status.state === 'unsupported') {
+    return {
+      label: t(locale, 'settings.freeChannels.localUnsupported'),
+      cls: 'border-sky-500/40 text-sky-300',
+      title: status.message ?? undefined,
+    };
+  }
+  return {
+    label: t(locale, 'settings.freeChannels.localServiceError'),
+    cls: 'border-rose-500/40 text-rose-300',
+    title: status.message ?? undefined,
+  };
 }
 
 function FreeChannelRow({
   channel,
   locale,
+  revision,
   onChange,
+  onLocalSetup,
 }: {
   channel: FreeChannel;
   locale: Locale;
+  revision: number;
   onChange: () => void;
+  onLocalSetup: () => void;
 }) {
   const [keyValue, setKeyValue] = useState(() => getFreeChannelKey(channel.id));
   const [modelValue, setModelValue] = useState(() =>
     getFreeChannelModelOverride(channel.id),
   );
   const [showKey, setShowKey] = useState(false);
+  const [probeRevision, setProbeRevision] = useState(0);
+  const [localStatus, setLocalStatus] =
+    useState<LocalModelRuntimeStatus | null>(null);
+  const [checkingLocalStatus, setCheckingLocalStatus] = useState(false);
+  useEffect(() => {
+    setKeyValue(getFreeChannelKey(channel.id));
+    setModelValue(getFreeChannelModelOverride(channel.id));
+  }, [channel.id, revision]);
+
+  useEffect(() => {
+    if (!channel.local) return;
+    const model = getFreeChannelModelOverride(channel.id);
+    if (!model.trim()) {
+      setLocalStatus({
+        channelId: channel.id,
+        configuredModel: '',
+        reachable: false,
+        ready: false,
+        state: 'missing_model',
+        models: [],
+        message: null,
+      });
+      setCheckingLocalStatus(false);
+      return;
+    }
+    let disposed = false;
+    setCheckingLocalStatus(true);
+    void localModelStatus(channel.id, model)
+      .then((status) => {
+        if (!disposed) setLocalStatus(status);
+      })
+      .catch((err) => {
+        if (disposed) return;
+        setLocalStatus({
+          channelId: channel.id,
+          configuredModel: model,
+          reachable: false,
+          ready: false,
+          state: 'service_unavailable',
+          models: [],
+          message: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (!disposed) setCheckingLocalStatus(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [channel.id, channel.local, revision, probeRevision]);
 
   const ready = freeChannelReady(channel.id);
   const transportLabel =
@@ -2347,11 +2496,8 @@ function FreeChannelRow({
     onChange();
   };
 
-  const status = channel.local
-    ? {
-        label: t(locale, 'settings.freeChannels.localReady'),
-        cls: 'border-sky-500/40 text-sky-300',
-      }
+  const status: { label: string; cls: string; title?: string } = channel.local
+    ? localChannelStatusBadge(locale, localStatus, checkingLocalStatus, ready)
     : ready
       ? {
           label: t(locale, 'settings.freeChannels.ready'),
@@ -2369,6 +2515,7 @@ function FreeChannelRow({
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm font-medium text-fg">{channel.label}</span>
         <span
+          title={status.title}
           className={cn(
             'rounded border px-1.5 py-0.5 text-[10px] font-medium',
             status.cls,
@@ -2380,6 +2527,41 @@ function FreeChannelRow({
           {transportLabel}
         </span>
         <span className="min-w-0 flex-1" />
+        {channel.id === 'ollama' && (
+          <button
+            type="button"
+            onClick={onLocalSetup}
+            className="inline-flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent/15"
+          >
+            <DownloadCloud size={12} strokeWidth={2.1} />
+            {t(locale, 'settings.freeChannels.localSetup')}
+          </button>
+        )}
+        {channel.local && (
+          <button
+            type="button"
+            onClick={() => setProbeRevision((n) => n + 1)}
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-panel px-2 py-1 text-[11px] text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            title={t(locale, 'settings.freeChannels.localStatusHint')}
+          >
+            <RefreshCw
+              size={11}
+              strokeWidth={2}
+              className={checkingLocalStatus ? 'animate-spin' : undefined}
+            />
+            {t(locale, 'settings.freeChannels.localRecheck')}
+          </button>
+        )}
+        {channel.local && channel.id !== 'ollama' && channel.setupUrl && (
+          <button
+            type="button"
+            onClick={() => void openExternal(channel.setupUrl as string)}
+            className="inline-flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent/15"
+          >
+            <ExternalLink size={11} strokeWidth={2} />
+            {t(locale, 'dock.localModelDownload')}
+          </button>
+        )}
         {channel.credentialUrl && (
           <button
             type="button"

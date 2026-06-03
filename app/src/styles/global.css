@@ -583,6 +583,33 @@ pre,
 }
 .ai-code--wrap code { white-space: pre-wrap; word-break: break-word; }
 
+/* File preview drawer: use the code surface as the whole drawer body instead of
+   the compact chat-message code-card shape. */
+.ai-file-preview-code {
+  display: flex;
+  flex-direction: column;
+}
+.ai-file-preview-code .ai-markdown {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+.ai-file-preview-code .ai-code {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+.ai-file-preview-code .ai-code__scroll {
+  min-height: 0;
+  flex: 1;
+  max-height: none !important;
+}
+
 /* highlight.js token classes → theme vars (no stock hljs stylesheet imported). */
 .hljs { color: var(--fg); background: transparent; }
 .hljs-comment,

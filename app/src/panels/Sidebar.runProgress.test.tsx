@@ -281,6 +281,27 @@ function sessionButton(
   return button as HTMLButtonElement;
 }
 
+function sessionTitleOrder(container: HTMLElement, titles: string[]): string[] {
+  return Array.from(container.querySelectorAll('button'))
+    .map((button) =>
+      titles.find((title) => button.textContent?.includes(title)),
+    )
+    .filter((title): title is string => title !== undefined);
+}
+
+function expectTextBefore(
+  container: HTMLElement,
+  before: string,
+  after: string,
+): void {
+  const text = container.textContent ?? '';
+  const beforeIndex = text.indexOf(before);
+  const afterIndex = text.indexOf(after);
+  expect(beforeIndex).toBeGreaterThanOrEqual(0);
+  expect(afterIndex).toBeGreaterThanOrEqual(0);
+  expect(beforeIndex).toBeLessThan(afterIndex);
+}
+
 async function openSessionContextMenu(
   button: HTMLButtonElement,
 ): Promise<void> {
@@ -392,7 +413,7 @@ describe('Sidebar workflow rename', () => {
     return input as HTMLInputElement;
   }
 
-  it('shows Rename only for workflow sessions', async () => {
+  it('shows Rename for chat sessions', async () => {
     resetSidebarStore();
     const chatSession = {
       ...SESSION,
@@ -411,7 +432,7 @@ describe('Sidebar workflow rename', () => {
       await openSessionContextMenu(sessionButton(view.container, 'Chat run'));
 
       expect(view.container.textContent).toContain('删除');
-      expect(view.container.textContent).not.toContain('重命名');
+      expect(view.container.textContent).toContain('重命名');
       expect(queryContextMenuExportButton(view.container)).toBeNull();
     } finally {
       await view.cleanup();
@@ -493,7 +514,40 @@ describe('Sidebar workflow rename', () => {
     }
   });
 
-  it('shows only favorited workflows in the favorites tab', async () => {
+  it('favorites chat sessions from the context menu', async () => {
+    resetSidebarStore();
+    const chatSession = {
+      ...SESSION,
+      id: 's_chat',
+      title: 'Research chat',
+      isWorkflow: false,
+    };
+    mockState.sessionTree = {
+      [WORKSPACE.id]: [chatSession],
+    };
+    mockState.sessions = [chatSession];
+
+    const view = await renderSidebar();
+
+    try {
+      await openSessionContextMenu(sessionButton(view.container, 'Research chat'));
+
+      const favoriteButton = contextMenuFavoriteButton(view.container);
+      expect(favoriteButton.textContent).toContain('收藏');
+
+      await clickButton(favoriteButton);
+
+      expect(mockState.setWorkflowFavoriteSession).toHaveBeenCalledWith(
+        chatSession.id,
+        WORKSPACE.id,
+        true,
+      );
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('shows all favorited sessions in the favorites tab', async () => {
     resetSidebarStore();
     const favoriteSession = {
       ...SESSION,
@@ -525,7 +579,7 @@ describe('Sidebar workflow rename', () => {
 
       expect(view.container.textContent).toContain('Favorite Workflow');
       expect(view.container.textContent).not.toContain('Plain Workflow');
-      expect(view.container.textContent).not.toContain('Favorite Chat');
+      expect(view.container.textContent).toContain('Favorite Chat');
     } finally {
       await view.cleanup();
     }
@@ -582,6 +636,53 @@ describe('Sidebar workflow rename', () => {
       expect(
         view.container.querySelector('input[aria-label="重命名"]'),
       ).toBeNull();
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('saves a trimmed chat session name from the context menu', async () => {
+    resetSidebarStore();
+    const chatSession = {
+      ...SESSION,
+      id: 's_chat',
+      title: 'Research chat',
+      isWorkflow: false,
+    };
+    mockState.sessionTree = {
+      [WORKSPACE.id]: [chatSession],
+    };
+    mockState.sessions = [chatSession];
+    mockState.activeSessionId = chatSession.id;
+
+    const view = await renderSidebar();
+
+    try {
+      await openSessionContextMenu(sessionButton(view.container, 'Research chat'));
+      const renameButton = Array.from(
+        view.container.querySelectorAll('button'),
+      ).find((button) => button.textContent?.includes('重命名'));
+      expect(renameButton).toBeInstanceOf(HTMLButtonElement);
+
+      await clickButton(renameButton as HTMLButtonElement);
+
+      const input = view.container.querySelector('input[aria-label="重命名"]');
+      expect(input).toBeInstanceOf(HTMLInputElement);
+      await changeInputValue(input as HTMLInputElement, '  Renamed Chat  ');
+
+      const saveButton = Array.from(view.container.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === '保存',
+      );
+      expect(saveButton).toBeInstanceOf(HTMLButtonElement);
+
+      await clickButton(saveButton as HTMLButtonElement);
+      await flushAsyncWork();
+
+      expect(mockState.renameWorkflowSession).toHaveBeenCalledWith(
+        chatSession.id,
+        WORKSPACE.id,
+        'Renamed Chat',
+      );
     } finally {
       await view.cleanup();
     }
@@ -669,7 +770,7 @@ describe('Sidebar workflow rename', () => {
     }
   });
 
-  it('rejects duplicate workflow names in the same workspace list', async () => {
+  it('rejects duplicate session names in the same workspace list', async () => {
     resetSidebarStore();
     const existingSession = {
       ...SESSION,
@@ -690,7 +791,7 @@ describe('Sidebar workflow rename', () => {
       await pressInputKey(input, 'Enter');
 
       expect(view.container.textContent).toContain(
-        '同一历史列表中已存在同名 Workflow',
+        '同一历史列表中已存在同名会话',
       );
       expect(mockState.renameWorkflowSession).not.toHaveBeenCalled();
     } finally {
@@ -1000,6 +1101,164 @@ describe('Sidebar delete protection', () => {
   );
 });
 
+describe('Sidebar live session ordering', () => {
+  it('orders workspace sessions by live state before timestamp', async () => {
+    resetSidebarStore();
+    const runningSession = {
+      ...SESSION,
+      id: 's_running_old',
+      title: 'Running old',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+    };
+    const thinkingSession = {
+      ...SESSION,
+      id: 's_thinking_mid',
+      title: 'Thinking mid',
+      createdAt: 1_700_000_100_000,
+      updatedAt: 1_700_000_100_000,
+    };
+    const recentSession = {
+      ...SESSION,
+      id: 's_recent_idle',
+      title: 'Recent idle',
+      createdAt: 1_700_000_200_000,
+      updatedAt: 1_700_000_200_000,
+    };
+    const titles = [
+      runningSession.title,
+      thinkingSession.title,
+      recentSession.title,
+    ];
+    mockState.sessionTree = {
+      [WORKSPACE.id]: [recentSession, thinkingSession, runningSession],
+    };
+    mockState.sessions = [recentSession, thinkingSession, runningSession];
+    mockState.workspaces = [{ ...WORKSPACE, sessionCount: 3 }];
+    mockState.runningSessions = [
+      { workspaceId: WORKSPACE.id, sessionId: runningSession.id },
+    ];
+    mockState.aiEditingSessions = [
+      { workspaceId: WORKSPACE.id, sessionId: thinkingSession.id },
+    ];
+
+    const view = await renderSidebar();
+
+    try {
+      expect(sessionTitleOrder(view.container, titles)).toEqual(titles);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('promotes workspace groups with live sessions and keeps groups together', async () => {
+    resetSidebarStore();
+    const liveWorkspace = {
+      ...WORKSPACE,
+      id: 'ws_live',
+      name: 'Live Workspace',
+      path: 'E:\\LiveWorkspace',
+      updatedAt: 1_700_000_000_000,
+      sessionCount: 1,
+      lastActiveSessionId: 's_live_old',
+    };
+    const recentWorkspace = {
+      ...WORKSPACE,
+      id: 'ws_recent',
+      name: 'Recent Workspace',
+      path: 'E:\\RecentWorkspace',
+      updatedAt: 1_700_000_300_000,
+      sessionCount: 1,
+      lastActiveSessionId: 's_recent_new',
+    };
+    const liveSession = {
+      ...SESSION,
+      id: 's_live_old',
+      title: 'Running build',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+    };
+    const recentSession = {
+      ...SESSION,
+      id: 's_recent_new',
+      title: 'Recent build',
+      createdAt: 1_700_000_300_000,
+      updatedAt: 1_700_000_300_000,
+    };
+    mockState.workspaces = [recentWorkspace, liveWorkspace];
+    mockState.sessionTree = {
+      [recentWorkspace.id]: [recentSession],
+      [liveWorkspace.id]: [liveSession],
+    };
+    mockState.sessions = [recentSession, liveSession];
+    mockState.activeWorkspaceId = liveWorkspace.id;
+    mockState.activeSessionId = liveSession.id;
+    mockState.runningSessions = [
+      { workspaceId: liveWorkspace.id, sessionId: liveSession.id },
+    ];
+
+    const view = await renderSidebar();
+
+    try {
+      expectTextBefore(view.container, liveWorkspace.name, recentWorkspace.name);
+      expectTextBefore(view.container, liveWorkspace.name, liveSession.title);
+      expectTextBefore(view.container, liveSession.title, recentWorkspace.name);
+      expectTextBefore(view.container, recentWorkspace.name, recentSession.title);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('orders flat fallback sessions by live state before timestamp', async () => {
+    resetSidebarStore();
+    const runningSession = {
+      ...SESSION,
+      id: 's_flat_running_old',
+      title: 'Flat running old',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+    };
+    const thinkingSession = {
+      ...SESSION,
+      id: 's_flat_thinking_mid',
+      title: 'Flat thinking mid',
+      createdAt: 1_700_000_100_000,
+      updatedAt: 1_700_000_100_000,
+    };
+    const recentSession = {
+      ...SESSION,
+      id: 's_flat_recent_idle',
+      title: 'Flat recent idle',
+      createdAt: 1_700_000_200_000,
+      updatedAt: 1_700_000_200_000,
+    };
+    const titles = [
+      runningSession.title,
+      thinkingSession.title,
+      recentSession.title,
+    ];
+    mockState.workspaces = [];
+    mockState.sessionTree = {};
+    mockState.sessions = [recentSession, thinkingSession, runningSession];
+    mockState.activeWorkspaceId = null;
+    mockState.activeSessionId = recentSession.id;
+    mockState.runningSessions = [
+      { workspaceId: null, sessionId: runningSession.id },
+    ];
+    mockState.aiEditingSessions = [
+      { workspaceId: null, sessionId: thinkingSession.id },
+    ];
+
+    const view = await renderSidebar();
+
+    try {
+      expect(sessionTitleOrder(view.container, titles)).toEqual(titles);
+    } finally {
+      await view.cleanup();
+    }
+  });
+});
+
 describe('Sidebar session search', () => {
   it('renders an enabled search field after history is ready', async () => {
     resetSidebarStore();
@@ -1049,7 +1308,7 @@ describe('Sidebar session search', () => {
       await clickButton(tabButton(view.container, '收藏夹'));
 
       expect(queryHistorySearchInput(view.container)).toBeNull();
-      expect(view.container.textContent).toContain('暂无收藏的 Workflow');
+      expect(view.container.textContent).toContain('暂无收藏的会话');
     } finally {
       await view.cleanup();
     }
@@ -1417,8 +1676,9 @@ describe('Sidebar session search', () => {
       );
 
     try {
-      expect(view.container.textContent).toContain('Bulk Session 10');
-      expect(visibleBulkSessionButtons()).toHaveLength(10);
+      expect(view.container.textContent).toContain('Bulk Session 5');
+      expect(visibleBulkSessionButtons()).toHaveLength(5);
+      expect(view.container.textContent).not.toContain('Bulk Session 6');
       expect(view.container.textContent).not.toContain('Bulk Session 25');
       expect(view.container.textContent).toContain('加载更多');
 
@@ -1433,8 +1693,53 @@ describe('Sidebar session search', () => {
       expect(clearButton).toBeInstanceOf(HTMLButtonElement);
       await clickButton(clearButton as HTMLButtonElement);
 
-      expect(visibleBulkSessionButtons()).toHaveLength(10);
+      expect(visibleBulkSessionButtons()).toHaveLength(5);
+      expect(view.container.textContent).not.toContain('Bulk Session 6');
       expect(view.container.textContent).not.toContain('Bulk Session 25');
+      expect(view.container.textContent).toContain('加载更多');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('loads workspace history in pages of five', async () => {
+    resetSidebarStore();
+    const manySessions = Array.from({ length: 12 }, (_, index) => ({
+      ...SESSION,
+      id: `s_page_${index}`,
+      title: `Paged Session ${index + 1}`,
+    }));
+    mockState.sessionTree = { [WORKSPACE.id]: manySessions };
+    mockState.sessions = manySessions;
+    mockState.workspaces = [{ ...WORKSPACE, sessionCount: manySessions.length }];
+
+    const view = await renderSidebar();
+    const visiblePagedSessionButtons = () =>
+      Array.from(view.container.querySelectorAll('button')).filter((button) =>
+        button.textContent?.includes('Paged Session'),
+      );
+    const visiblePagedSessionTitles = () =>
+      Array.from(view.container.querySelectorAll('span'))
+        .map((span) => span.textContent ?? '')
+        .filter((text) => text.startsWith('Paged Session'));
+    const loadMoreButton = () => {
+      const button = Array.from(view.container.querySelectorAll('button')).find(
+        (item) => item.textContent?.trim() === '加载更多',
+      );
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      return button as HTMLButtonElement;
+    };
+
+    try {
+      expect(visiblePagedSessionButtons()).toHaveLength(5);
+      expect(visiblePagedSessionTitles()).toContain('Paged Session 5');
+      expect(visiblePagedSessionTitles()).not.toContain('Paged Session 6');
+
+      await clickButton(loadMoreButton());
+
+      expect(visiblePagedSessionButtons()).toHaveLength(10);
+      expect(visiblePagedSessionTitles()).toContain('Paged Session 10');
+      expect(visiblePagedSessionTitles()).not.toContain('Paged Session 11');
       expect(view.container.textContent).toContain('加载更多');
     } finally {
       await view.cleanup();

@@ -30,6 +30,8 @@ pub struct FreeChannelCfg {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
 }
 
 /// Returned to JS from `free_proxy_ensure`.
@@ -44,6 +46,7 @@ struct ProxyState {
 
 static SERVER_STATE: OnceLock<Mutex<Option<ProxyState>>> = OnceLock::new();
 static REGISTRY: OnceLock<Mutex<HashMap<String, FreeChannelCfg>>> = OnceLock::new();
+static MODEL_SUCCESS_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static MSG_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn state_lock() -> &'static Mutex<Option<ProxyState>> {
@@ -52,6 +55,10 @@ fn state_lock() -> &'static Mutex<Option<ProxyState>> {
 
 fn registry() -> &'static Mutex<HashMap<String, FreeChannelCfg>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn model_success_cache() -> &'static Mutex<HashMap<String, String>> {
+    MODEL_SUCCESS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn next_message_id() -> String {
@@ -120,9 +127,8 @@ fn start_server() -> Result<u16, String> {
         }
     }
 
-    let (server, port) = bound.ok_or_else(|| {
-        "free proxy: no free port in 8765..8799 to bind on 127.0.0.1".to_string()
-    })?;
+    let (server, port) = bound
+        .ok_or_else(|| "free proxy: no free port in 8765..8799 to bind on 127.0.0.1".to_string())?;
 
     std::thread::Builder::new()
         .name("owf-free-proxy".to_string())
@@ -144,16 +150,8 @@ fn start_server() -> Result<u16, String> {
 fn cors_headers() -> Vec<Header> {
     vec![
         Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
-        Header::from_bytes(
-            &b"Access-Control-Allow-Methods"[..],
-            &b"POST, OPTIONS"[..],
-        )
-        .unwrap(),
-        Header::from_bytes(
-            &b"Access-Control-Allow-Headers"[..],
-            &b"*"[..],
-        )
-        .unwrap(),
+        Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, OPTIONS"[..]).unwrap(),
+        Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"*"[..]).unwrap(),
     ]
 }
 
@@ -196,7 +194,11 @@ fn handle_request(mut request: Request) {
     let (channel_id, endpoint) = match parse_channel_route(path) {
         Some(parsed) => parsed,
         None => {
-            respond_json_error(request, 404, "free proxy: unknown route (expected /ch/<id>/v1/messages)");
+            respond_json_error(
+                request,
+                404,
+                "free proxy: unknown route (expected /ch/<id>/v1/messages)",
+            );
             return;
         }
     };
@@ -226,7 +228,12 @@ fn handle_request(mut request: Request) {
     let anthropic_beta = request
         .headers()
         .iter()
-        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("anthropic-beta"))
+        .find(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("anthropic-beta")
+        })
         .map(|h| h.value.as_str().to_string());
 
     // Read the full request body (Anthropic Messages JSON).
@@ -353,8 +360,9 @@ fn handle_count_tokens(
                 let body = response
                     .into_string()
                     .unwrap_or_else(|_| json!({ "input_tokens": 0 }).to_string());
-                let value: Value = serde_json::from_str(&body)
-                    .unwrap_or_else(|_| json!({ "input_tokens": estimate_input_tokens(&anthropic_body) }));
+                let value: Value = serde_json::from_str(&body).unwrap_or_else(
+                    |_| json!({ "input_tokens": estimate_input_tokens(&anthropic_body) }),
+                );
                 respond_json(request, 200, &value);
             }
             // On any upstream failure, fall back to a local estimate so the CLI
@@ -382,6 +390,204 @@ fn trim_base(base: &str) -> &str {
     base.trim_end_matches('/')
 }
 
+fn push_unique_model(out: &mut Vec<String>, model: String) {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if out.iter().any(|existing| existing == trimmed) {
+        return;
+    }
+    out.push(trimmed.to_string());
+}
+
+fn model_variants_for_channel(channel_id: &str, model: &str) -> Vec<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    match channel_id {
+        // OpenRouter requires provider-qualified ids for GLM models.
+        "open_router" => {
+            if lower.starts_with("glm-") {
+                return vec![format!("z-ai/{lower}")];
+            }
+            if lower.starts_with("z-ai/glm-") {
+                return vec![lower];
+            }
+        }
+        // These providers use namespaced ids for the models in our catalog.
+        "nvidia_nim" => {
+            if !trimmed.contains('/') && lower.contains("nemotron") {
+                return vec![format!("nvidia/{lower}")];
+            }
+        }
+        "fireworks" => {
+            if !trimmed.contains('/') && lower.starts_with("llama-") {
+                return vec![format!("accounts/fireworks/models/{lower}")];
+            }
+        }
+        // GLM-like providers are inconsistent about casing in examples; the
+        // public APIs accept lowercase ids, while Wafer is handled by fallback
+        // candidates so both GLM-5.1 and glm-5.1 may be tried.
+        "opencode" | "opencode_go" | "zai" => {
+            if lower.starts_with("glm-") {
+                return vec![lower];
+            }
+        }
+        _ => {}
+    }
+
+    vec![trimmed.to_string()]
+}
+
+#[cfg(test)]
+fn model_candidates(primary: &str, fallbacks: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for model in std::iter::once(primary).chain(fallbacks.iter().map(String::as_str)) {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+fn model_cache_key(channel_id: &str, candidates: &[String]) -> String {
+    let mut parts = vec![channel_id.trim().to_ascii_lowercase()];
+    parts.extend(candidates.iter().map(|m| m.trim().to_string()));
+    parts.join("\u{1f}")
+}
+
+fn builtin_models_for_channel(channel_id: &str) -> &'static [&'static str] {
+    match channel_id {
+        "nvidia_nim" => &[
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+        ],
+        "open_router" => &[
+            "z-ai/glm-4.6",
+            "z-ai/glm-5.1",
+            "z-ai/glm-4.7",
+            "z-ai/glm-4.5-air:free",
+        ],
+        "gemini" => &[
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ],
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        "mistral" => &["mistral-large-latest", "mistral-small-latest"],
+        "mistral_codestral" => &["codestral-latest", "codestral-2405"],
+        "opencode" => &["glm-5.1", "glm-4.6"],
+        "opencode_go" => &["glm-5.1", "glm-4.6"],
+        "wafer" => &["GLM-5.1", "glm-5.1", "glm-4.6"],
+        "kimi" => &["kimi-k2.5", "kimi-k2-0905-preview", "moonshot-v1-32k"],
+        "cerebras" => &["llama-3.3-70b", "llama3.1-8b"],
+        "groq" => &[
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "openai/gpt-oss-120b",
+        ],
+        "fireworks" => &[
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+        ],
+        "zai" => &["glm-5.1", "glm-4.6"],
+        _ => &[],
+    }
+}
+
+fn model_candidates_for_channel(
+    channel_id: &str,
+    primary: &str,
+    fallbacks: &[String],
+) -> (String, Vec<String>) {
+    let mut candidates = Vec::new();
+    for model in std::iter::once(primary)
+        .chain(fallbacks.iter().map(String::as_str))
+        .chain(builtin_models_for_channel(channel_id).iter().copied())
+    {
+        for variant in model_variants_for_channel(channel_id, model) {
+            push_unique_model(&mut candidates, variant);
+        }
+    }
+    let cache_key = model_cache_key(channel_id, &candidates);
+    let cached = model_success_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned());
+    if let Some(cached_model) = cached {
+        if let Some(pos) = candidates.iter().position(|model| model == &cached_model) {
+            let model = candidates.remove(pos);
+            candidates.insert(0, model);
+        }
+    }
+    (cache_key, candidates)
+}
+
+fn remember_model_success(cache_key: &str, model: &str) {
+    if let Ok(mut cache) = model_success_cache().lock() {
+        cache.insert(cache_key.to_string(), model.to_string());
+    }
+}
+
+fn looks_like_model_error(status: u16, detail: &str) -> bool {
+    if !matches!(status, 400 | 404 | 422 | 403) {
+        return false;
+    }
+    let text = detail.to_ascii_lowercase();
+    let mentions_model = text.contains("model")
+        || text.contains("模型")
+        || text.contains("deployment")
+        || text.contains("engine");
+    mentions_model
+        && (text.contains("not found")
+            || text.contains("not defined")
+            || text.contains("does not exist")
+            || text.contains("unsupported")
+            || text.contains("invalid")
+            || text.contains("unavailable")
+            || text.contains("不存在")
+            || text.contains("不支持")
+            || text.contains("不可用"))
+}
+
+fn model_candidates_failed_message(
+    channel_id: &str,
+    status: u16,
+    detail: &str,
+    tried_models: &[String],
+) -> String {
+    let tried = if tried_models.is_empty() {
+        "<none>".to_string()
+    } else {
+        tried_models.join(", ")
+    };
+    format!(
+        "free proxy: channel {channel_id} model unavailable (tried: {tried}): upstream {status}: {detail}"
+    )
+}
+
+fn with_json_model(body: &Value, model: &str) -> Value {
+    let mut next = body.clone();
+    if !model.is_empty() {
+        if let Some(obj) = next.as_object_mut() {
+            obj.insert("model".to_string(), Value::String(model.to_string()));
+        }
+    }
+    next
+}
+
 // ---------------------------------------------------------------------------
 // Native Anthropic reverse proxy
 // ---------------------------------------------------------------------------
@@ -389,75 +595,119 @@ fn trim_base(base: &str) -> &str {
 fn handle_anthropic_passthrough(
     request: Request,
     cfg: &FreeChannelCfg,
-    mut anthropic_body: Value,
+    anthropic_body: Value,
     anthropic_beta: Option<String>,
 ) {
-    // Override model if configured.
-    if !cfg.model.is_empty() {
-        if let Some(obj) = anthropic_body.as_object_mut() {
-            obj.insert("model".to_string(), Value::String(cfg.model.clone()));
-        }
-    }
-
     let upstream_url = format!("{}/v1/messages", trim_base(&cfg.base_url));
-    let body_string = anthropic_body.to_string();
+    let requested_model = anthropic_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    let primary_model = if cfg.model.is_empty() {
+        requested_model
+    } else {
+        cfg.model.as_str()
+    };
+    let (cache_key, candidates) =
+        model_candidates_for_channel(&cfg.id, primary_model, &cfg.fallback_models);
+    let mut last_error: Option<(u16, String, String)> = None;
+    let mut tried_models: Vec<String> = Vec::new();
 
-    let mut req = ureq::post(&upstream_url)
-        .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
-        .set("accept", "text/event-stream");
-    // Only attach credentials when we actually have a key. Local channels send
-    // an empty key; a literal `Authorization: Bearer ` (no token) makes some
-    // auth-enabled local backends 401.
-    if !cfg.api_key.is_empty() {
-        req = req
-            .set("x-api-key", &cfg.api_key)
-            .set("authorization", &format!("Bearer {}", cfg.api_key));
-    }
-    if let Some(beta) = anthropic_beta.as_deref() {
-        req = req.set("anthropic-beta", beta);
-    }
-
-    let resp = req.send_string(&body_string);
-
-    match resp {
-        Ok(response) => {
-            stream_passthrough(request, response);
+    for model in candidates.iter() {
+        tried_models.push(model.clone());
+        let body = with_json_model(&anthropic_body, model);
+        let body_string = body.to_string();
+        let mut req = ureq::post(&upstream_url)
+            .set("anthropic-version", "2023-06-01")
+            .set("content-type", "application/json")
+            .set("accept", "text/event-stream");
+        // Only attach credentials when we actually have a key. Local channels send
+        // an empty key; a literal `Authorization: Bearer ` (no token) makes some
+        // auth-enabled local backends 401.
+        if !cfg.api_key.is_empty() {
+            req = req
+                .set("x-api-key", &cfg.api_key)
+                .set("authorization", &format!("Bearer {}", cfg.api_key));
         }
-        Err(ureq::Error::Status(code, response)) => {
-            // Surface upstream error body as-is. We buffer it below, so if the
-            // upstream labelled the error as an SSE stream, relabel it JSON —
-            // otherwise the downstream CLI switches to SSE parsing and chokes on
-            // a single non-streamed payload.
-            let raw_ct = response
-                .header("content-type")
-                .unwrap_or("application/json")
-                .to_string();
-            let ct = if raw_ct.starts_with("text/event-stream") {
-                "application/json".to_string()
-            } else {
-                raw_ct
-            };
-            let detail = response
-                .into_string()
-                .unwrap_or_else(|_| "<no body>".to_string());
-            let mut out = Response::from_string(detail).with_status_code(code);
-            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()) {
-                out.add_header(h);
-            }
-            for h in cors_headers() {
-                out.add_header(h);
-            }
-            let _ = request.respond(out);
+        if let Some(beta) = anthropic_beta.as_deref() {
+            req = req.set("anthropic-beta", beta);
         }
-        Err(e) => {
+
+        match req.send_string(&body_string) {
+            Ok(response) => {
+                remember_model_success(&cache_key, model);
+                stream_passthrough(request, response);
+                return;
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let raw_ct = response
+                    .header("content-type")
+                    .unwrap_or("application/json")
+                    .to_string();
+                let ct = if raw_ct.starts_with("text/event-stream") {
+                    "application/json".to_string()
+                } else {
+                    raw_ct
+                };
+                let detail = response
+                    .into_string()
+                    .unwrap_or_else(|_| "<no body>".to_string());
+                if looks_like_model_error(code, &detail) {
+                    last_error = Some((code, ct, detail));
+                    if model != candidates.last().unwrap() {
+                        continue;
+                    }
+                    let (last_code, _, last_detail) = last_error.as_ref().unwrap();
+                    respond_json_error(
+                        request,
+                        422,
+                        &model_candidates_failed_message(
+                            &cfg.id,
+                            *last_code,
+                            last_detail,
+                            &tried_models,
+                        ),
+                    );
+                    return;
+                }
+                respond_upstream_status(request, code, &ct, detail);
+                return;
+            }
+            Err(e) => {
+                respond_json_error(
+                    request,
+                    502,
+                    &format!("free proxy: upstream request failed: {e}"),
+                );
+                return;
+            }
+        }
+    }
+
+    if let Some((code, ct, detail)) = last_error {
+        if looks_like_model_error(code, &detail) {
             respond_json_error(
                 request,
-                502,
-                &format!("free proxy: upstream request failed: {e}"),
+                422,
+                &model_candidates_failed_message(&cfg.id, code, &detail, &tried_models),
             );
+        } else {
+            respond_upstream_status(request, code, &ct, detail);
         }
+    } else {
+        respond_json_error(request, 400, "free proxy: no model configured");
     }
+}
+
+fn respond_upstream_status(request: Request, code: u16, content_type: &str, body: String) {
+    let mut out = Response::from_string(body).with_status_code(code);
+    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+        out.add_header(h);
+    }
+    for h in cors_headers() {
+        out.add_header(h);
+    }
+    let _ = request.respond(out);
 }
 
 /// Stream an upstream ureq response back to the client unchanged.
@@ -497,7 +747,11 @@ fn stream_passthrough(request: Request, response: ureq::Response) {
 }
 
 /// Write an HTTP/1.1 response head using chunked transfer-encoding + CORS.
-fn write_stream_head<W: Write>(writer: &mut W, status: u16, content_type: &str) -> std::io::Result<()> {
+fn write_stream_head<W: Write>(
+    writer: &mut W,
+    status: u16,
+    content_type: &str,
+) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status} OK\r\n\
          Content-Type: {content_type}\r\n\
@@ -540,43 +794,100 @@ fn handle_openai_translate(request: Request, cfg: &FreeChannelCfg, anthropic_bod
     } else {
         cfg.model.clone()
     };
-    let echo_model = if requested_model.is_empty() {
+    let requested_echo_model = if requested_model.is_empty() {
         upstream_model.clone()
     } else {
-        requested_model
+        requested_model.clone()
     };
-    let openai_body = anthropic_to_openai_body(&anthropic_body, &upstream_model);
     let upstream_url = format!("{}/chat/completions", trim_base(&cfg.base_url));
+    let (cache_key, candidates) =
+        model_candidates_for_channel(&cfg.id, &upstream_model, &cfg.fallback_models);
+    let mut last_error: Option<(u16, String)> = None;
+    let mut tried_models: Vec<String> = Vec::new();
 
-    let mut req = ureq::post(&upstream_url)
-        .set("content-type", "application/json")
-        .set("accept", "text/event-stream");
-    if !cfg.api_key.is_empty() {
-        req = req.set("authorization", &format!("Bearer {}", cfg.api_key));
-    }
-    let resp = req.send_string(&openai_body.to_string());
-
-    match resp {
-        Ok(response) => {
-            translate_openai_stream(request, response, &echo_model);
+    for model in candidates.iter() {
+        tried_models.push(model.clone());
+        let openai_body = anthropic_to_openai_body(&anthropic_body, model);
+        let mut req = ureq::post(&upstream_url)
+            .set("content-type", "application/json")
+            .set("accept", "text/event-stream");
+        if !cfg.api_key.is_empty() {
+            req = req.set("authorization", &format!("Bearer {}", cfg.api_key));
         }
-        Err(ureq::Error::Status(code, response)) => {
-            let detail = response
-                .into_string()
-                .unwrap_or_else(|_| "<no body>".to_string());
+        if cfg.id == "open_router" {
+            req = req
+                .set("HTTP-Referer", "https://openworkflows.local")
+                .set("X-Title", "OpenWorkflows");
+        }
+        let resp = req.send_string(&openai_body.to_string());
+
+        match resp {
+            Ok(response) => {
+                remember_model_success(&cache_key, model);
+                let echo_model = if model == &upstream_model {
+                    requested_echo_model.clone()
+                } else {
+                    model.clone()
+                };
+                translate_openai_stream(request, response, &echo_model);
+                return;
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let detail = response
+                    .into_string()
+                    .unwrap_or_else(|_| "<no body>".to_string());
+                if looks_like_model_error(code, &detail) {
+                    last_error = Some((code, detail));
+                    if model != candidates.last().unwrap() {
+                        continue;
+                    }
+                    let (last_code, last_detail) = last_error.as_ref().unwrap();
+                    respond_json_error(
+                        request,
+                        422,
+                        &model_candidates_failed_message(
+                            &cfg.id,
+                            *last_code,
+                            last_detail,
+                            &tried_models,
+                        ),
+                    );
+                    return;
+                }
+                respond_json_error(
+                    request,
+                    code,
+                    &format!("free proxy: upstream {code}: {detail}"),
+                );
+                return;
+            }
+            Err(e) => {
+                respond_json_error(
+                    request,
+                    502,
+                    &format!("free proxy: upstream request failed: {e}"),
+                );
+                return;
+            }
+        }
+    }
+
+    if let Some((code, detail)) = last_error {
+        if looks_like_model_error(code, &detail) {
+            respond_json_error(
+                request,
+                422,
+                &model_candidates_failed_message(&cfg.id, code, &detail, &tried_models),
+            );
+        } else {
             respond_json_error(
                 request,
                 code,
                 &format!("free proxy: upstream {code}: {detail}"),
             );
         }
-        Err(e) => {
-            respond_json_error(
-                request,
-                502,
-                &format!("free proxy: upstream request failed: {e}"),
-            );
-        }
+    } else {
+        respond_json_error(request, 400, "free proxy: no model configured");
     }
 }
 
@@ -664,7 +975,9 @@ fn join_system_text(system: &Value) -> String {
             .iter()
             .filter_map(|b| {
                 if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -697,7 +1010,9 @@ fn collect_text_blocks(blocks: &[Value]) -> String {
         .iter()
         .filter_map(|b| {
             if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             } else {
                 None
             }
@@ -822,10 +1137,7 @@ fn convert_user_blocks(blocks: &[Value], out: &mut Vec<Value>) {
                 }
             }
             Some("tool_result") => {
-                let tool_use_id = b
-                    .get("tool_use_id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("");
+                let tool_use_id = b.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("");
                 let serialized = b
                     .get("content")
                     .map(serialize_tool_result_content)
@@ -989,7 +1301,11 @@ fn run_openai_translation<R: BufRead>(
             }
         }
 
-        let choice = match chunk.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) {
+        let choice = match chunk
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+        {
             Some(c) => c,
             None => continue,
         };
@@ -1230,6 +1546,110 @@ mod tests {
     }
 
     #[test]
+    fn model_candidates_dedupes_primary_and_fallbacks() {
+        assert_eq!(
+            model_candidates("glm-4.6", &["GLM-4.6".into(), "glm-5.1".into(), " ".into()]),
+            vec!["glm-4.6".to_string(), "glm-5.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_candidates_prefer_cached_success_for_same_config() {
+        let fallbacks = vec!["glm-5.1".to_string(), "glm-4.5".to_string()];
+        let (cache_key, candidates) =
+            model_candidates_for_channel("cache_test_channel", "glm-4.6", &fallbacks);
+        assert_eq!(candidates[0], "glm-4.6");
+
+        remember_model_success(&cache_key, "glm-5.1");
+        let (_, candidates) =
+            model_candidates_for_channel("cache_test_channel", "glm-4.6", &fallbacks);
+        assert_eq!(candidates[0], "glm-5.1");
+
+        let (_, changed_primary) =
+            model_candidates_for_channel("cache_test_channel", "custom-model", &fallbacks);
+        assert_eq!(changed_primary[0], "custom-model");
+    }
+
+    #[test]
+    fn openrouter_candidates_normalize_bare_glm_models() {
+        let fallbacks = vec!["GLM-5.1".to_string(), "z-ai/glm-4.5-air:free".to_string()];
+        let (_, candidates) = model_candidates_for_channel("open_router", "glm-4.6", &fallbacks);
+        assert_eq!(
+            candidates,
+            vec![
+                "z-ai/glm-4.6".to_string(),
+                "z-ai/glm-5.1".to_string(),
+                "z-ai/glm-4.5-air:free".to_string(),
+                "z-ai/glm-4.7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn channel_candidates_have_backend_builtin_models() {
+        let (_, gemini) = model_candidates_for_channel("gemini", "", &[]);
+        assert_eq!(
+            gemini,
+            vec![
+                "gemini-2.5-flash".to_string(),
+                "gemini-2.5-flash-lite".to_string(),
+                "gemini-2.0-flash".to_string(),
+            ]
+        );
+
+        let (_, openrouter) = model_candidates_for_channel("open_router", "", &[]);
+        assert_eq!(openrouter[0], "z-ai/glm-4.6");
+        assert!(openrouter.contains(&"z-ai/glm-5.1".to_string()));
+    }
+
+    #[test]
+    fn channel_candidates_normalize_known_bare_aliases() {
+        let (_, nvidia) =
+            model_candidates_for_channel("nvidia_nim", "nemotron-3-super-120b-a12b", &[]);
+        assert_eq!(nvidia[0], "nvidia/nemotron-3-super-120b-a12b");
+
+        let (_, fireworks) =
+            model_candidates_for_channel("fireworks", "llama-v3p3-70b-instruct", &[]);
+        assert_eq!(
+            fireworks[0],
+            "accounts/fireworks/models/llama-v3p3-70b-instruct"
+        );
+    }
+
+    #[test]
+    fn model_candidates_failed_message_lists_tried_models() {
+        let message = model_candidates_failed_message(
+            "open_router",
+            403,
+            "model not defined",
+            &["z-ai/glm-4.6".to_string(), "z-ai/glm-5.1".to_string()],
+        );
+        assert!(message.contains("channel open_router"));
+        assert!(message.contains("tried: z-ai/glm-4.6, z-ai/glm-5.1"));
+        assert!(message.contains("upstream 403"));
+    }
+
+    #[test]
+    fn model_error_detection_is_narrow() {
+        assert!(looks_like_model_error(403, "model not defined: glm-4.6"));
+        assert!(looks_like_model_error(
+            404,
+            "{\"error\":\"model does not exist\"}"
+        ));
+        assert!(!looks_like_model_error(401, "invalid api key"));
+        assert!(!looks_like_model_error(429, "rate limit exceeded"));
+        assert!(!looks_like_model_error(500, "model server overloaded"));
+    }
+
+    #[test]
+    fn with_json_model_overrides_body_model() {
+        let body = json!({ "model": "bad", "messages": [] });
+        let out = with_json_model(&body, "good");
+        assert_eq!(out["model"], "good");
+        assert_eq!(body["model"], "bad");
+    }
+
+    #[test]
     fn anthropic_body_translates_to_openai_shape() {
         let body = json!({
             "model": "ignored-by-override",
@@ -1273,8 +1693,14 @@ mod tests {
             ]
         );
         // message_start echoes the REQUESTED model, not the upstream model.
-        assert_eq!(first(&events, "message_start")["message"]["model"], "claude-sonnet-4-5");
-        assert_eq!(first(&events, "message_delta")["delta"]["stop_reason"], "end_turn");
+        assert_eq!(
+            first(&events, "message_start")["message"]["model"],
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(
+            first(&events, "message_delta")["delta"]["stop_reason"],
+            "end_turn"
+        );
     }
 
     #[test]
@@ -1297,7 +1723,10 @@ mod tests {
             .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
             .collect();
         assert_eq!(joined, "{\"city\":\"SF\"}");
-        assert_eq!(first(&events, "message_delta")["delta"]["stop_reason"], "tool_use");
+        assert_eq!(
+            first(&events, "message_delta")["delta"]["stop_reason"],
+            "tool_use"
+        );
     }
 
     #[test]

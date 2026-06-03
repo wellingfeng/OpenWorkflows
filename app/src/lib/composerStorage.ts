@@ -1,5 +1,10 @@
-import type { ComposerSettings, PromptGroup } from '@/store/types';
+import type {
+  ComposerSettings,
+  PromptGroup,
+  SessionComposerSettings,
+} from '@/store/types';
 import { isLocale, systemLocale, type Locale } from '@/lib/i18n';
+import { uniqueWorkspaceHistory } from '@/lib/workspaceHistory';
 
 /**
  * localStorage persistence for AI-input composer state, the AIDock height, and
@@ -17,6 +22,7 @@ const PROMPT_GROUPS_VERSION_KEY = 'openworkflow.promptGroups.version.v1';
 
 export interface PersistedComposer {
   composer: ComposerSettings;
+  composerBySession?: Record<string, SessionComposerSettings>;
   workspaceHistory: string[];
 }
 
@@ -33,8 +39,14 @@ export function loadComposer(): PersistedComposer | null {
     if (!parsed.composer) return null;
     return {
       composer: parsed.composer,
+      composerBySession:
+        parsed.composerBySession &&
+        typeof parsed.composerBySession === 'object' &&
+        !Array.isArray(parsed.composerBySession)
+          ? (parsed.composerBySession as Record<string, SessionComposerSettings>)
+          : {},
       workspaceHistory: Array.isArray(parsed.workspaceHistory)
-        ? parsed.workspaceHistory
+        ? uniqueWorkspaceHistory(parsed.workspaceHistory)
         : [],
     };
   } catch {
@@ -45,7 +57,16 @@ export function loadComposer(): PersistedComposer | null {
 export function saveComposer(state: PersistedComposer): void {
   if (!hasStorage()) return;
   try {
-    window.localStorage.setItem(COMPOSER_KEY, JSON.stringify(state));
+    const previous = loadComposer();
+    window.localStorage.setItem(
+      COMPOSER_KEY,
+      JSON.stringify({
+        ...state,
+        workspaceHistory: uniqueWorkspaceHistory(state.workspaceHistory),
+        composerBySession:
+          state.composerBySession ?? previous?.composerBySession ?? {},
+      }),
+    );
   } catch {
     // Quota / serialization errors are non-fatal.
   }

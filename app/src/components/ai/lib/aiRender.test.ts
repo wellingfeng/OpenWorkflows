@@ -139,6 +139,14 @@ describe('parseFileRef', () => {
     expect(looksLikePath('https://example.com')).toBe(false);
   });
 
+  it('accepts local file urls', () => {
+    expect(parseFileRef('file:///C:/Users/x/main.rs#L12')).toEqual({
+      path: 'C:/Users/x/main.rs',
+      basename: 'main.rs',
+      startLine: 12,
+    });
+  });
+
   it('accepts relative path with separator and no extension', () => {
     expect(parseFileRef('./src/config')?.path).toBe('./src/config');
   });

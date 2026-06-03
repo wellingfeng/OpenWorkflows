@@ -4,6 +4,7 @@ import { scanFileRefs } from './lib/fileScan';
 import ToolIcon from './ToolIcon';
 import CopyButton from './CopyButton';
 import FileChip, { type OpenFileFn } from './FileChip';
+import { compactToolSubject, toolSubjectAllowsFileRefs } from './lib/toolDisplay';
 
 /**
  * Renders a runtime tool-call progress line (e.g. `🔧 command_execution: rg …`)
@@ -25,11 +26,14 @@ export default function ToolLine({
   onOpenFile?: OpenFileFn;
 }) {
   const [open, setOpen] = useState(false);
-  // A detail is "long" if it would plausibly overflow one line; only then do we
-  // offer expand. Keep the threshold generous so most rows stay single-line.
-  const expandable = detail.length > 88 || detail.includes('\n');
+  const collapsedDetail = compactToolSubject(name, detail);
+  const rawOneLine = detail.replace(/[\r\n]+/g, ' ').trim();
+  const expandable =
+    detail.length > 88 || detail.includes('\n') || collapsedDetail !== rawOneLine;
+  const linkFileRefs = toolSubjectAllowsFileRefs(name);
 
   const renderDetail = (text: string) => {
+    if (!linkFileRefs) return text;
     const parts = scanFileRefs(text);
     return parts.map((p, i) =>
       typeof p === 'string' ? (
@@ -68,7 +72,7 @@ export default function ToolLine({
               (open ? 'whitespace-pre-wrap break-words' : 'truncate')
             }
           >
-            {open ? renderDetail(detail) : renderDetail(detail.replace(/\n/g, ' '))}
+            {open ? renderDetail(detail) : renderDetail(collapsedDetail)}
           </span>
         )}
         <CopyButton

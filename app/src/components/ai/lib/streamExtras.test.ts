@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { scanFileRefs, hasFileRef } from './fileScan';
 import { parseToolLine } from './toolLine';
+import { compactToolSubject, toolSubjectAllowsFileRefs } from './toolDisplay';
 
 describe('scanFileRefs', () => {
   it('returns the original string when no file ref present', () => {
@@ -90,5 +91,44 @@ describe('parseToolLine', () => {
 
   it('rejects an unknown bare name:detail', () => {
     expect(parseToolLine('foobar: something')).toBeNull();
+  });
+});
+
+describe('compactToolSubject', () => {
+  it('unwraps PowerShell -Command wrappers', () => {
+    expect(
+      compactToolSubject(
+        'command_execution',
+        `"Programpwsh.exe" -Command 'npm view resvg-js version'`,
+      ),
+    ).toBe('npm view resvg-js version');
+    expect(
+      compactToolSubject(
+        'command_execution',
+        `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -Command "npm test"`,
+      ),
+    ).toBe('npm test');
+  });
+
+  it('unwraps cmd and POSIX shell wrappers', () => {
+    expect(compactToolSubject('command_execution', 'cmd.exe /C npm test')).toBe(
+      'npm test',
+    );
+    expect(compactToolSubject('Bash', "bash -lc 'rg -n foo app/src'")).toBe(
+      'rg -n foo app/src',
+    );
+  });
+
+  it('leaves direct commands unchanged', () => {
+    expect(compactToolSubject('command_execution', 'npm test')).toBe('npm test');
+    expect(compactToolSubject('Read', 'app/src/core/ir.ts')).toBe(
+      'app/src/core/ir.ts',
+    );
+  });
+
+  it('does not linkify file refs inside command subjects', () => {
+    expect(toolSubjectAllowsFileRefs('command_execution')).toBe(false);
+    expect(toolSubjectAllowsFileRefs('Bash')).toBe(false);
+    expect(toolSubjectAllowsFileRefs('Read')).toBe(true);
   });
 });

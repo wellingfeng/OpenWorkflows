@@ -63,11 +63,28 @@ function extensionOf(token: string): string | null {
   return base.slice(dot + 1).toLowerCase();
 }
 
+function pathFromFileUrl(raw: string): string | null {
+  if (!/^file:\/\//i.test(raw)) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'file:') return null;
+    let path = decodeURIComponent(url.pathname);
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    if (url.hostname) path = `//${url.hostname}${path}`;
+    if (/^#L?\d/i.test(url.hash)) path += url.hash;
+    return path;
+  } catch {
+    return null;
+  }
+}
+
 /** Cheap pre-filter: reject obvious non-paths before the precise regex. */
 export function looksLikePath(raw: string): boolean {
   const s = raw.trim();
   if (!s || s.length > 240) return false;
   if (/\s/.test(s)) return false; // file refs never contain whitespace
+  const fileUrlPath = pathFromFileUrl(s);
+  if (fileUrlPath) return looksLikePath(fileUrlPath);
   if (/^[a-z]+:\/\//i.test(s)) return false; // url scheme -> not a file chip
   if (/[\\/]/.test(s)) return true; // a path separator is strong evidence
   // No separator: require a recognised file extension so `2.0` / `react.foo`
@@ -89,7 +106,7 @@ function basenameOf(path: string): string {
  * `config.ts`, `./config`, or `src/store/useStore.ts:42` are accepted.
  */
 export function parseFileRef(raw: string): FileRef | null {
-  const s = raw.trim();
+  const s = pathFromFileUrl(raw.trim()) ?? raw.trim();
   if (!looksLikePath(s)) return null;
 
   const m = FILE_REF.exec(s);

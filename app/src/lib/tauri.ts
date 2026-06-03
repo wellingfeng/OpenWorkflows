@@ -57,6 +57,42 @@ export interface CliPathValidation {
   fileName: string;
 }
 
+export interface LocalModelHardware {
+  ramGb?: number | null;
+  cpuThreads?: number | null;
+  gpuVramGb?: number | null;
+}
+
+export interface LocalFilePreview {
+  path: string;
+  fileName: string;
+  kind: 'text' | 'image' | 'binary';
+  mime?: string | null;
+  sizeBytes: number;
+  truncated: boolean;
+  text?: string | null;
+  base64?: string | null;
+}
+
+export type LocalModelRuntimeState =
+  | 'missing_model'
+  | 'service_unavailable'
+  | 'service_error'
+  | 'model_missing'
+  | 'ready'
+  | 'unsupported'
+  | 'desktop_unavailable';
+
+export interface LocalModelRuntimeStatus {
+  channelId: string;
+  configuredModel: string;
+  reachable: boolean;
+  ready: boolean;
+  state: LocalModelRuntimeState;
+  models: string[];
+  message?: string | null;
+}
+
 /** Disposer returned by the event listeners. */
 export type UnlistenFn = () => void;
 
@@ -214,6 +250,7 @@ export async function freeProxyEnsure(
     baseUrl: string;
     apiKey: string;
     model: string;
+    fallbackModels?: string[];
   }>,
 ): Promise<{ port: number }> {
   if (!tauriAvailable()) {
@@ -230,6 +267,75 @@ export async function freeProxyStop(): Promise<void> {
   await invoke('free_proxy_stop');
 }
 
+/** Read whitelisted free-channel API keys from local private config + env. */
+export async function freeChannelAutoKeys(): Promise<Record<string, string>> {
+  if (!tauriAvailable()) return {};
+  const invoke = await getInvoke();
+  return invoke<Record<string, string>>('free_channel_auto_keys');
+}
+
+/** Read rough local hardware for choosing an Ollama model. */
+export async function localModelHardware(): Promise<LocalModelHardware> {
+  if (!tauriAvailable()) {
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    const memory =
+      nav && typeof (nav as Navigator & { deviceMemory?: unknown }).deviceMemory === 'number'
+        ? (nav as Navigator & { deviceMemory: number }).deviceMemory
+        : null;
+    return {
+      ramGb: memory,
+      cpuThreads: nav?.hardwareConcurrency ?? null,
+      gpuVramGb: null,
+    };
+  }
+  const invoke = await getInvoke();
+  return invoke<LocalModelHardware>('local_model_hardware');
+}
+
+/** Probe whether a local-model runtime is reachable and exposes the selected model. */
+export async function localModelStatus(
+  channelId: string,
+  model: string,
+): Promise<LocalModelRuntimeStatus> {
+  const configuredModel = model.trim();
+  if (!configuredModel) {
+    return {
+      channelId,
+      configuredModel: '',
+      reachable: false,
+      ready: false,
+      state: 'missing_model',
+      models: [],
+      message: 'missing model',
+    };
+  }
+  if (!tauriAvailable()) {
+    return {
+      channelId,
+      configuredModel,
+      reachable: false,
+      ready: false,
+      state: 'desktop_unavailable',
+      models: [],
+      message: 'desktop backend unavailable',
+    };
+  }
+  const invoke = await getInvoke();
+  return invoke<LocalModelRuntimeStatus>('local_model_status', {
+    channelId,
+    model: configuredModel,
+  });
+}
+
+/** Launch the bundled Windows Ollama setup script in a visible terminal. */
+export async function setupLocalModel(model: string): Promise<void> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  await invoke('setup_local_model', { model });
+}
+
 /** Open an external URL via the OS default browser (web: new tab). */
 export async function openExternal(url: string): Promise<void> {
   if (!tauriAvailable()) {
@@ -238,6 +344,21 @@ export async function openExternal(url: string): Promise<void> {
   }
   const invoke = await getInvoke();
   await invoke('open_external', { url });
+}
+
+/** Read a local file for the in-app right-side preview drawer. Desktop-only. */
+export async function previewLocalFile(
+  path: string,
+  opts?: { cwd?: string },
+): Promise<LocalFilePreview> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<LocalFilePreview>('preview_local_file', {
+    path,
+    cwd: opts?.cwd ?? null,
+  });
 }
 
 /** Best-effort cancellation for an in-flight local agent CLI invocation. */

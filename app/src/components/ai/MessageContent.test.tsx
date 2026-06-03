@@ -62,4 +62,44 @@ describe('MessageContent integration', () => {
     // The raw <img> must be escaped/stripped, not rendered as a live element.
     expect(html).not.toMatch(/<img[^>]*onerror/);
   });
+
+  it('renders legacy command progress lines as isolated tool cards', () => {
+    const command = [
+      `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`,
+      `-Command`,
+      `'p="""C:\\Users\\fengwei\\AppData\\Local\\npm-cache\\abc\\node_modules\\@larksuiteoapi\\lark-mcp\\dist\\mcp-tool\\tools\\zh"""; node "$p"'`,
+    ].join(' ');
+    const html = renderToStaticMarkup(
+      createElement(MessageContent, {
+        text: `图片还在。\n🔧 command_execution: ${command}\n继续检查。`,
+        streaming: false,
+      }),
+    );
+    expect(html).toMatch(/ai-tool-card/);
+    expect(html).toMatch(/command_execution/);
+    expect(html).toMatch(/p=&quot;&quot;&quot;C:\\Users/);
+    expect(html).not.toMatch(/ai-file-chip/);
+    expect(html).not.toMatch(/Program Files/);
+  });
+
+  it('extracts inline legacy command progress from prose paragraphs', () => {
+    const command = [
+      `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`,
+      `-Command`,
+      `'p="""C:\\Users\\fengwei\\AppData\\Local\\npm-cache\\abc\\node_modules\\@larksuiteoapi\\lark-mcp\\dist\\mcp-tool\\tools\\zh"""; node "$p"'`,
+    ].join(' ');
+    const html = renderToStaticMarkup(
+      createElement(MessageContent, {
+        text:
+          `先替一张表。 🔧 command_execution: ${command} ` +
+          `🔧 command_execution: rg -n replace_image docx_image\\upload_all\\media.xupload node_modules 继续检查。`,
+        streaming: false,
+      }),
+    );
+    expect(html.match(/ai-tool-card/g)).toHaveLength(2);
+    expect(html).toMatch(/先替一张表/);
+    expect(html).not.toMatch(/🔧/);
+    expect(html).not.toMatch(/ai-file-chip/);
+    expect(html).not.toMatch(/Program Files/);
+  });
 });

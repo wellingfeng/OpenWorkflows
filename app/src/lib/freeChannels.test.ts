@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   FREE_CHANNELS,
   FREE_CHANNEL_PROVIDER_PREFIX,
+  applyFreeChannelEnvKeys,
   freeChannelGatewayProviders,
   freeChannelReady,
   freeChannelSelection,
+  getFreeChannelFallbackModels,
+  getFreeChannelKey,
   getFreeChannelModel,
   getFreeChannelModelOverride,
   isFreeChannelSelection,
@@ -39,9 +42,11 @@ describe('free channel selection encoding', () => {
 });
 
 describe('freeChannelReady', () => {
-  it('treats local channels as ready without a key', () => {
+  it('requires an explicit model for local channels', () => {
     const local = FREE_CHANNELS.find((c) => c.local);
     expect(local).toBeDefined();
+    expect(freeChannelReady(local!.id)).toBe(false);
+    setFreeChannelModel(local!.id, 'local-model');
     expect(freeChannelReady(local!.id)).toBe(true);
   });
 
@@ -55,6 +60,23 @@ describe('freeChannelReady', () => {
   });
 });
 
+describe('applyFreeChannelEnvKeys', () => {
+  it('imports known remote-channel keys without overwriting saved values', () => {
+    setFreeChannelKey('groq', 'saved-groq');
+    const imported = applyFreeChannelEnvKeys({
+      groq: 'env-groq',
+      open_router: 'env-openrouter',
+      ollama: 'ignored-local',
+      unknown: 'ignored',
+    });
+
+    expect(imported).toEqual(['open_router']);
+    expect(getFreeChannelKey('groq')).toBe('saved-groq');
+    expect(getFreeChannelKey('open_router')).toBe('env-openrouter');
+    expect(getFreeChannelKey('ollama')).toBe('');
+  });
+});
+
 describe('model override', () => {
   it('exposes the raw override separately from the resolved default', () => {
     const channel = FREE_CHANNELS.find((c) => c.defaultModel)!;
@@ -64,6 +86,49 @@ describe('model override', () => {
     setFreeChannelModel(channel.id, 'custom-model-x');
     expect(getFreeChannelModelOverride(channel.id)).toBe('custom-model-x');
     expect(getFreeChannelModel(channel.id)).toBe('custom-model-x');
+  });
+
+  it('normalizes bare OpenRouter GLM model overrides to provider-qualified lowercase ids', () => {
+    setFreeChannelModel('open_router', 'GLM-4.6');
+    expect(getFreeChannelModelOverride('open_router')).toBe('GLM-4.6');
+    expect(getFreeChannelModel('open_router')).toBe('z-ai/glm-4.6');
+  });
+
+  it('normalizes known provider-specific bare model aliases', () => {
+    setFreeChannelModel('nvidia_nim', 'nemotron-3-super-120b-a12b');
+    expect(getFreeChannelModel('nvidia_nim')).toBe(
+      'nvidia/nemotron-3-super-120b-a12b',
+    );
+
+    setFreeChannelModel('fireworks', 'llama-v3p3-70b-instruct');
+    expect(getFreeChannelModel('fireworks')).toBe(
+      'accounts/fireworks/models/llama-v3p3-70b-instruct',
+    );
+  });
+
+  it('returns de-duplicated fallback models after the active model', () => {
+    expect(getFreeChannelFallbackModels('open_router')).toEqual([
+      'z-ai/glm-5.1',
+      'z-ai/glm-4.7',
+      'z-ai/glm-4.5-air:free',
+    ]);
+    setFreeChannelModel('open_router', 'glm-5.1');
+    expect(getFreeChannelModel('open_router')).toBe('z-ai/glm-5.1');
+    expect(getFreeChannelFallbackModels('open_router')).toContain('z-ai/glm-4.6');
+    expect(getFreeChannelFallbackModels('open_router')).not.toContain(
+      'z-ai/glm-5.1',
+    );
+  });
+});
+
+describe('channel catalog', () => {
+  it('routes OpenRouter through the OpenAI-compatible endpoint', () => {
+    const channel = FREE_CHANNELS.find((c) => c.id === 'open_router');
+    expect(channel).toMatchObject({
+      transport: 'openai',
+      upstreamBaseUrl: 'https://openrouter.ai/api/v1',
+      defaultModel: 'z-ai/glm-4.6',
+    });
   });
 });
 

@@ -67,6 +67,7 @@ async function completeGatewayTextViaCli(
     env: request.route.env,
     timeoutSeconds: request.timeoutSeconds,
     idleTimeoutSeconds: request.idleTimeoutSeconds,
+    runId: request.runId,
   });
 }
 

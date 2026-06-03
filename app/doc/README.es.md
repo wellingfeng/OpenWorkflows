@@ -4,34 +4,39 @@
   <a href="../../README.md">English</a> | <a href="README.zh-CN.md">中文</a> | <a href="README.fr.md">Français</a> | <a href="README.de.md">Deutsch</a> | Español | <a href="README.pt-BR.md">Português</a> | <a href="README.ru.md">Русский</a> | <a href="README.ja.md">日本語</a> | <a href="README.ko.md">한국어</a> | <a href="README.hi.md">हिन्दी</a> | <a href="README.ar.md">العربية</a>
 </div>
 
-Claude Code introdujo una función de Workflow para orquestar pasos multiagente, ramas paralelas y pipelines como scripts ejecutables. OpenWorkflows convierte ese patrón en un editor visual y multimodelo: construye un único grafo de Workflow y luego ejecútalo o adáptalo en Claude Code, Codex, Gemini y futuros entornos de ejecución de modelos locales o en la nube.
-
-El IR compartido mantiene portable la estructura del workflow, al tiempo que permite que cada nodo elija el modelo, el prompt, el schema y la configuración de ejecución que expone al runtime.
+OpenWorkflows es una aplicación de escritorio que combina chat gratuito con modelos de IA y edición visual de workflows multi-agente. Chatea directamente con 17+ canales gratuitos (Gemini, DeepSeek, Groq, Ollama…) o construye gráficos de workflows multi-agente en el lienzo que se compilan en scripts ejecutables para Claude Code, Codex, Gemini y otros runtimes.
 
 <p align="center">
   <img src="images/0-标题使用.png" alt="Captura de pantalla del editor de OpenWorkflows" width="960">
 </p>
 
+## Funciones principales
+
+### 🧊 Chat gratuito con modelos de IA
+- **17+ canales gratuitos** integrados — NVIDIA NIM, OpenRouter, Google Gemini, DeepSeek, Mistral, Groq, Cerebras, Fireworks, Kimi, Z.ai, OpenCode, Wafer, además de runtimes locales (Ollama, LM Studio, llama.cpp).
+- Proxy Rust integrado traduce entre protocolos Anthropic y OpenAI, así que todos los canales usan la misma interfaz de chat.
+- Elige un canal, pega tu API key y empieza a chatear — sin configuración adicional.
+- Runtimes locales (Ollama, LM Studio, llama.cpp) funcionan **sin API key**.
+
+### 🕸️ Editor visual de Workflows
+- Describe el objetivo en el campo de entrada de IA de la esquina inferior derecha y genera un blueprint de Workflow editable.
+- Creación visual de workflows en lugar de editar a mano grandes scripts multiagente.
+- Compila el blueprint en scripts de Workflow ejecutables al estilo de Claude Code; los scripts se pueden cargar de vuelta al blueprint.
+- Elige adaptadores de runtime (Claude Code, Codex, Gemini) y configura el modelo de cada nodo.
+- Inicia/detén workflows desde la app de escritorio con estado de ejecución por nodo.
+
+### ⭐ Favoritos e Historial
+- Marca una sesión con una estrella para fijarla en la pestaña **Favoritos** para acceso rápido.
+- La pestaña **Historial** muestra todas las sesiones con badges: **CHAT** para conversaciones simples, **WF** para sesiones de workflow.
+- Historial completo de espacios de trabajo y sesiones — cambia de contexto sin perder progreso.
+
+### 🔒 Privacidad primero
+- Las claves API se almacenan localmente en tu máquina, nunca se envían a ningún servidor.
+- Todos los datos de workflows, sesiones y configuraciones permanecen en tu máquina.
+
 ## Tutorial de uso
 
 - [Tutorial de uso de OpenWorkflows](claude-code-workflow-openworkflow.es.md) - recorrido paso a paso con capturas de pantalla, desde la configuración general y la selección de runtime en la entrada de IA hasta la generación del blueprint, la ejecución y el cambio de apariencia.
-
-## Soporte de workflows multimodelo
-
-- OpenWorkflows extiende la idea de Workflow de Claude Code más allá de un único runtime de LLM.
-- El mismo grafo de Workflow puede editarse visualmente y dirigirse a Claude Code, Codex, Gemini o adaptadores adicionales.
-- Las primitivas al estilo de Claude Code, como los pasos de agente, las ramas paralelas y los pipelines, se convierten en nodos de grafo portables.
-- Cada nodo puede llevar su propio prompt, nivel de modelo, schema y configuración de ejecución.
-- La vista de script compila hoy el grafo en scripts de Workflow ejecutables al estilo de Claude Code, con la capa de adaptadores lista para otros runtimes de modelos.
-
-## Por qué OpenWorkflows
-
-- Describe el objetivo en el campo de entrada de IA de la esquina inferior derecha y genera un blueprint de Workflow editable.
-- Creación visual de workflows en lugar de editar a mano grandes scripts multiagente.
-- Una biblioteca de prompts reutilizable con reescrituras de workflow y prompts de revisión habituales.
-- Historial de espacios de trabajo y sesiones para que puedas volver rápidamente a trabajo anterior.
-- Controles de ejecución/parada con estado de ejecución por nodo en el lienzo.
-- Almacenamiento local de la clave de API para la asistencia de IA del lado del navegador, mantenida únicamente en la máquina.
 
 ## Inicio rápido
 
@@ -57,15 +62,23 @@ npm run package
 
 Desde la raíz del repositorio, `run.bat` inicia la aplicación y la reconstruye cuando es necesario, y `build.bat` empaqueta el instalador de Windows.
 
-## Uso básico
+## Uso
 
-1. Crea un nuevo workflow o abre uno existente.
+### Modo Chat
+
+1. Haz clic en **+ Nueva sesión** en la barra lateral.
+2. Elige un canal gratuito (ej. Gemini, DeepSeek, Ollama) o usa tu propia API key con cualquier runtime.
+3. Escribe tu pregunta en el campo de entrada inferior. Las respuestas aparecen en el área de chat arriba.
+4. Marca una sesión con estrella para fijarla en la pestaña **Favoritos**.
+
+### Modo Workflow
+
+1. Haz clic en **+ Nuevo workflow** en la barra lateral.
 2. Describe la tarea en el campo de entrada de IA de la esquina inferior derecha. OpenWorkflows genera el blueprint de Workflow automáticamente.
-3. Sigue refinando el blueprint escribiendo instrucciones de seguimiento en el mismo campo, o haz clic en los prompts habituales del panel derecho para realizar ediciones orientadas a la estructura, la exhaustividad, el coste, la fiabilidad y el rollback.
+3. Sigue refinando el blueprint escribiendo instrucciones de seguimiento, o haz clic en los prompts habituales del panel derecho.
 4. Selecciona nodos individuales cuando necesites editar manualmente prompts, modelos, schemas o parámetros de ejecución.
-5. Elige un adaptador de runtime como Claude Code, Codex o Gemini y, luego, ajusta los modelos de los nodos según sea necesario.
-6. Haz clic en el botón Run de la parte superior para ejecutar el workflow, observa las actualizaciones de estado por nodo y detente en cualquier momento.
-7. Cambia de sesión o de espacio de trabajo desde la barra de historial para continuar con trabajo anterior.
+5. Elige un adaptador de runtime como Claude Code, Codex o Gemini.
+6. Haz clic en el botón Run de la parte superior para ejecutar el workflow y observar las actualizaciones de estado por nodo.
 
 ## Estructura del proyecto
 
@@ -74,9 +87,15 @@ app/
   src/                 React + TypeScript frontend
     core/              IR, parser, emitter, round-trip logic
     canvas/            React Flow canvas and node components
-    panels/            Sidebar, prompt panel, AI dock
+    panels/            Sidebar (history + favorites), prompt panel, AI dock (chat + workflow), settings (free channels)
+    runtime/           DAG execution, provider gateway, run state
     store/             Zustand application state
-  src-tauri/           Rust/Tauri desktop backend and packaging config
+    lib/
+      freeChannels.ts  17+ free channel catalog + helpers
+  src-tauri/
+    src/
+      free_proxy.rs    Rust reverse-proxy + Anthropic↔OpenAI translation
+      lib.rs           Tauri commands, filesystem/history bridge
   doc/                 Usage tutorial and screenshots
 pencil/                Pencil design files
 run.bat                Build-if-needed and launch the Windows app

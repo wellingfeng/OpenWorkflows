@@ -99,6 +99,7 @@ export interface GatewayTextRequest {
   userContent: string;
   maxTokens?: number;
   signal?: AbortSignal;
+  runId?: string;
   onDelta?: (chunk: string) => void;
   permission?: string;
   cwd?: string;

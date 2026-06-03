@@ -1,6 +1,6 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import AIDock from './AIDock';
 import PromptPanel from './PromptPanel';
 import { defaultBlueprint, simpleBlueprint } from '@/core/defaultBlueprint';
@@ -22,6 +22,7 @@ function resetStoreForPromptLock(
     selectedNodeId: null,
     aiStreaming: false,
     aiEditingSessions: [],
+    chattingSessions: [],
     locale: 'zh-CN',
     promptAutoTranslate: false,
     promptGroups: samplePromptGroups,
@@ -65,6 +66,29 @@ async function renderPanels(): Promise<{
   };
 }
 
+async function renderChatDock(): Promise<{
+  container: HTMLDivElement;
+  cleanup: () => Promise<void>;
+}> {
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const root: Root = createRoot(container);
+
+  await act(async () => {
+    root.render(<AIDock layout="chat" />);
+  });
+
+  return {
+    container,
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      container.remove();
+    },
+  };
+}
+
 function buttonByText(container: HTMLElement, text: string): HTMLButtonElement {
   const button = Array.from(container.querySelectorAll('button')).find((item) =>
     item.textContent?.includes(text),
@@ -79,10 +103,14 @@ function aiInput(container: HTMLElement): HTMLTextAreaElement {
   return input;
 }
 
+function optionalSearchInput(container: HTMLElement): HTMLInputElement | null {
+  return container.querySelector('input[aria-label="搜索 AI 返回内容"]');
+}
+
 function searchInput(container: HTMLElement): HTMLInputElement {
-  const input = container.querySelector('input[aria-label="搜索 AI 返回内容"]');
+  const input = optionalSearchInput(container);
   if (!input) throw new Error('Missing AI return search input');
-  return input as HTMLInputElement;
+  return input;
 }
 
 function buttonByAriaLabel(
@@ -215,6 +243,113 @@ describe('PromptPanel running lock', () => {
     }
   });
 
+  it('shows the chat run button in simple chat mode', async () => {
+    resetStoreForPromptLock('design', 'hello');
+    useStore.setState({
+      workflow: simpleBlueprint('Simple chat'),
+    });
+    const view = await renderChatDock();
+
+    try {
+      const runButton = buttonByAriaLabel(view.container, '运行当前会话输入');
+
+      expect(runButton.disabled).toBe(false);
+      expect(runButton.textContent).toContain('运行');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('reruns a favorited chat from its first user message', async () => {
+    resetStoreForPromptLock('design');
+    const originalSendPrompt = useStore.getState().sendPrompt;
+    const sendPrompt = vi.fn();
+    useStore.setState({
+      workflow: simpleBlueprint('Reusable chat'),
+      composerDraft: '',
+      sendPrompt,
+      sessions: [
+        {
+          id: 's_prompt',
+          title: 'Reusable chat',
+          createdAt: 1,
+          updatedAt: 1,
+          isWorkflow: false,
+          favorite: true,
+        },
+      ],
+      messages: [
+        { id: 'm_user', role: 'user', text: 'repeat this task', createdAt: 1 },
+        { id: 'm_ai', role: 'assistant', text: 'done', createdAt: 2 },
+      ],
+    });
+    const view = await renderChatDock();
+
+    try {
+      const runButton = buttonByAriaLabel(view.container, '运行当前会话输入');
+
+      expect(runButton.disabled).toBe(false);
+
+      await act(async () => {
+        runButton.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(sendPrompt).toHaveBeenCalledWith('repeat this task');
+      expect(useStore.getState().composerDraft).toBe('');
+    } finally {
+      await view.cleanup();
+      useStore.setState({ sendPrompt: originalSendPrompt });
+    }
+  });
+
+  it('keeps empty unfavorited chat runs disabled', async () => {
+    resetStoreForPromptLock('design');
+    useStore.setState({
+      workflow: simpleBlueprint('Plain chat'),
+      composerDraft: '',
+      sessions: [
+        {
+          id: 's_prompt',
+          title: 'Plain chat',
+          createdAt: 1,
+          updatedAt: 1,
+          isWorkflow: false,
+        },
+      ],
+      messages: [
+        { id: 'm_user', role: 'user', text: 'repeat this task', createdAt: 1 },
+      ],
+    });
+    const view = await renderChatDock();
+
+    try {
+      const runButton = buttonByAriaLabel(view.container, '运行当前会话输入');
+
+      expect(runButton.disabled).toBe(true);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('flips the simple chat top action to stop while chatting', async () => {
+    resetStoreForPromptLock('design', 'hello');
+    useStore.setState({
+      workflow: simpleBlueprint('Simple chat'),
+      chattingSessions: [{ workspaceId: null, sessionId: 's_prompt' }],
+    });
+    const view = await renderChatDock();
+
+    try {
+      const stopButton = buttonByAriaLabel(view.container, '停止当前会话生成');
+
+      expect(stopButton.disabled).toBe(false);
+      expect(stopButton.textContent).toContain('停止');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
   it('hides the model strategy selector for non-workflow sessions', async () => {
     resetStoreForPromptLock('design');
     useStore.setState({
@@ -278,6 +413,12 @@ describe('PromptPanel running lock', () => {
     const view = await renderPanels();
 
     try {
+      expect(optionalSearchInput(view.container)).toBeNull();
+
+      await act(async () => {
+        buttonByAriaLabel(view.container, '搜索 AI 返回内容').click();
+      });
+
       const input = searchInput(view.container);
 
       await act(async () => {
@@ -303,6 +444,58 @@ describe('PromptPanel running lock', () => {
       expect(searchInput(view.container).value).toBe('');
       expect(view.container.querySelectorAll('mark[data-search-match-id]')).toHaveLength(0);
       expect(document.activeElement).toBe(searchInput(view.container));
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('opens chat search with Ctrl+F and closes it with Escape', async () => {
+    resetStoreForPromptLock('design');
+    useStore.setState({
+      workflow: simpleBlueprint('Plain chat'),
+      messages: [
+        { id: 'm_user', role: 'user', text: 'find needle', createdAt: 1 },
+        { id: 'm_ai', role: 'assistant', text: 'needle response', createdAt: 2 },
+      ] as Message[],
+    });
+    const view = await renderChatDock();
+
+    try {
+      expect(optionalSearchInput(view.container)).toBeNull();
+
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'f',
+            ctrlKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+
+      const input = searchInput(view.container);
+
+      await act(async () => {
+        typeIntoInput(input, 'needle');
+      });
+
+      expect(view.container.textContent).toContain('1/2');
+      expect(view.container.querySelectorAll('mark[data-search-match-id]')).toHaveLength(2);
+
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Escape',
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+
+      expect(optionalSearchInput(view.container)).toBeNull();
+      expect(view.container.querySelectorAll('mark[data-search-match-id]')).toHaveLength(0);
+      expect(view.container.textContent).not.toContain('1/2');
     } finally {
       await view.cleanup();
     }

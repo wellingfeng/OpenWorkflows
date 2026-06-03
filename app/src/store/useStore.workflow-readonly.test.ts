@@ -9,6 +9,7 @@ import {
   workflowReadOnlyReason,
   type WorkflowSessionKey,
 } from './useStore';
+import { workflowDefaultGatewaySelection } from '@/lib/modelGateway/resolver';
 import { historyStore } from './history/store';
 import type { SessionRecord, WorkspaceSummary } from './history/types';
 import type { Session } from './types';
@@ -643,6 +644,70 @@ describe('workflow read-only guard', () => {
     expect(useStore.getState().composerDraft).toBe('draft for B');
   });
 
+  it('keeps composer controls scoped to each session', () => {
+    resetStore('design', false);
+    useStore.setState({
+      activeWorkspaceId: null,
+      activeSessionId: 's_a',
+      composerDraft: '',
+      composerDrafts: {},
+      composerBySession: {},
+      composer: {
+        permission: 'full',
+        model: 'claude-sonnet-4',
+        workspace: '',
+        modelStrategy: 'inherit',
+      },
+    });
+
+    useStore.getState().setComposer({
+      permission: 'plan',
+      workspace: 'E:\\ProjectA',
+      modelStrategy: 'prefer-better',
+    });
+    useStore
+      .getState()
+      .setGlobalRunSelection({ adapter: 'codex', modelClass: 'opus' });
+    useStore.getState().selectSession('s_b');
+
+    expect(useStore.getState().composer.permission).toBe('full');
+    expect(useStore.getState().composer.workspace).toBe('');
+    expect(useStore.getState().composer.modelStrategy).toBe('inherit');
+
+    useStore.getState().setComposer({
+      permission: 'read-only',
+      workspace: 'E:\\ProjectB',
+      modelStrategy: 'prefer-cheaper',
+    });
+    useStore
+      .getState()
+      .setGlobalRunSelection({ adapter: 'gemini', modelClass: 'haiku' });
+
+    useStore.getState().selectSession('s_a');
+
+    expect(useStore.getState().composer).toMatchObject({
+      permission: 'plan',
+      workspace: 'E:\\ProjectA',
+      modelStrategy: 'prefer-better',
+    });
+    expect(workflowDefaultGatewaySelection(useStore.getState().workflow)).toEqual({
+      adapter: 'codex',
+      modelClass: 'opus',
+    });
+
+    useStore.getState().selectSession('s_b');
+
+    expect(useStore.getState().composer).toMatchObject({
+      permission: 'read-only',
+      workspace: 'E:\\ProjectB',
+      modelStrategy: 'prefer-cheaper',
+    });
+    expect(workflowDefaultGatewaySelection(useStore.getState().workflow)).toEqual({
+      adapter: 'gemini',
+      modelClass: 'haiku',
+    });
+  });
+
   it.each([
     ['running workflow', 'running', false],
     ['AI blueprint edit', 'design', true],
@@ -700,5 +765,30 @@ describe('workflow read-only guard', () => {
         aiEditingSessions: state.aiEditingSessions,
       }),
     ).toBe('aiEditing');
+  });
+
+  it('allows creating a new chat session while another session is streaming', () => {
+    resetStore('design', false);
+    useStore.setState({
+      aiStreaming: true,
+      chattingSessions: [ACTIVE_SESSION_KEY],
+    });
+
+    useStore.getState().newSession();
+
+    const state = useStore.getState();
+    const expectedName =
+      state.locale === 'en-US' ? 'Untitled Session' : '未命名会话';
+    expect(state.workflow.meta.simple).toBe(true);
+    expect(state.workflow.meta.name).toBe(expectedName);
+    expect(state.activeSessionId).not.toBe(ACTIVE_SESSION_KEY.sessionId);
+    expect(state.sessions[0]?.id).toBe(state.activeSessionId);
+    expect(state.sessions[0]?.title).toBe(expectedName);
+    expect(state.messages).toEqual([]);
+    expect(state.selectedNodeId).toBeNull();
+    expect(state.runState).toEqual({});
+    expect(state.runOutputs).toEqual({});
+    expect(state.lastRunFailedNodeId).toBeNull();
+    expect(state.dirty).toBe(false);
   });
 });

@@ -5,6 +5,7 @@
  * headless CLI run is observably identical to a desktop run.
  *
  * argv (claude):  -p --output-format stream-json --verbose
+ *                 [--bare                 (API-key relay/free channel only)]
  *                 [--strict-mcp-config]
  *                 [--resume <sid> | --session-id <sid>]
  *                 [--model <m>            (filtered by shouldPassModel)]
@@ -124,6 +125,71 @@ function resolveIdleTimeoutSecs(override?: number): number {
   return configured;
 }
 
+function flagEnabled(value: string | undefined): boolean {
+  const v = value?.trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+function hasEnvValue(env: Record<string, string> | undefined, key: string): boolean {
+  return !!env?.[key]?.trim();
+}
+
+function shouldRunClaudeBare(env: Record<string, string> | undefined): boolean {
+  if (flagEnabled(process.env.OPENWORKFLOW_DISABLE_CLAUDE_BARE)) return false;
+  const hasApiKey = hasEnvValue(env, 'ANTHROPIC_API_KEY');
+  const hasGatewayRoute =
+    hasEnvValue(env, 'ANTHROPIC_BASE_URL') || hasEnvValue(env, 'ANTHROPIC_MODEL');
+  return hasApiKey && hasGatewayRoute;
+}
+
+function knownProviderModelVariant(baseUrl: string | undefined, model: string | undefined): string | undefined {
+  const trimmed = model?.trim();
+  if (!trimmed) return undefined;
+  const base = (baseUrl ?? '').trim().toLowerCase();
+  const lower = trimmed.toLowerCase();
+
+  if (base.includes('openrouter.ai') || base.includes('/ch/open_router')) {
+    if (/^glm-\d/i.test(trimmed)) return `z-ai/${lower}`;
+    if (lower.startsWith('z-ai/glm-')) return lower;
+  }
+  if (base.includes('integrate.api.nvidia.com') || base.includes('/ch/nvidia_nim')) {
+    if (!trimmed.includes('/') && lower.includes('nemotron')) {
+      return `nvidia/${lower}`;
+    }
+  }
+  if (base.includes('fireworks.ai') || base.includes('/ch/fireworks')) {
+    if (!trimmed.includes('/') && lower.startsWith('llama-')) {
+      return `accounts/fireworks/models/${lower}`;
+    }
+  }
+  if (
+    base.includes('opencode.ai') ||
+    base.includes('z.ai') ||
+    base.includes('bigmodel.cn') ||
+    base.includes('/ch/opencode') ||
+    base.includes('/ch/opencode_go') ||
+    base.includes('/ch/zai')
+  ) {
+    if (/^glm-\d/i.test(trimmed)) return lower;
+  }
+  return trimmed;
+}
+
+function normalizeSpawnEnv(env: NodeJS.ProcessEnv): void {
+  const anthropicModel = knownProviderModelVariant(
+    env.ANTHROPIC_BASE_URL,
+    env.ANTHROPIC_MODEL,
+  );
+  if (anthropicModel && env.ANTHROPIC_MODEL?.trim() !== anthropicModel) {
+    env.ANTHROPIC_MODEL = anthropicModel;
+  }
+
+  const openaiModel = knownProviderModelVariant(env.OPENAI_BASE_URL, env.OPENAI_MODEL);
+  if (openaiModel && env.OPENAI_MODEL?.trim() !== openaiModel) {
+    env.OPENAI_MODEL = openaiModel;
+  }
+}
+
 function mcpEnabled(): boolean {
   const v = (process.env.OPENWORKFLOW_ENABLE_MCP ?? '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes';
@@ -210,6 +276,9 @@ function buildArgs(
   } else {
     // claude (and any non-codex protocol falls through to the claude shape).
     args.push('-p', '--output-format', 'stream-json', '--verbose');
+    if (shouldRunClaudeBare(opts.env)) {
+      args.push('--bare');
+    }
     disableAutoupdater = true;
     if (!mcpEnabled()) {
       args.push('--strict-mcp-config');
@@ -276,6 +345,7 @@ export function spawnCliAgent(prompt: string, opts: SpawnCliAgentOpts): Promise<
         if (k.trim()) env[k] = v;
       }
     }
+    normalizeSpawnEnv(env);
     if (disableAutoupdater) env.DISABLE_AUTOUPDATER = '1';
 
     let child;

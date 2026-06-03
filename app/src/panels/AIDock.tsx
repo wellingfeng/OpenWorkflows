@@ -7,13 +7,21 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { ChevronDown, ChevronUp, Plus, Search, X } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronUp,
+  Play,
+  Plus,
+  Search,
+  Square,
+  X,
+} from 'lucide-react';
 import Select from '@/components/Select';
 import WorkspaceSelect from '@/components/WorkspaceSelect';
 import { summarizeAnswer, type InteractionAnswer } from '@/core/interaction';
 import {
   systemDefaultGatewaySelection,
-  workflowGatewaySelection,
+  workflowDefaultGatewaySelection,
 } from '@/lib/modelGateway/resolver';
 import { RUNTIME_ADAPTERS } from '@/lib/adapters';
 import {
@@ -23,9 +31,14 @@ import {
   freeChannelReady,
   freeChannelSelection,
   getFreeChannelKey,
+  getFreeChannelModelOverride,
   isFreeChannelSelection,
+  loadFreeChannelKeyFromAutoConfig,
   setFreeChannelKey,
+  setFreeChannelModel,
+  type FreeChannel,
 } from '@/lib/freeChannels';
+import LocalModelSetupDialog from '@/components/LocalModelSetupDialog';
 import type { ModelStrategy, SelectOption } from '@/store/types';
 import { localizeSelectOption, t, type Locale } from '@/lib/i18n';
 import type { Message } from '@/store/types';
@@ -36,8 +49,14 @@ import {
   savePaneWidth,
 } from '@/lib/composerStorage';
 import { shouldRefocusComposerAfterAppend } from '@/lib/composerEntryPolicy';
-import { tauriAvailable, openLocalPath } from '@/lib/tauri';
+import {
+  tauriAvailable,
+  localModelStatus,
+  openExternal,
+  type LocalModelRuntimeStatus,
+} from '@/lib/tauri';
 import MessageContent from '@/components/ai/MessageContent';
+import FilePreviewDrawer from '@/components/ai/FilePreviewDrawer';
 import type { FileRef } from '@/components/ai/lib/filePath';
 import {
   extractToolSentinels,
@@ -258,6 +277,30 @@ function pathsFromDataTransfer(dataTransfer: DataTransfer): string[] {
       return withPath.path || file.webkitRelativePath || file.name;
     })
     .filter(Boolean);
+}
+
+function describeLocalModelStatus(
+  locale: Locale,
+  channel: FreeChannel,
+  status: LocalModelRuntimeStatus,
+): string {
+  const suffix = status.message ? ` ${status.message}` : '';
+  if (status.state === 'missing_model') {
+    return `${channel.label}: ${t(locale, 'settings.freeChannels.localMissingModel')}。`;
+  }
+  if (status.state === 'service_unavailable') {
+    return `${channel.label}: ${t(locale, 'settings.freeChannels.localServiceDown')}。${suffix}`;
+  }
+  if (status.state === 'model_missing') {
+    return `${channel.label}: ${t(locale, 'settings.freeChannels.localModelMissing')} (${status.configuredModel})。${suffix}`;
+  }
+  if (status.state === 'desktop_unavailable') {
+    return `${channel.label}: ${t(locale, 'settings.freeChannels.localDesktopOnly')}。`;
+  }
+  if (status.state === 'unsupported') {
+    return `${channel.label}: ${t(locale, 'settings.freeChannels.localUnsupported')}。${suffix}`;
+  }
+  return `${channel.label}: ${t(locale, 'settings.freeChannels.localServiceError')}。${suffix}`;
 }
 
 /**
@@ -484,7 +527,7 @@ export default function AIDock({
   const isChat = layout === 'chat';
   const messages = useStore((s) => s.messages);
   const sendPrompt = useStore((s) => s.sendPrompt);
-  // Chat layout shows the workflow/session title in place of the search bar.
+  const stopChat = useStore((s) => s.stopChat);
   const chatTitle = useStore((s) => s.workflow.meta?.name ?? '');
   const simpleMode = useStore((s) => s.workflow.meta?.simple === true);
   const activeSessionIsWorkflow = useStore((s) => {
@@ -498,7 +541,18 @@ export default function AIDock({
         : undefined);
     return active?.isWorkflow ?? true;
   });
-  const runSelection = useStore((s) => workflowGatewaySelection(s.workflow), shallow);
+  const activeSessionFavorite = useStore((s) => {
+    if (!s.activeSessionId) return false;
+    const active =
+      s.sessions.find((session) => session.id === s.activeSessionId) ??
+      (s.activeWorkspaceId
+        ? s.sessionTree[s.activeWorkspaceId]?.find(
+            (session) => session.id === s.activeSessionId,
+          )
+        : undefined);
+    return active?.favorite === true;
+  });
+  const runSelection = useStore((s) => workflowDefaultGatewaySelection(s.workflow), shallow);
   const setGlobalRunSelection = useStore((s) => s.setGlobalRunSelection);
   const composer = useStore((s) => s.composer);
   const draft = useStore((s) => s.composerDraft);
@@ -511,6 +565,13 @@ export default function AIDock({
   const workspaceHistory = useStore((s) => s.workspaceHistory);
   const mode = useStore((s) => s.mode);
   const activeAiEditing = useStore((s) => isActiveAiEditingSession(s));
+  const activeChatting = useStore((s) =>
+    s.chattingSessions.some(
+      (session) =>
+        session.workspaceId === (s.activeWorkspaceId ?? null) &&
+        session.sessionId === (s.activeSessionId ?? null),
+    ),
+  );
   const answerInteraction = useStore((s) => s.answerInteraction);
   const dismissInteraction = useStore((s) => s.dismissInteraction);
   const streamRef = useRef<HTMLDivElement>(null);
@@ -526,6 +587,8 @@ export default function AIDock({
 
   const isReadOnly = mode === 'running';
   const [dropActive, setDropActive] = useState(false);
+  const [filePreviewRef, setFilePreviewRef] = useState<FileRef | null>(null);
+  const [returnSearchOpen, setReturnSearchOpen] = useState(false);
   const [returnSearch, setReturnSearch] = useState('');
   const [activeSearchMatchIndex, setActiveSearchMatchIndex] = useState(0);
   const normalizedSearch = useMemo(
@@ -544,6 +607,10 @@ export default function AIDock({
     () => new Set(searchMatches.map((match) => match.messageId)),
     [searchMatches],
   );
+  const reusableFavoritePrompt = useMemo(() => {
+    if (!isChat || !activeSessionFavorite) return '';
+    return messages.find((message) => message.role === 'user')?.text.trim() ?? '';
+  }, [activeSessionFavorite, isChat, messages]);
   const runtimeSelectOptions = useMemo<SelectOption[]>(
     () =>
       RUNTIME_ADAPTERS.map((adapter) => ({
@@ -560,55 +627,252 @@ export default function AIDock({
   // Option 1 = system default (no proxy), options 2..n = the free channels
   // routed through the built-in local proxy. See lib/freeChannels.ts.
   const isClaudeCodeRuntime = runtimeSelectValue === 'claude-code';
+  const [freeChannelRevision, setFreeChannelRevision] = useState(0);
+  useEffect(() => {
+    const refresh = () => setFreeChannelRevision((n) => n + 1);
+    window.addEventListener('owf:gateway-config-changed', refresh);
+    return () => window.removeEventListener('owf:gateway-config-changed', refresh);
+  }, []);
+  const [localRuntimeStatuses, setLocalRuntimeStatuses] = useState<
+    Record<string, LocalModelRuntimeStatus | undefined>
+  >({});
   const channelSelectOptions = useMemo<SelectOption[]>(
     () => [
       { id: '__system__', label: t(locale, 'dock.channelSystemDefault') },
-      ...FREE_CHANNELS.map((c) => ({
-        id: c.id,
-        label:
-          'Free · ' +
-          c.label +
-          (c.needsKey && !freeChannelReady(c.id) ? ' ⚠' : ''),
-      })),
+      ...FREE_CHANNELS.map((c) => {
+        const localStatus = c.local ? localRuntimeStatuses[c.id] : undefined;
+        const needsAttention =
+          !freeChannelReady(c.id) || (c.local && localStatus && !localStatus.ready);
+        return {
+          id: c.id,
+          label: 'Free · ' + c.label + (needsAttention ? ' ⚠' : ''),
+        };
+      }),
     ],
-    [locale],
+    [locale, freeChannelRevision, localRuntimeStatuses],
   );
   const channelSelectValue =
     isFreeChannelSelection(runSelection) ?? '__system__';
-  const onChannelChange = useCallback(
-    (id: string) => {
-      if (id === '__system__') {
-        setGlobalRunSelection(systemDefaultGatewaySelection('claude-code'));
-        return;
-      }
-      const channel = freeChannelById(id);
-      if (!channel) return;
-      if (channel.needsKey && !getFreeChannelKey(id)) {
-        const promptMsg =
-          'Enter API key for ' +
-          channel.label +
-          (channel.credentialUrl ? ' (' + channel.credentialUrl + ')' : '');
-        const k = window.prompt(promptMsg);
-        if (!k || !k.trim()) return;
-        setFreeChannelKey(id, k.trim());
-      }
+  const [keyModalChannel, setKeyModalChannel] = useState<FreeChannel | null>(null);
+  const [keyModalValue, setKeyModalValue] = useState('');
+  const [localSetupChannel, setLocalSetupChannel] =
+    useState<FreeChannel | null>(null);
+  const [localModelValue, setLocalModelValue] = useState('');
+  const [localSetupMessage, setLocalSetupMessage] = useState<string | null>(null);
+  const [checkingLocalModel, setCheckingLocalModel] = useState(false);
+
+  useEffect(() => {
+    if (!isClaudeCodeRuntime || !tauriAvailable()) return;
+    let disposed = false;
+    const localChannels = FREE_CHANNELS.filter((channel) => {
+      if (!channel.local) return false;
+      return getFreeChannelModelOverride(channel.id).length > 0;
+    });
+    if (localChannels.length === 0) {
+      setLocalRuntimeStatuses({});
+      return;
+    }
+    void Promise.all(
+      localChannels.map(async (channel) => {
+        const model = getFreeChannelModelOverride(channel.id);
+        try {
+          return [channel.id, await localModelStatus(channel.id, model)] as const;
+        } catch {
+          return [channel.id, undefined] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (disposed) return;
+      setLocalRuntimeStatuses(Object.fromEntries(entries));
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [isClaudeCodeRuntime, freeChannelRevision]);
+  const useFreeChannel = useCallback(
+    (channel: FreeChannel) => {
       void ensureFreeProxy();
       setGlobalRunSelection(
-        freeChannelSelection(id, runSelection.modelClass),
+        freeChannelSelection(channel.id, runSelection.modelClass),
       );
+      setKeyModalChannel(null);
+      setKeyModalValue('');
+      setLocalSetupChannel(null);
+      setLocalModelValue('');
+      setLocalSetupMessage(null);
     },
     [runSelection.modelClass, setGlobalRunSelection],
   );
+  const onChannelChange = useCallback(
+    (id: string) => {
+      void (async () => {
+        if (id === '__system__') {
+          setGlobalRunSelection(systemDefaultGatewaySelection('claude-code'));
+          return;
+        }
+        const channel = freeChannelById(id);
+        if (!channel) return;
+        if (channel.local) {
+          const model = getFreeChannelModelOverride(id);
+          if (!model.trim()) {
+            setLocalSetupChannel(channel);
+            setLocalModelValue(model);
+            setLocalSetupMessage(null);
+            return;
+          }
+          if (tauriAvailable()) {
+            setCheckingLocalModel(true);
+            try {
+              const status = await localModelStatus(id, model);
+              setLocalRuntimeStatuses((prev) => ({ ...prev, [id]: status }));
+              if (!status.ready) {
+                setLocalSetupChannel(channel);
+                setLocalModelValue(model);
+                setLocalSetupMessage(
+                  describeLocalModelStatus(locale, channel, status),
+                );
+                return;
+              }
+            } catch (err) {
+              const status: LocalModelRuntimeStatus = {
+                channelId: id,
+                configuredModel: model,
+                reachable: false,
+                ready: false,
+                state: 'service_unavailable',
+                models: [],
+                message: err instanceof Error ? err.message : String(err),
+              };
+              setLocalRuntimeStatuses((prev) => ({ ...prev, [id]: status }));
+              setLocalSetupChannel(channel);
+              setLocalModelValue(model);
+              setLocalSetupMessage(
+                describeLocalModelStatus(locale, channel, status),
+              );
+              return;
+            } finally {
+              setCheckingLocalModel(false);
+            }
+          }
+          useFreeChannel(channel);
+          return;
+        }
+        const key =
+          channel.needsKey && !getFreeChannelKey(id)
+            ? await loadFreeChannelKeyFromAutoConfig(id)
+            : getFreeChannelKey(id);
+        if (channel.needsKey && !key) {
+          setKeyModalChannel(channel);
+          setKeyModalValue('');
+          return;
+        }
+        useFreeChannel(channel);
+      })();
+    },
+    [locale, setGlobalRunSelection, useFreeChannel],
+  );
+  const saveKeyModal = useCallback(() => {
+    if (!keyModalChannel) return;
+    const key = keyModalValue.trim();
+    if (!key) return;
+    setFreeChannelKey(keyModalChannel.id, key);
+    useFreeChannel(keyModalChannel);
+  }, [keyModalChannel, keyModalValue, useFreeChannel]);
+  const saveLocalModelModal = useCallback(() => {
+    if (!localSetupChannel) return;
+    const model = localModelValue.trim();
+    if (!model) return;
+    void (async () => {
+      setCheckingLocalModel(true);
+      setFreeChannelModel(localSetupChannel.id, model);
+      try {
+        if (tauriAvailable()) {
+          const status = await localModelStatus(localSetupChannel.id, model);
+          setLocalRuntimeStatuses((prev) => ({
+            ...prev,
+            [localSetupChannel.id]: status,
+          }));
+          if (!status.ready) {
+            setLocalSetupMessage(
+              describeLocalModelStatus(locale, localSetupChannel, status),
+            );
+            return;
+          }
+        }
+        useFreeChannel(localSetupChannel);
+      } catch (err) {
+        const status: LocalModelRuntimeStatus = {
+          channelId: localSetupChannel.id,
+          configuredModel: model,
+          reachable: false,
+          ready: false,
+          state: 'service_unavailable',
+          models: [],
+          message: err instanceof Error ? err.message : String(err),
+        };
+        setLocalRuntimeStatuses((prev) => ({
+          ...prev,
+          [localSetupChannel.id]: status,
+        }));
+        setLocalSetupMessage(
+          describeLocalModelStatus(locale, localSetupChannel, status),
+        );
+      } finally {
+        setCheckingLocalModel(false);
+      }
+    })();
+  }, [localModelValue, localSetupChannel, locale, useFreeChannel]);
 
-  // Open a local file referenced by an AI-message chip in the OS handler. Paths
-  // resolve against the active workspace folder; no-ops gracefully in browser.
+  const ensureSelectedLocalChannelReady = useCallback(async (): Promise<boolean> => {
+    const id = isFreeChannelSelection(runSelection);
+    if (!id) return true;
+    const channel = freeChannelById(id);
+    if (!channel?.local) return true;
+    const model = getFreeChannelModelOverride(id);
+    if (!model.trim()) {
+      setLocalSetupChannel(channel);
+      setLocalModelValue(model);
+      setLocalSetupMessage(null);
+      return false;
+    }
+    if (!tauriAvailable()) return true;
+    setCheckingLocalModel(true);
+    try {
+      const status = await localModelStatus(id, model);
+      setLocalRuntimeStatuses((prev) => ({ ...prev, [id]: status }));
+      if (status.ready) return true;
+      setLocalSetupChannel(channel);
+      setLocalModelValue(model);
+      setLocalSetupMessage(describeLocalModelStatus(locale, channel, status));
+      return false;
+    } catch (err) {
+      const status: LocalModelRuntimeStatus = {
+        channelId: id,
+        configuredModel: model,
+        reachable: false,
+        ready: false,
+        state: 'service_unavailable',
+        models: [],
+        message: err instanceof Error ? err.message : String(err),
+      };
+      setLocalRuntimeStatuses((prev) => ({ ...prev, [id]: status }));
+      setLocalSetupChannel(channel);
+      setLocalModelValue(model);
+      setLocalSetupMessage(describeLocalModelStatus(locale, channel, status));
+      return false;
+    } finally {
+      setCheckingLocalModel(false);
+    }
+  }, [locale, runSelection]);
+
+  // Open a local file referenced by an AI-message chip in the right preview pane.
+  // Paths resolve against the active workspace folder in the Tauri command.
   const workspaceCwd = composer.workspace;
   const onOpenFile = useCallback(
     (ref: FileRef) => {
-      if (!tauriAvailable()) return;
-      void openLocalPath(ref.path, { cwd: workspaceCwd || undefined });
+      setFilePreviewRef(ref);
     },
-    [workspaceCwd],
+    [],
   );
 
   // Heuristic "live bubble": the last assistant message is streaming while the
@@ -620,7 +884,7 @@ export default function AIDock({
     }
     return null;
   }, [messages]);
-  const aiBusy = mode === 'running' || activeAiEditing;
+  const aiBusy = mode === 'running' || activeAiEditing || activeChatting;
 
   const modelStrategyOptions = useMemo<SelectOption[]>(
     () => [
@@ -658,11 +922,22 @@ export default function AIDock({
     searchInputRef.current?.select();
   }, []);
 
+  const openReturnSearch = useCallback(() => {
+    setReturnSearchOpen(true);
+  }, []);
+
+  const closeReturnSearch = useCallback(() => {
+    setReturnSearchOpen(false);
+    setReturnSearch('');
+    setActiveSearchMatchIndex(0);
+    activeSearchMatchNodeRef.current = null;
+  }, []);
+
   const clearReturnSearch = useCallback(() => {
     setReturnSearch('');
     setActiveSearchMatchIndex(0);
-    focusSearchInput();
-  }, [focusSearchInput]);
+    if (returnSearchOpen) focusSearchInput();
+  }, [focusSearchInput, returnSearchOpen]);
 
   const moveSearchMatch = useCallback(
     (step: number) => {
@@ -745,6 +1020,38 @@ export default function AIDock({
   useEffect(() => {
     setActiveSearchMatchIndex(0);
   }, [normalizedSearch]);
+
+  useEffect(() => {
+    if (returnSearchOpen) focusSearchInput();
+  }, [focusSearchInput, returnSearchOpen]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (keyModalChannel || localSetupChannel) return;
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.altKey &&
+        event.key.toLowerCase() === 'f'
+      ) {
+        event.preventDefault();
+        openReturnSearch();
+        return;
+      }
+      if (event.key === 'Escape' && returnSearchOpen) {
+        event.preventDefault();
+        closeReturnSearch();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    closeReturnSearch,
+    keyModalChannel,
+    localSetupChannel,
+    openReturnSearch,
+    returnSearchOpen,
+  ]);
 
   useEffect(() => {
     if (searchMatches.length === 0) {
@@ -975,14 +1282,25 @@ export default function AIDock({
     [chatInputHeight],
   );
 
-  const submit = () => {
+  const submit = (overrideText?: string) => {
     if (isReadOnly || activeAiEditing) return;
-    const text = draft.trim();
+    const text = (overrideText ?? draft).trim();
     if (!text) return;
-    sendPrompt(text);
-    setComposerDraft('');
-    draftRef.current = '';
-    selectionRef.current = { start: 0, end: 0 };
+    void (async () => {
+      if (!(await ensureSelectedLocalChannelReady())) return;
+      sendPrompt(text);
+      if (overrideText === undefined) {
+        setComposerDraft('');
+        draftRef.current = '';
+        selectionRef.current = { start: 0, end: 0 };
+      }
+    })();
+  };
+
+  const chatRunText = draft.trim() || reusableFavoritePrompt;
+  const runChat = () => {
+    if (draft.trim()) submit();
+    else submit(reusableFavoritePrompt);
   };
 
   const addFiles = async () => {
@@ -991,6 +1309,12 @@ export default function AIDock({
     const paths = await pickComposerFiles(t(locale, 'dock.addFileDialogTitle'));
     if (paths?.length) insertFilePaths(paths);
   };
+
+  const searchStatus = normalizedSearch
+    ? searchMatches.length === 0
+      ? t(locale, 'dock.searchNoMatch')
+      : `${activeSearchMatchIndex + 1}/${searchMatches.length}`
+    : '';
 
   return (
     <div
@@ -1016,7 +1340,7 @@ export default function AIDock({
       )}
       {/* AI return stream */}
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <header className="flex flex-wrap items-center gap-2 border-b border-border-soft px-3 py-2">
+        <header className="relative flex flex-wrap items-center gap-2 border-b border-border-soft px-3 py-2">
           {isChat ? (
             <span
               className="min-w-0 flex-1 truncate text-sm font-medium text-fg"
@@ -1035,80 +1359,124 @@ export default function AIDock({
               {t(locale, 'dock.generating')}
             </span>
           )}
-          {!isChat && (
-            <div className="flex min-w-0 flex-1 basis-full flex-wrap items-center justify-end gap-1 sm:ml-auto sm:basis-0 sm:flex-nowrap">
-            <div className="flex min-w-0 flex-1 basis-full items-center gap-1 rounded-md border border-border bg-bg px-2 py-1 transition-colors focus-within:border-accent sm:basis-auto">
-              <Search size={13} className="shrink-0 text-fg-faint" />
-              <input
-                ref={searchInputRef}
-                value={returnSearch}
-                onChange={(e) => setReturnSearch(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    moveSearchMatch(e.shiftKey ? -1 : 1);
-                  } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    if (returnSearch) clearReturnSearch();
-                    else searchInputRef.current?.blur();
-                  }
-                }}
-                placeholder={t(locale, 'dock.searchPlaceholder')}
-                aria-label={t(locale, 'dock.searchAria')}
-                spellCheck={false}
-                className="min-w-0 flex-1 bg-transparent text-xs text-fg outline-none placeholder:text-fg-faint"
-              />
-              {returnSearch ? (
+          <div className="ml-auto flex shrink-0 items-center gap-1">
+            {isChat &&
+              (activeChatting ? (
                 <button
                   type="button"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={clearReturnSearch}
-                  title={t(locale, 'dock.searchClear')}
-                  aria-label={t(locale, 'dock.searchClear')}
-                  className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-fg-faint transition-colors hover:text-fg"
+                  onClick={stopChat}
+                  title={t(locale, 'dock.stopChatTitle')}
+                  aria-label={t(locale, 'dock.stopChatTitle')}
+                  className="flex shrink-0 items-center gap-1.5 rounded-md border border-status-error/40 bg-status-error/15 px-3 py-1.5 text-xs font-semibold text-status-error transition-opacity hover:opacity-90"
                 >
-                  <X size={12} />
+                  <Square size={12} fill="currentColor" strokeWidth={2.2} />
+                  <span>{t(locale, 'dock.runningStop')}</span>
                 </button>
-              ) : null}
-            </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={runChat}
+                  disabled={!chatRunText || isReadOnly || activeAiEditing}
+                  title={t(locale, 'dock.runChatTitle')}
+                  aria-label={t(locale, 'dock.runChatTitle')}
+                  className="flex shrink-0 items-center gap-1.5 rounded-md bg-status-success px-3 py-1.5 text-xs font-semibold text-status-success-contrast transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Play size={13} fill="currentColor" strokeWidth={2.2} />
+                  <span>{t(locale, 'canvas.run')}</span>
+                </button>
+              ))}
             <button
               type="button"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => moveSearchMatch(-1)}
-              disabled={searchMatches.length === 0}
-              title={t(locale, 'dock.searchPrevious')}
-              aria-label={t(locale, 'dock.searchPrevious')}
-              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <ChevronUp size={14} />
-            </button>
-            <button
-              type="button"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => moveSearchMatch(1)}
-              disabled={searchMatches.length === 0}
-              title={t(locale, 'dock.searchNext')}
-              aria-label={t(locale, 'dock.searchNext')}
-              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <ChevronDown size={14} />
-            </button>
-            <span
-              aria-live="polite"
+              onClick={() => {
+                if (returnSearchOpen) closeReturnSearch();
+                else openReturnSearch();
+              }}
+              title={t(locale, 'dock.searchAria')}
+              aria-label={t(locale, 'dock.searchAria')}
+              aria-expanded={returnSearchOpen}
+              aria-controls="ai-return-search"
               className={
-                'min-w-[3.75rem] whitespace-nowrap text-right font-mono text-[10px] ' +
-                (normalizedSearch && searchMatches.length === 0
-                  ? 'text-accent-3'
-                  : 'text-fg-faint')
+                'flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-colors ' +
+                (returnSearchOpen
+                  ? 'border-accent bg-accent/10 text-accent'
+                  : 'border-border bg-panel-2 text-fg-dim hover:border-accent hover:text-fg')
               }
             >
-              {normalizedSearch
-                ? searchMatches.length === 0
-                  ? t(locale, 'dock.searchNoMatch')
-                  : `${activeSearchMatchIndex + 1}/${searchMatches.length}`
-                : ''}
-            </span>
+              <Search size={14} />
+            </button>
           </div>
+          {returnSearchOpen && (
+            <div className="absolute left-3 right-3 top-full z-30 mt-2 flex items-center gap-1 rounded-lg border border-border bg-panel/95 p-1.5 shadow-2xl backdrop-blur sm:left-auto sm:w-96">
+              <div className="flex min-w-0 flex-1 items-center gap-1 rounded-md border border-border bg-bg px-2 py-1 transition-colors focus-within:border-accent">
+                <Search size={13} className="shrink-0 text-fg-faint" />
+                <input
+                  id="ai-return-search"
+                  type="search"
+                  ref={searchInputRef}
+                  value={returnSearch}
+                  onChange={(e) => setReturnSearch(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      moveSearchMatch(e.shiftKey ? -1 : 1);
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      closeReturnSearch();
+                    }
+                  }}
+                  placeholder={t(locale, 'dock.searchPlaceholder')}
+                  aria-label={t(locale, 'dock.searchAria')}
+                  spellCheck={false}
+                  className="min-w-0 flex-1 bg-transparent text-xs text-fg outline-none placeholder:text-fg-faint"
+                />
+                {returnSearch ? (
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={clearReturnSearch}
+                    title={t(locale, 'dock.searchClear')}
+                    aria-label={t(locale, 'dock.searchClear')}
+                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-fg-faint transition-colors hover:text-fg"
+                  >
+                    <X size={12} />
+                  </button>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => moveSearchMatch(-1)}
+                disabled={searchMatches.length === 0}
+                title={t(locale, 'dock.searchPrevious')}
+                aria-label={t(locale, 'dock.searchPrevious')}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronUp size={14} />
+              </button>
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => moveSearchMatch(1)}
+                disabled={searchMatches.length === 0}
+                title={t(locale, 'dock.searchNext')}
+                aria-label={t(locale, 'dock.searchNext')}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronDown size={14} />
+              </button>
+              <span
+                aria-live="polite"
+                className={
+                  'min-w-[3.75rem] whitespace-nowrap text-right font-mono text-[10px] ' +
+                  (normalizedSearch && searchMatches.length === 0
+                    ? 'text-accent-3'
+                    : 'text-fg-faint')
+                }
+              >
+                {searchStatus}
+              </span>
+            </div>
           )}
         </header>
         <div ref={streamRef} className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -1120,6 +1488,7 @@ export default function AIDock({
             <ul className="flex flex-col gap-3">
               {messages.map((m) => {
                 const isUser = m.role === 'user';
+                const isChatUser = isChat && isUser;
                 const isSystem = m.role === 'system';
                 const isSearchHit = searchMatchMessageIds.has(m.id);
                 const isCurrentSearchHit = activeSearchMatchMessageId === m.id;
@@ -1142,6 +1511,7 @@ export default function AIDock({
                     }}
                     className={
                       'flex flex-col gap-1 rounded-md px-1 py-0.5 transition-colors ' +
+                      (isChatUser ? 'items-end ' : '') +
                       (isCurrentSearchHit
                         ? 'bg-accent/5 ring-1 ring-inset ring-accent-3/40'
                         : isSearchHit
@@ -1179,7 +1549,14 @@ export default function AIDock({
                       // User turns stay plain text; while a return search is
                       // active we fall back to the plain highlighter for every
                       // message so match marks land on real text nodes.
-                      <span className="whitespace-pre-wrap text-sm leading-relaxed text-fg-dim">
+                      <span
+                        className={
+                          'whitespace-pre-wrap break-words text-sm leading-relaxed ' +
+                          (isChatUser
+                            ? 'max-w-[min(78%,42rem)] rounded-md border border-accent/20 bg-accent/10 px-3 py-2 text-left text-fg'
+                            : 'text-fg-dim')
+                        }
+                      >
                         {renderHighlightedText(
                           isUser ? m.text : cleanMessageText(m.text),
                           m.id,
@@ -1355,10 +1732,22 @@ export default function AIDock({
                 icon="🧠"
               />
             )}
+            <WorkspaceSelect
+              value={composer.workspace}
+              history={workspaceHistory}
+              onSelect={setWorkspace}
+              disabled={activeAiEditing}
+              className="min-w-0"
+            />
+            <span className="min-w-fit font-mono text-[10px] text-fg-faint">
+              {isReadOnly
+                ? t(locale, 'dock.runningReadonly')
+                : t(locale, 'dock.sendShortcut')}
+            </span>
             <div className="min-w-0 flex-1" />
             <button
               type="button"
-              onClick={submit}
+              onClick={() => submit()}
               disabled={!draft.trim() || isReadOnly || activeAiEditing}
               title={
                 isReadOnly
@@ -1372,23 +1761,219 @@ export default function AIDock({
               {activeAiEditing ? '…' : '↑'}
             </button>
           </div>
-
-          {/* Context row: workspace */}
-          <div className="flex items-center gap-2">
-            <WorkspaceSelect
-              value={composer.workspace}
-              history={workspaceHistory}
-              onSelect={setWorkspace}
-              disabled={activeAiEditing}
-            />
-            <span className="font-mono text-[10px] text-fg-faint">
-              {isReadOnly
-                ? t(locale, 'dock.runningReadonly')
-                : t(locale, 'dock.sendShortcut')}
-            </span>
-          </div>
         </div>
       </section>
+      <FilePreviewDrawer
+        refData={filePreviewRef}
+        cwd={workspaceCwd || undefined}
+        onClose={() => setFilePreviewRef(null)}
+      />
+      {keyModalChannel && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-bg/75 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-lg border border-border bg-panel p-4 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-accent/40 bg-accent/10 text-accent">
+                ✦
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-semibold text-fg">
+                  {t(locale, 'dock.freeKeyTitle')} · {keyModalChannel.label}
+                </h3>
+                <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+                  {t(locale, 'dock.freeKeyDescription')}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setKeyModalChannel(null);
+                  setKeyModalValue('');
+                }}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-fg-faint transition-colors hover:bg-border-soft hover:text-fg"
+                title={t(locale, 'common.close')}
+              >
+                <X size={15} strokeWidth={2} />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <input
+                type="password"
+                value={keyModalValue}
+                onChange={(event) => setKeyModalValue(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') saveKeyModal();
+                  if (event.key === 'Escape') {
+                    setKeyModalChannel(null);
+                    setKeyModalValue('');
+                  }
+                }}
+                autoFocus
+                placeholder={t(locale, 'dock.freeKeyPlaceholder')}
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full rounded-md border border-border bg-bg px-3 py-2 text-sm text-fg outline-none transition-colors focus:border-accent"
+              />
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                {keyModalChannel.credentialUrl ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void openExternal(keyModalChannel.credentialUrl as string)
+                    }
+                    className="rounded-md border border-border bg-panel-2 px-3 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+                  >
+                    {t(locale, 'dock.freeKeyGet')}
+                  </button>
+                ) : (
+                  <span className="text-xs text-fg-faint">
+                    {t(locale, 'dock.freeKeyNoUrl')}
+                  </span>
+                )}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setKeyModalChannel(null);
+                      setKeyModalValue('');
+                    }}
+                    className="rounded-md border border-border bg-panel-2 px-3 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+                  >
+                    {t(locale, 'dock.freeKeyCancel')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveKeyModal}
+                    disabled={!keyModalValue.trim()}
+                    className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-bg transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {t(locale, 'dock.freeKeySave')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {localSetupChannel?.id === 'ollama' && (
+        <LocalModelSetupDialog
+          locale={locale}
+          downloadUrl={localSetupChannel.setupUrl}
+          statusMessage={localSetupMessage}
+          onClose={() => {
+            setLocalSetupChannel(null);
+            setLocalModelValue('');
+            setLocalSetupMessage(null);
+          }}
+          onModelSelected={(model) => {
+            setFreeChannelModel(localSetupChannel.id, model);
+            setLocalModelValue(model);
+            setLocalSetupMessage(t(locale, 'settings.localModel.setupStarted'));
+          }}
+        />
+      )}
+      {localSetupChannel && localSetupChannel.id !== 'ollama' && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-bg/75 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-lg border border-border bg-panel p-4 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-accent/40 bg-accent/10 text-accent">
+                ▣
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-semibold text-fg">
+                  {t(locale, 'dock.localModelTitle')} · {localSetupChannel.label}
+                </h3>
+                <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+                  {t(locale, 'dock.localModelDescription')}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setLocalSetupChannel(null);
+                  setLocalModelValue('');
+                  setLocalSetupMessage(null);
+                }}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-fg-faint transition-colors hover:bg-border-soft hover:text-fg"
+                title={t(locale, 'common.close')}
+              >
+                <X size={15} strokeWidth={2} />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              {localSetupMessage && (
+                <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200">
+                  {localSetupMessage}
+                </p>
+              )}
+              <label className="block space-y-1">
+                <span className="text-[11px] font-medium text-fg-dim">
+                  {t(locale, 'settings.freeChannels.modelLabel')}
+                </span>
+                <input
+                  type="text"
+                  value={localModelValue}
+                  onChange={(event) => setLocalModelValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') saveLocalModelModal();
+                    if (event.key === 'Escape') {
+                      setLocalSetupChannel(null);
+                      setLocalModelValue('');
+                      setLocalSetupMessage(null);
+                    }
+                  }}
+                  autoFocus
+                  placeholder={t(locale, 'dock.localModelPlaceholder')}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full rounded-md border border-border bg-bg px-3 py-2 text-sm text-fg outline-none transition-colors focus:border-accent"
+                />
+              </label>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                {localSetupChannel.setupUrl ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void openExternal(localSetupChannel.setupUrl as string)
+                    }
+                    className="rounded-md border border-border bg-panel-2 px-3 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+                  >
+                    {t(locale, 'dock.localModelDownload')}
+                  </button>
+                ) : (
+                  <span className="text-xs text-fg-faint">
+                    {t(locale, 'dock.localModelNoUrl')}
+                  </span>
+                )}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLocalSetupChannel(null);
+                      setLocalModelValue('');
+                      setLocalSetupMessage(null);
+                    }}
+                    className="rounded-md border border-border bg-panel-2 px-3 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+                  >
+                    {t(locale, 'dock.freeKeyCancel')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveLocalModelModal}
+                    disabled={!localModelValue.trim() || checkingLocalModel}
+                    className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-bg transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {checkingLocalModel
+                      ? t(locale, 'settings.freeChannels.localChecking')
+                      : t(locale, 'dock.localModelSave')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

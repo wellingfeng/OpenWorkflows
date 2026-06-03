@@ -32,6 +32,7 @@ import {
   type ToolEvent,
   type ToolEventPatch,
 } from './toolEvent';
+import { parseToolLine } from './toolLine';
 
 const OPEN = /<think(?:ing)?>/i;
 const CLOSE = /<\/think(?:ing)?>/i;
@@ -147,10 +148,13 @@ export function segmentMessage(text: string, streaming = false): Segment[] {
  * finishes after it still resolves to a single event.
  */
 function expandTools(segments: Segment[]): Segment[] {
-  const anyTools = segments.some(
+  const anySentinels = segments.some(
     (s) => s.type === 'answer' && hasToolSentinel(s.text),
   );
-  if (!anyTools) return segments;
+  const anyLegacyToolLines = segments.some(
+    (s) => s.type === 'answer' && hasLegacyToolMarker(s.text),
+  );
+  if (!anySentinels && !anyLegacyToolLines) return segments;
 
   // Decode every patch first (in stream order) so we can merge globally by id.
   const allPatches: ToolEventPatch[] = [];
@@ -164,10 +168,16 @@ function expandTools(segments: Segment[]): Segment[] {
 
   const out: Segment[] = [];
   const emitted = new Set<string>();
+  let legacyId = 0;
   const pushAnswerText = (text: string) => {
     const trimmed = text.replace(/^\n+|\n+$/g, '');
     if (trimmed.length === 0) return;
     out.push({ type: 'answer', text: trimmed });
+  };
+  const pushToolEvent = (event: ToolEvent) => {
+    const last = out[out.length - 1];
+    if (last && last.type === 'tools') last.events.push(event);
+    else out.push({ type: 'tools', events: [event] });
   };
   const pushTool = (id: string) => {
     // Global dedup: a tool's `running` and later `done` patch resolve to one
@@ -177,9 +187,20 @@ function expandTools(segments: Segment[]): Segment[] {
     const event = byId.get(id);
     if (!event) return;
     emitted.add(id);
-    const last = out[out.length - 1];
-    if (last && last.type === 'tools') last.events.push(event);
-    else out.push({ type: 'tools', events: [event] });
+    pushToolEvent(event);
+  };
+  const pushTextWithLegacyTools = (text: string) => {
+    for (const part of splitLegacyTools(text)) {
+      if ('text' in part) pushAnswerText(part.text);
+      else {
+        pushToolEvent({
+          id: `legacy-${legacyId++}`,
+          name: part.tool.name,
+          subject: part.tool.detail,
+          status: 'done',
+        });
+      }
+    }
   };
 
   for (const s of segments) {
@@ -188,16 +209,75 @@ function expandTools(segments: Segment[]): Segment[] {
       continue;
     }
     if (!hasToolSentinel(s.text)) {
-      pushAnswerText(s.text);
+      pushTextWithLegacyTools(s.text);
       continue;
     }
     // Walk the ordered parts so tool cards land exactly between prose runs.
     for (const part of extractToolSentinels(s.text).parts) {
-      if ('text' in part) pushAnswerText(part.text);
+      if ('text' in part) pushTextWithLegacyTools(part.text);
       else pushTool(part.patch.id);
     }
   }
 
   return out;
+}
+
+const LEGACY_TOOL_MARKER = /🔧\s*([A-Za-z][A-Za-z0-9_.-]{0,80})\s*:\s*/gu;
+
+function hasLegacyToolMarker(text: string): boolean {
+  LEGACY_TOOL_MARKER.lastIndex = 0;
+  for (let m = LEGACY_TOOL_MARKER.exec(text); m; m = LEGACY_TOOL_MARKER.exec(text)) {
+    if (parseToolLine(`🔧 ${m[1].trim()}: detail`)) return true;
+  }
+  return false;
+}
+
+function splitLegacyTools(
+  text: string,
+): Array<{ text: string } | { tool: { name: string; detail: string } }> {
+  const matches: Array<{
+    emojiStart: number;
+    detailStart: number;
+    name: string;
+  }> = [];
+
+  LEGACY_TOOL_MARKER.lastIndex = 0;
+  for (let m = LEGACY_TOOL_MARKER.exec(text); m; m = LEGACY_TOOL_MARKER.exec(text)) {
+    const name = m[1].trim();
+    if (!parseToolLine(`🔧 ${name}: detail`)) continue;
+    matches.push({
+      emojiStart: m.index,
+      detailStart: m.index + m[0].length,
+      name,
+    });
+  }
+
+  if (matches.length === 0) return text ? [{ text }] : [];
+
+  const out: Array<{ text: string } | { tool: { name: string; detail: string } }> = [];
+  let cursor = 0;
+  for (let i = 0; i < matches.length; i++) {
+    const current = matches[i];
+    const next = matches[i + 1];
+    const detailEnd = next ? next.emojiStart : legacyDetailEnd(text, current.detailStart);
+    const before = text.slice(cursor, current.emojiStart);
+    if (before) out.push({ text: before });
+    out.push({
+      tool: {
+        name: current.name,
+        detail: text.slice(current.detailStart, detailEnd).trim(),
+      },
+    });
+    cursor = detailEnd;
+  }
+  const tail = text.slice(cursor);
+  if (tail) out.push({ text: tail });
+  return out;
+}
+
+function legacyDetailEnd(text: string, detailStart: number): number {
+  const newline = text.indexOf('\n', detailStart);
+  if (newline !== -1) return newline;
+  return text.length;
 }
 

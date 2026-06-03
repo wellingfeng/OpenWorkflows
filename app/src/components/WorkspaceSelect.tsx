@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/cn';
 import { basename, pickFolder } from '@/lib/folderPicker';
 import { t } from '@/lib/i18n';
+import {
+  uniqueWorkspaceHistory,
+  workspacePathKey,
+} from '@/lib/workspaceHistory';
 import { useStore } from '@/store/useStore';
 
 /**
@@ -58,6 +62,8 @@ export default function WorkspaceSelect({
   };
 
   const label = value ? basename(value) : t(locale, 'workspace.choose');
+  const historyOptions = uniqueWorkspaceHistory(history);
+  const valueKey = value ? workspacePathKey(value) : '';
 
   return (
     <div ref={rootRef} className={cn('relative', className)}>
@@ -95,16 +101,17 @@ export default function WorkspaceSelect({
           <div className="px-3 pb-0.5 text-[10px] uppercase tracking-wider text-fg-faint">
             {t(locale, 'sidebar.history')}
           </div>
-          {history.length === 0 ? (
+          {historyOptions.length === 0 ? (
             <div className="px-3 py-1.5 text-xs text-fg-faint">
               {t(locale, 'workspace.noHistory')}
             </div>
           ) : (
             <ul role="listbox">
-              {history.map((path) => {
-                const active = path === value;
+              {historyOptions.map((path) => {
+                const active =
+                  valueKey !== '' && workspacePathKey(path) === valueKey;
                 return (
-                  <li key={path}>
+                  <li key={workspacePathKey(path)}>
                     <button
                       type="button"
                       role="option"

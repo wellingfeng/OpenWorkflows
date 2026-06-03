@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { IRGraph } from '@/core/ir';
 import { setActiveGatewaySelection } from '@/lib/gatewayConfig';
 import { PROVIDERS_STORAGE } from '@/lib/apiConfig';
+import { FREE_CHANNEL_PROVIDER_PREFIX } from '@/lib/freeChannels';
 import {
   resolveGatewayRoute,
   nodeGatewayOverride,
@@ -200,6 +201,41 @@ describe('model gateway compatibility', () => {
     expect(route.model).toBe('custom-model');
   });
 
+  it('normalizes known provider bare model ids before exporting CLI env', () => {
+    window.localStorage.setItem(
+      PROVIDERS_STORAGE,
+      JSON.stringify([
+        {
+          id: 'nvidia_provider',
+          kind: 'anthropic',
+          transport: 'cli',
+          name: 'NVIDIA Import',
+          apiKey: 'nvapi-test',
+          baseUrl: 'https://integrate.api.nvidia.com/v1',
+          model: 'nemotron-3-super-120b-a12b',
+        },
+      ]),
+    );
+
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = {
+      defaults: {
+        adapter: 'claude-code',
+        modelClass: 'sonnet',
+        providerId: 'nvidia_provider',
+        channelId: 'default',
+      },
+    };
+
+    const route = resolveGatewayRoute(workflow);
+
+    expect(route.model).toBe('nvidia/nemotron-3-super-120b-a12b');
+    expect(route.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+      ANTHROPIC_MODEL: 'nvidia/nemotron-3-super-120b-a12b',
+    });
+  });
+
   it('uses system CLI defaults without provider env when systemDefault is selected', () => {
     window.localStorage.setItem(
       PROVIDERS_STORAGE,
@@ -231,6 +267,24 @@ describe('model gateway compatibility', () => {
     expect(route.channelId).toBeUndefined();
     expect(route.env).toBeUndefined();
     expect(route.model).toBeUndefined();
+  });
+
+  it('does not resolve stale unconfigured free-channel selections', () => {
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = {
+      defaults: {
+        adapter: 'claude-code',
+        modelClass: 'sonnet',
+        providerId: `${FREE_CHANNEL_PROVIDER_PREFIX}ollama`,
+        channelId: 'default',
+      },
+    };
+
+    const route = resolveGatewayRoute(workflow);
+
+    expect(route.transport).toBe('cli');
+    expect(route.baseUrl).toBeUndefined();
+    expect(route.env).toBeUndefined();
   });
 
   it('prefers cli-backed Claude providers over stale browser-direct defaults', () => {

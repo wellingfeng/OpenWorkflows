@@ -4,10 +4,10 @@
 
 <h1 align="center">OpenWorkflows</h1>
 
-<h3 align="center">Visual multi-model workflow editor for agent runtimes.</h3>
+<h3 align="center">Use free and low-cost models as dynamic coding workflows.</h3>
 
 <p align="center">
-  Build one Workflow graph, compile it into runnable scripts, and adapt it across Claude Code, Codex, Gemini, and future local or cloud model runtimes.
+  OpenWorkflows is a local desktop coding tool that combines free-model routing with editable Dynamic Workflows. It turns cheap and free models into multi-agent flows that research, generate, challenge, vote, and retry so difficult programming tasks can get higher accuracy without sending every step to the most expensive model.
 </p>
 
 <p align="center">
@@ -39,7 +39,7 @@
 </p>
 
 <p align="center">
-  <a href="app/package.json"><img src="https://img.shields.io/badge/version-0.1.12-2F6FED?style=flat-square&labelColor=161b22" alt="version 0.1.12"></a>
+  <a href="app/package.json"><img src="https://img.shields.io/badge/version-0.2.2-2F6FED?style=flat-square&labelColor=161b22" alt="version 0.2.2"></a>
   <a href="app/src-tauri/tauri.conf.json"><img src="https://img.shields.io/badge/Tauri-2.11-24C8DB?style=flat-square&labelColor=161b22&logo=tauri&logoColor=white" alt="Tauri 2.11"></a>
   <a href="app/package.json"><img src="https://img.shields.io/badge/React-18-61DAFB?style=flat-square&labelColor=161b22&logo=react&logoColor=white" alt="React 18"></a>
   <a href="app/package.json"><img src="https://img.shields.io/badge/TypeScript-5.6-3178C6?style=flat-square&labelColor=161b22&logo=typescript&logoColor=white" alt="TypeScript 5.6"></a>
@@ -55,16 +55,60 @@
 > [!IMPORTANT]
 > **Community · 加入社区** — join the OpenWorkflows Discord or QQ group for setup help, workflow examples, feature ideas, and contributor coordination. Discord: <https://discord.gg/2C9ptSEFG> · QQ Group: `149523963`
 
-## What OpenWorkflows Does
+## Why OpenWorkflows
 
-Claude Code introduced Workflow-style scripts for orchestrating multi-agent steps, parallel branches, and pipelines. OpenWorkflows turns that pattern into a visual editor with a portable intermediate representation, so the same graph can be edited, compiled, parsed, and adapted across different agent runtimes.
+Modern coding agents become much more reliable when they do not answer once and stop. Dynamic Workflows improve output quality by splitting a request into multiple agents, exploring from different angles, validating adversarially, and voting over competing answers. The tradeoff is cost: a serious workflow can burn through premium-model quota quickly.
 
-- Generate an editable Workflow blueprint from a natural-language goal.
-- Author agent steps, parallel branches, pipelines, branches, loops, consensus nodes, and reusable composite workflows on a React Flow canvas.
-- Compile the graph into runnable Claude Code-style Workflow scripts, then parse scripts back into the same graph model.
-- Select runtime-facing adapters such as Claude Code, Codex, or Gemini, with per-node model and provider settings.
-- Run or stop workflows from the desktop app while tracking node-level execution state.
-- Keep workspaces, sessions, prompt shortcuts, API configuration, and local history on your machine.
+OpenWorkflows makes that pattern visible, editable, and cheaper:
+
+- Use free or low-cost channels such as Gemini, DeepSeek, Kimi, Groq, OpenRouter, NVIDIA NIM, Z.ai, Ollama, LM Studio, and llama.cpp.
+- Fan out only the steps that need extra certainty; keep simple steps as single-pass calls.
+- Let critical coding tasks pass through multi-angle research, adversarial review, tournament selection, or self-consistency voting.
+- Route different nodes to different runtimes and model tiers, so expensive models are reserved for judgment, review, or high-risk steps.
+- Keep the whole workflow graph local, inspectable, exportable, and reusable.
+
+OpenWorkflows is not just a chat UI. It is a way to turn a collection of cheap models into a structured programming workflow.
+
+## What It Can Do
+
+### Free-Model Coding Chat
+
+- **17+ built-in channels**: NVIDIA NIM, OpenRouter, Google Gemini, DeepSeek, Mistral, Mistral Codestral, Groq, Cerebras, Fireworks, Kimi, Z.ai, OpenCode, Wafer, plus local runtimes such as Ollama, LM Studio, and llama.cpp.
+- Local Rust proxy translates between Anthropic and OpenAI-compatible protocols, so the same interface can talk to different providers.
+- API keys stay on your machine. Local runtimes can run with zero API keys.
+
+### Dynamic Workflow Canvas
+
+- Generate an editable workflow blueprint from a natural-language coding goal.
+- Build agent steps, parallel branches, pipelines, loops, branches, consensus nodes, and reusable composite workflows on a React Flow canvas.
+- Compile the graph into runnable Claude Code-style workflow scripts, then parse scripts back into the same graph model.
+- Run workflows from the desktop app while tracking node-level execution state.
+- Export and import workflow graphs as portable `.owf.json` files.
+
+### Multi-Round Accuracy Loop
+
+OpenWorkflows supports the quality patterns that make Dynamic Workflows useful for programming:
+
+| Pattern | Use it for | What happens |
+| --- | --- | --- |
+| Multi-angle research | Ambiguous requirements, architecture, migrations | Several agents inspect the same goal from different lenses before generation. |
+| Adversarial validation | Security, code review, risky refactors | Candidate answers are challenged and only conclusions that survive critique are kept. |
+| Tournament selection | Competing implementation plans | Multiple plans are scored; the winner can absorb useful ideas from the others. |
+| Self-consistency voting | Deterministic decisions and structured outputs | The same prompt runs multiple times and the majority answer is selected. |
+| Adaptive escalation | Hard nodes and final verification | The runner can start with a small sample count, measure disagreement, and add more samples only when needed. |
+
+### Runtime and Model Routing
+
+- Use Claude Code, Codex, Gemini, or extensible provider routing.
+- Configure model/provider choices globally or per node.
+- Route Claude Code through free channels via the local proxy.
+- Use cheaper models for discovery and stronger models for synthesis, review, or final judgment.
+
+### Local-First Workspace
+
+- Sessions, favorites, history, API keys, and workflow files are stored locally.
+- Chat sessions and workflow sessions are both preserved in the sidebar history.
+- No hosted OpenWorkflows server is required.
 
 ## Quick Start
 
@@ -96,13 +140,22 @@ From the repository root, `run.bat` rebuilds when needed and launches the Window
 
 ## Basic Usage
 
-1. Create a workflow or open an existing session.
-2. Describe the goal in the bottom-right AI input. OpenWorkflows generates an editable blueprint.
-3. Refine the blueprint with follow-up instructions, or use the right-panel prompt shortcuts for structure, completeness, cost, reliability, and rollback-oriented edits.
-4. Select nodes to edit prompts, model tiers, schemas, ports, or execution parameters.
-5. Choose a runtime adapter such as Claude Code, Codex, or Gemini.
-6. Click **Run** to execute the graph and watch per-node status updates.
-7. Switch workspaces or sessions from the history rail to continue earlier work.
+### Chat With a Free Channel
+
+1. Click **+ New Session** in the sidebar.
+2. Pick a free channel, for example Gemini, DeepSeek, Kimi, Groq, or Ollama.
+3. Paste the provider API key if the channel needs one. Local runtimes need only a running local server and a model override.
+4. Ask a coding question in the bottom input.
+5. Star the session if you want it pinned in **Favorites**.
+
+### Build a Coding Workflow
+
+1. Click **+ New Workflow**.
+2. Describe the programming task in the AI input: code review, migration, refactor plan, bug investigation, test generation, architecture audit, or implementation plan.
+3. Let OpenWorkflows generate a blueprint, then refine it with follow-up instructions or right-panel prompt shortcuts for structure, completeness, cost, reliability, and rollback.
+4. Select important nodes and configure prompt text, schema, model tier, provider, or execution parameters.
+5. Convert high-risk nodes to **Consensus** when they need adversarial checking or voting.
+6. Click **Run** and watch node-level status updates.
 
 ## CLI Preview
 
@@ -127,6 +180,33 @@ node app/cli/dist/owf.mjs run review.js --dry-run
 
 See [OpenWorkflows CLI usage](app/doc/openworkflows-cli-usage.md) and the [CLI skill spec](app/doc/openworkflows-cli-skill-spec.md) for details.
 
+## How It Works
+
+`IRGraph` is the single source of truth. The canvas, parser, emitter, AI mutation path, runtime, and local persistence all operate on the same model-agnostic graph.
+
+```text
+Coding goal
+    |
+    +-- Chat mode ------> simpleBlueprint -> single-node IRGraph -> free-channel proxy -> answer
+    |
+    +-- Workflow mode --> multi-angle research -> blueprint consensus -> IRGraph -> React Flow canvas
+                                                                       |
+                                                                       +--> emitter -> runnable workflow script
+                                                                       |
+                                                                       +--> parser  -> round-trip graph recovery
+                                                                       |
+                                                                       +--> runtime -> Claude Code / Codex / Gemini
+                                                                                     |
+                                                                                     +--> consensus / vote / retry
+```
+
+Free-channel proxy:
+
+- Runs locally and binds to `127.0.0.1:<port>`.
+- Routes each channel through `http://127.0.0.1:<port>/ch/<channelId>`.
+- Translates Anthropic and OpenAI-compatible streaming protocols.
+- Lets Claude Code use non-Anthropic and local providers through the same gateway path.
+
 ## Technology Stack
 
 | Area | Technology |
@@ -138,39 +218,29 @@ See [OpenWorkflows CLI usage](app/doc/openworkflows-cli-usage.md) and the [CLI s
 | Styling | Tailwind CSS, CSS variables |
 | Icons | lucide-react |
 | Workflow core | `IRGraph`, parser, emitter, round-trip checks |
+| Runtime | DAG execution, provider gateway, per-node status, consensus runner |
+| Free-channel proxy | Rust `tiny_http` + `ureq`, Anthropic/OpenAI protocol translation |
 | Runtime adapters | Claude Code, Codex, Gemini, extensible provider routing |
 
-## Architecture
-
-`IRGraph` is the single source of truth. The canvas, parser, emitter, AI mutation path, and runtime all operate on the same model-agnostic graph:
-
-```text
-Natural-language goal
-        |
-        v
-AI blueprint generation  ->  IRGraph  ->  React Flow canvas
-                                |
-                                +----> emitter -> runnable Workflow script
-                                |
-                                +----> parser  -> round-trip graph recovery
-                                |
-                                +----> runtime -> Claude Code / Codex / Gemini
-```
-
-Core files:
+## Project Structure
 
 ```text
 app/
   src/
-    core/        IR, parser, emitter, fixtures, round-trip checks
+    core/        IR, parser, emitter, fixtures, consensus heuristics, round-trip checks
     canvas/      React Flow projection, node components, toolbar
-    panels/      Sidebar, prompt panel, AI dock, node inspector
-    runtime/     DAG execution, provider gateway, run state
+    panels/      Sidebar, prompt panel, AI dock, node inspector, settings
+    runtime/     DAG execution, provider gateway, consensus, run state
     store/       Zustand state and history
-  src-tauri/     Tauri commands, filesystem/history bridge, packaging config
-  doc/           Tutorials, localized READMEs, CLI docs, screenshots
-docs/            Research notes, static docs, assets
-pencil/          Pencil design files
+    lib/
+      freeChannels.ts  17+ free channel catalog + helpers
+  src-tauri/
+    src/
+      free_proxy.rs    Rust reverse proxy + Anthropic/OpenAI translation
+      lib.rs           Tauri commands, filesystem/history bridge
+  doc/                 Tutorials, localized READMEs, CLI docs, screenshots
+docs/                  Research notes, static docs, assets
+pencil/                Pencil design files
 ```
 
 ## Documentation

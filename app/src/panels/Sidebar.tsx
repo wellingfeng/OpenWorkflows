@@ -1,5 +1,19 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
-import { Download, Pencil, Search, Star, Trash2, Upload, X } from 'lucide-react';
+import {
+  useState,
+  useCallback,
+  useEffect,
+  useMemo,
+  type CSSProperties,
+} from 'react';
+import {
+  Download,
+  Pencil,
+  Search,
+  Star,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react';
 import StatusIndicator, { type StatusTone } from '@/components/StatusIndicator';
 import {
   sessionLiveStatus,
@@ -7,6 +21,7 @@ import {
   workflowDeleteProtectionReason,
   workflowSessionKeyId,
   type WorkflowDeleteProtectionReason,
+  type WorkflowSessionKey,
 } from '@/store/useStore';
 import type { Session } from '@/store/types';
 import type { WorkspaceSummary } from '@/store/history/types';
@@ -39,9 +54,89 @@ function formatTime(ts: number): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${hhmm}`;
 }
 
-const WORKFLOW_HISTORY_PAGE_SIZE = 10;
-const MAX_WORKFLOW_RENAME_LENGTH = 80;
+const WORKFLOW_HISTORY_PAGE_SIZE = 5;
+const MAX_SESSION_RENAME_LENGTH = 80;
 type SidebarTab = 'history' | 'favorites';
+type SidebarLiveState = {
+  runningSessions: WorkflowSessionKey[];
+  aiEditingSessions: WorkflowSessionKey[];
+  chattingSessions: WorkflowSessionKey[];
+};
+type WorkspaceToneStyle = CSSProperties & {
+  '--owf-workspace-bg': string;
+  '--owf-workspace-bg-hover': string;
+  '--owf-workspace-bg-active': string;
+  '--owf-workspace-chip-bg': string;
+  '--owf-workspace-mark': string;
+};
+
+const WORKSPACE_TONE_HUES = [44, 86, 136, 168, 198, 224, 252, 278];
+
+function workspaceToneHash(workspaceId: string): number {
+  let hash = 0;
+  for (let i = 0; i < workspaceId.length; i += 1) {
+    hash = (hash * 31 + workspaceId.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function workspaceToneStyle(workspaceId: string): WorkspaceToneStyle {
+  const hash = workspaceToneHash(workspaceId);
+  const hue = WORKSPACE_TONE_HUES[hash % WORKSPACE_TONE_HUES.length];
+  const saturation = 24 + (Math.floor(hash / 8) % 4) * 2;
+  const lightness = 42 + (Math.floor(hash / 32) % 3) * 3;
+  return {
+    '--owf-workspace-bg': `hsl(${hue} ${saturation}% ${lightness}% / 0.12)`,
+    '--owf-workspace-bg-hover': `hsl(${hue} ${saturation}% ${lightness}% / 0.17)`,
+    '--owf-workspace-bg-active': `hsl(${hue} ${saturation + 3}% ${lightness + 2}% / 0.22)`,
+    '--owf-workspace-chip-bg': `hsl(${hue} ${saturation + 3}% ${lightness + 2}% / 0.15)`,
+    '--owf-workspace-mark': `hsl(${hue} ${saturation + 14}% ${lightness + 18}% / 0.82)`,
+  };
+}
+
+function sessionSortTimestamp(session: Session): number {
+  return session.updatedAt ?? session.createdAt;
+}
+
+function sessionLiveRank(
+  session: Session,
+  workspaceId: string | null,
+  liveState: SidebarLiveState,
+): number {
+  const liveStatus = sessionLiveStatus(
+    { workspaceId, sessionId: session.id },
+    liveState,
+  );
+  if (liveStatus === 'running') return 0;
+  if (liveStatus === 'aiEditing') return 1;
+  return 2;
+}
+
+function sortHistorySessions(
+  sessions: Session[],
+  workspaceId: string | null,
+  liveState: SidebarLiveState,
+): Session[] {
+  return [...sessions].sort((a, b) => {
+    const liveDiff =
+      sessionLiveRank(a, workspaceId, liveState) -
+      sessionLiveRank(b, workspaceId, liveState);
+    if (liveDiff !== 0) return liveDiff;
+    return sessionSortTimestamp(b) - sessionSortTimestamp(a);
+  });
+}
+
+function workspaceLiveRank(
+  sessions: Session[],
+  workspaceId: string,
+  liveState: SidebarLiveState,
+): number {
+  return sessions.reduce(
+    (best, session) =>
+      Math.min(best, sessionLiveRank(session, workspaceId, liveState)),
+    2,
+  );
+}
 
 function clampPercent(percent: number | null | undefined): number | null {
   if (percent == null || !Number.isFinite(percent)) return null;
@@ -92,6 +187,22 @@ function historyStatusTone(
   return session.isWorkflow ? 'unrun' : null;
 }
 
+function SessionKindBadge({
+  isWorkflow,
+  simple,
+}: {
+  isWorkflow: boolean;
+  simple: boolean;
+}) {
+  const chat = !isWorkflow || simple;
+  const className =
+    'inline-flex h-5 min-w-8 shrink-0 items-center justify-center rounded bg-border-soft px-1 font-mono text-[9px] leading-4 ' +
+    (chat
+      ? 'text-accent-3 opacity-75'
+      : 'text-accent-2 opacity-75');
+  return <span className={className}>{chat ? 'CHAT' : 'WF'}</span>;
+}
+
 function deleteProtectionLabel(
   locale: Locale,
   reason: WorkflowDeleteProtectionReason,
@@ -130,7 +241,7 @@ function sessionMatchesSearch(
 }
 
 function sessionVisibleInTab(session: Session, tab: SidebarTab): boolean {
-  return tab === 'history' || (session.isWorkflow && session.favorite === true);
+  return tab === 'history' || session.favorite === true;
 }
 
 function FavoriteMarker({
@@ -178,7 +289,7 @@ export default function Sidebar() {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTab, setActiveTab] = useState<SidebarTab>('history');
 
-  // ── Context menu for session deletion ────────────────────────────────────
+  // ── Context menu for session actions ─────────────────────────────────────
   type MenuState =
     | null
     | {
@@ -338,7 +449,7 @@ export default function Sidebar() {
   }, [exportWorkflowSession, locale, menu]);
 
   const handleToggleFavorite = useCallback(() => {
-    if (!menu?.isWorkflow) return;
+    if (!menu) return;
     void setWorkflowFavoriteSession(
       menu.sessionId,
       menu.workspaceId,
@@ -357,7 +468,7 @@ export default function Sidebar() {
   }, [importWorkflowToWorkspace, locale, workspaceMenu]);
 
   const handleStartRename = useCallback(() => {
-    if (!menu?.isWorkflow) return;
+    if (!menu) return;
     setRenaming({
       sessionId: menu.sessionId,
       workspaceId: menu.workspaceId,
@@ -396,7 +507,7 @@ export default function Sidebar() {
         setRenameError(t(locale, 'sidebar.renameErrorEmpty'));
         return;
       }
-      if (trimmed.length > MAX_WORKFLOW_RENAME_LENGTH) {
+      if (trimmed.length > MAX_SESSION_RENAME_LENGTH) {
         setRenameError(t(locale, 'sidebar.renameErrorTooLong'));
         return;
       }
@@ -407,7 +518,6 @@ export default function Sidebar() {
       const duplicate = siblingSessions.some(
         (item) =>
           item.id !== session.id &&
-          item.isWorkflow &&
           item.title.trim() === trimmed,
       );
       if (duplicate) {
@@ -462,6 +572,10 @@ export default function Sidebar() {
 
   const normalizedQuery = searchQuery.trim().toLowerCase();
   const isSearching = normalizedQuery.length > 0;
+  const sidebarLiveState = useMemo(
+    () => ({ runningSessions, aiEditingSessions, chattingSessions }),
+    [aiEditingSessions, chattingSessions, runningSessions],
+  );
 
   const totalTreeSessions = useMemo(
     () =>
@@ -488,8 +602,12 @@ export default function Sidebar() {
 
   const tabFlatSessions = useMemo(
     () =>
-      sessions.filter((session) => sessionVisibleInTab(session, activeTab)),
-    [activeTab, sessions],
+      sortHistorySessions(
+        sessions.filter((session) => sessionVisibleInTab(session, activeTab)),
+        null,
+        sidebarLiveState,
+      ),
+    [activeTab, sessions, sidebarLiveState],
   );
 
   const hasHistory =
@@ -518,8 +636,12 @@ export default function Sidebar() {
     () =>
       workspaces
         .map((workspace) => {
-          const tabSessions = (sessionTree[workspace.id] ?? []).filter(
-            (session) => sessionVisibleInTab(session, activeTab),
+          const tabSessions = sortHistorySessions(
+            (sessionTree[workspace.id] ?? []).filter((session) =>
+              sessionVisibleInTab(session, activeTab),
+            ),
+            workspace.id,
+            sidebarLiveState,
           );
           return {
             workspace,
@@ -535,8 +657,15 @@ export default function Sidebar() {
           if (normalizedQuery) return group.sessions.length > 0;
           if (activeTab === 'favorites') return group.tabSessions.length > 0;
           return true;
+        })
+        .sort((a, b) => {
+          const liveDiff =
+            workspaceLiveRank(a.sessions, a.workspace.id, sidebarLiveState) -
+            workspaceLiveRank(b.sessions, b.workspace.id, sidebarLiveState);
+          if (liveDiff !== 0) return liveDiff;
+          return b.workspace.updatedAt - a.workspace.updatedAt;
         }),
-    [activeTab, normalizedQuery, sessionTree, workspaces],
+    [activeTab, normalizedQuery, sessionTree, sidebarLiveState, workspaces],
   );
 
   const filteredFlatSessions = useMemo(
@@ -772,27 +901,36 @@ export default function Sidebar() {
                       workspaceLimits[workspace.id] ??
                         WORKFLOW_HISTORY_PAGE_SIZE,
                     );
+                const workspaceActive = workspace.id === activeWorkspaceId;
                 return (
                   <li key={workspace.id} className="flex flex-col gap-1">
                     <div
-                      className="px-2 py-1"
+                      className={
+                        'rounded-md px-2.5 py-1.5 transition-colors ' +
+                        (workspaceActive
+                          ? 'bg-[var(--owf-workspace-bg-active)]'
+                          : 'bg-[var(--owf-workspace-bg)] hover:bg-[var(--owf-workspace-bg-hover)]')
+                      }
+                      style={workspaceToneStyle(workspace.id)}
                       onContextMenu={(e) =>
                         onWorkspaceContextMenu(e, workspace.id)
                       }
                     >
-                      <div className="flex items-center gap-1.5 text-[11px] font-medium text-fg">
-                        <span className="text-accent-2">▾</span>
+                      <div className="flex items-center gap-1.5 text-[11px] font-semibold text-fg">
+                        <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded bg-[var(--owf-workspace-chip-bg)] text-[var(--owf-workspace-mark)]">
+                          ▾
+                        </span>
                         <span className="min-w-0 flex-1 truncate" title={workspace.path}>
                           {workspace.name}
                         </span>
-                        <span className="font-mono text-[10px] text-fg-faint">
+                        <span className="rounded bg-[var(--owf-workspace-chip-bg)] px-1.5 py-0.5 font-mono text-[10px] leading-none text-fg-dim">
                           {activeTab === 'favorites'
                             ? fullList.length
                             : workspace.sessionCount}
                         </span>
                       </div>
                       {workspace.path && (
-                        <div className="truncate pl-4 font-mono text-[9px] text-fg-faint">
+                        <div className="truncate pl-[1.375rem] font-mono text-[9px] text-fg-faint">
                           {workspace.path}
                         </div>
                       )}
@@ -849,22 +987,10 @@ export default function Sidebar() {
                                   }
                                 >
                                   <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
-                                    <span
-                                      className={
-                                        'rounded border px-1 font-mono text-[9px] leading-4 ' +
-                                        (session.isWorkflow
-                                          ? session.simple
-                                            ? 'border-accent-3/50 text-accent-3'
-                                            : 'border-accent-2/50 text-accent-2'
-                                          : 'border-border text-fg-faint')
-                                      }
-                                    >
-                                      {session.isWorkflow
-                                        ? session.simple
-                                          ? 'SW'
-                                          : 'WF'
-                                        : 'CHAT'}
-                                    </span>
+                                    <SessionKindBadge
+                                      isWorkflow={session.isWorkflow}
+                                      simple={session.simple === true}
+                                    />
                                     <input
                                       autoFocus
                                       aria-label={t(locale, 'sidebar.renameSession')}
@@ -955,22 +1081,10 @@ export default function Sidebar() {
                                   }
                                 >
                                   <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
-                                    <span
-                                      className={
-                                        'rounded border px-1 font-mono text-[9px] leading-4 ' +
-                                        (session.isWorkflow
-                                          ? session.simple
-                                            ? 'border-accent-3/50 text-accent-3'
-                                            : 'border-accent-2/50 text-accent-2'
-                                          : 'border-border text-fg-faint')
-                                      }
-                                    >
-                                      {session.isWorkflow
-                                        ? session.simple
-                                          ? 'SW'
-                                          : 'WF'
-                                        : 'CHAT'}
-                                    </span>
+                                    <SessionKindBadge
+                                      isWorkflow={session.isWorkflow}
+                                      simple={session.simple === true}
+                                    />
                                     <span className="flex min-w-0 flex-1 items-center gap-1">
                                       <FavoriteMarker
                                         favorite={session.favorite === true}
@@ -1063,14 +1177,10 @@ export default function Sidebar() {
                         }
                       >
                         <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
-                          <span
-                            className={
-                              'text-[10px] leading-none ' +
-                              (active ? 'text-accent-2' : 'text-fg-faint')
-                            }
-                          >
-                            ●
-                          </span>
+                          <SessionKindBadge
+                            isWorkflow={session.isWorkflow}
+                            simple={session.simple === true}
+                          />
                           <input
                             autoFocus
                             aria-label={t(locale, 'sidebar.renameSession')}
@@ -1096,7 +1206,7 @@ export default function Sidebar() {
                           />
                           <StatusIndicator label={statusLabel} tone={status} />
                         </span>
-                        <span className="flex w-full items-center gap-1 pl-3.5">
+                        <span className="flex w-full items-center gap-1 pl-10">
                           <button
                             type="button"
                             disabled={renameSaving}
@@ -1121,7 +1231,7 @@ export default function Sidebar() {
                           </button>
                         </span>
                         {renameError && (
-                          <span className="pl-3.5 text-[11px] leading-snug text-rose-300">
+                          <span className="pl-10 text-[11px] leading-snug text-rose-300">
                             {renameError}
                           </span>
                         )}
@@ -1150,14 +1260,10 @@ export default function Sidebar() {
                         }
                       >
                         <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
-                          <span
-                            className={
-                              'text-[10px] leading-none ' +
-                              (active ? 'text-accent-2' : 'text-fg-faint')
-                            }
-                          >
-                            ●
-                          </span>
+                          <SessionKindBadge
+                            isWorkflow={session.isWorkflow}
+                            simple={session.simple === true}
+                          />
                           <span className="flex min-w-0 flex-1 items-center gap-1">
                             <FavoriteMarker
                               favorite={session.favorite === true}
@@ -1169,8 +1275,8 @@ export default function Sidebar() {
                           </span>
                           <StatusIndicator label={statusLabel} tone={status} />
                         </span>
-                        <span className="pl-3.5 font-mono text-[10px] text-fg-faint">
-                          {formatTime(session.createdAt)}
+                        <span className="pl-10 font-mono text-[10px] text-fg-faint">
+                          {formatTime(session.updatedAt ?? session.createdAt)}
                         </span>
                       </button>
                     )}
@@ -1214,9 +1320,9 @@ export default function Sidebar() {
           x={menu.x}
           y={menu.y}
           locale={locale}
-          canFavorite={menu.isWorkflow}
+          canFavorite={true}
           isFavorite={menu.favorite}
-          canRename={menu.isWorkflow}
+          canRename={true}
           canExportWorkflow={menu.isWorkflow && !menu.simple}
           deleteDisabledReason={deleteProtectionLabel(
             locale,
