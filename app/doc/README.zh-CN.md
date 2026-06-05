@@ -50,6 +50,16 @@ AI 编程工具确实好用，但高级模型额度消耗很快。FreeUltraCode 
 | Kilo Gateway | `poolside/laguna-xs.2:free` |
 | LLM7 | `codestral-latest` |
 
+### 动态工作流 (/ultracode)
+
+对于复杂的多步骤编程任务，`/ultracode <任务>` 会即时生成一个专属的执行 harness 并立即运行，无需可视化画布。
+
+- 用自然语言描述任务 — planner 自动构建包含并行子代理、对抗验证和验收门的 harness。
+- 六种内部策略自动选择：分类执行、扇出合成、对抗验证、生成筛选、锦标赛、循环至完成。
+- 每次运行都在 `.fuc-run/<run-id>/` 下完整记录：任务账本、事件、裁决和最终结果。
+- 可在桌面端直接使用，或通过命令行：`fuc ultracode "<任务>" --json --interactive --cwd <workspace>`。
+- 零配置 — 复用本地 `claude` CLI 登录态。
+
 ### 本地优先
 
 - 会话、收藏、定时提示词、API Key 和 workspace 历史都保存在本机。

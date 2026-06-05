@@ -97,6 +97,16 @@ Current default coding-oriented models:
 | Kilo Gateway | `poolside/laguna-xs.2:free` |
 | LLM7 | `codestral-latest` |
 
+### Dynamic Workflow (/ultracode)
+
+For complex multi-step coding tasks, `/ultracode <task>` generates a purpose-built execution harness on the fly and runs it immediately — no visual canvas needed.
+
+- Describe the task in natural language. The planner builds a harness with parallel subagents, adversarial verification, and acceptance gates.
+- Six internal strategies are chosen automatically: classify-and-act, fan-out-and-synthesize, adversarial-verification, generate-and-filter, tournament, and loop-until-done.
+- Every run is fully logged under `.fuc-run/<run-id>/` with a task ledger, events, verdict, and final result.
+- Run from the desktop app or the CLI: `fuc ultracode "<task>" --json --interactive --cwd <workspace>`.
+- Zero config — reuses local `claude` CLI login credentials.
+
 ### Local-First Workspace
 
 - Sessions, favorites, scheduled prompts, API keys, and workspace history are stored locally.

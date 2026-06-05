@@ -50,6 +50,16 @@ Aktuelle programmierorientierte Standardmodelle:
 | Kilo Gateway | `poolside/laguna-xs.2:free` |
 | LLM7 | `codestral-latest` |
 
+### Dynamischer Workflow (/ultracode)
+
+Für komplexe mehrstufige Programmieraufgaben generiert `/ultracode <Aufgabe>` spontan ein maßgeschneidertes Ausführungs-Harness und führt es sofort aus. Kein visuelles Canvas nötig.
+
+- Beschreibe die Aufgabe in natürlicher Sprache — der Planer baut ein Harness mit parallelen Subagenten, adversarieller Verifikation und Akzeptanzgattern.
+- Sechs interne Strategien werden automatisch gewählt: Klassifizieren & Handeln, Fächer & Synthese, Adversarielle Verifikation, Generieren & Filtern, Turnier, Schleife bis zur Fertigstellung.
+- Jeder Lauf wird vollständig unter `.fuc-run/<run-id>/` protokolliert: Aufgabenbuch, Ereignisse, Urteil und Endergebnis.
+- Ausführung über die Desktop-App oder CLI: `fuc ultracode "<Aufgabe>" --json --interactive --cwd <workspace>`.
+- Null Konfiguration — verwendet die lokalen `claude` CLI-Anmeldeinformationen.
+
 ## Schnellstart
 
 ```bash

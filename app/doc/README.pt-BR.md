@@ -50,6 +50,16 @@ Modelos padrão voltados para programação:
 | Kilo Gateway | `poolside/laguna-xs.2:free` |
 | LLM7 | `codestral-latest` |
 
+### Workflow dinâmico (/ultracode)
+
+Para tarefas complexas de programação com várias etapas, `/ultracode <tarefa>` gera na hora um harness de execução sob medida e o executa imediatamente. Nenhum canvas visual necessário.
+
+- Descreva a tarefa em linguagem natural — o planejador constrói um harness com subagentes paralelos, verificação adversarial e portões de aceitação.
+- Seis estratégias internas são escolhidas automaticamente: classificar-e-agir, leque-e-síntese, verificação-adversarial, gerar-e-filtrar, torneio, repetir-até-concluir.
+- Cada execução é totalmente registrada em `.fuc-run/<run-id>/` com livro de tarefas, eventos, veredito e resultado final.
+- Execute pelo app desktop ou pela CLI: `fuc ultracode "<tarefa>" --json --interactive --cwd <workspace>`.
+- Configuração zero — reutiliza as credenciais de login do `claude` CLI local.
+
 ## Início rápido
 
 ```bash
