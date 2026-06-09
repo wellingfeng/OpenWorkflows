@@ -1,0 +1,26 @@
+<svg width="300" height="96" viewBox="0 0 300 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">API NODE sponsor logo</title>
+  <desc id="desc">Text logo for API NODE, an AI API gateway sponsor.</desc>
+  <defs>
+    <linearGradient id="bg" x1="20" y1="12" x2="282" y2="86" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="41" y1="20" x2="257" y2="80" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38BDF8"/>
+      <stop offset=".55" stop-color="#2F6FED"/>
+      <stop offset="1" stop-color="#22C55E"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="284" height="80" rx="18" fill="url(#bg)"/>
+  <rect x="8.75" y="8.75" width="282.5" height="78.5" rx="17.25" stroke="url(#accent)" stroke-opacity=".82" stroke-width="1.5"/>
+  <path d="M37 33 L53 24 L69 33 L69 52 L53 61 L37 52 Z" stroke="#7DD3FC" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M53 24 V61 M37 33 L69 52 M69 33 L37 52" stroke="#22C55E" stroke-width="2.6" stroke-linecap="round" stroke-opacity=".9"/>
+  <circle cx="53" cy="24" r="4" fill="#E0F2FE"/>
+  <circle cx="37" cy="52" r="4" fill="#E0F2FE"/>
+  <circle cx="69" cy="52" r="4" fill="#E0F2FE"/>
+
+  <text x="88" y="48" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="25" font-weight="800" letter-spacing="1.2">API NODE</text>
+  <text x="90" y="68" fill="#A7F3D0" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" letter-spacing="1.8">AI GATEWAY</text>
+</svg>
