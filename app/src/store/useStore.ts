@@ -61,6 +61,7 @@ import {
   recordModelCall,
   timeoutPolicyForSelection,
 } from '@/lib/modelSpeed';
+import { recordEstimatedModelUsageForSelection } from '@/lib/usageMeter';
 import {
   appendStartUserInputs,
   readStartUserInputs,
@@ -81,6 +82,11 @@ import { getCliRuntimeSnapshot } from '@/lib/cliConfig';
 import { maybeRunCcSwitchAutoImportOnFirstRun } from '@/lib/ccSwitchAutoImport';
 import { ensureFreeProxy, isFreeChannelSelection } from '@/lib/freeChannels';
 import { getManifestModeEnabled } from '@/lib/manifestMode';
+import {
+  isNotifiableCompletionStatus,
+  notifySessionComplete,
+  setSessionNotificationClickHandler,
+} from '@/lib/sessionNotification';
 import {
   generateImage,
   imageProviderById,
@@ -247,6 +253,11 @@ import {
   importWorkflowFromFile,
 } from '@/lib/persist';
 import {
+  ensureCachedSessionChangesBaseline,
+  refreshCachedSessionChanges,
+  sessionChangesCacheKey,
+} from '@/lib/sessionChanges';
+import {
   historyStore,
   isAutoTitlePlaceholder,
   titleFromText,
@@ -408,11 +419,11 @@ export interface StoreState {
   modelOptions: SelectOption[];
   /** Previously-selected workspace folders, most-recent-first. */
   workspaceHistory: string[];
-  /** True once `.worktree` history has been loaded or gracefully skipped. */
+  /** True once `.freeultracode` history has been loaded or gracefully skipped. */
   historyReady: boolean;
   /** Last history initialization failure, shown instead of sample sessions. */
   historyError: string | null;
-  /** Resolved `.worktree` root path for diagnostics. */
+  /** Resolved `.freeultracode` root path for diagnostics. */
   historyRootPath: string | null;
   /** Workspace buckets rendered as the first level of the history tree. */
   workspaces: WorkspaceSummary[];
@@ -530,6 +541,10 @@ export interface StoreState {
    * and surfacing their saved path + an inline preview). Returns the message id.
    */
   appendChatNote: (text: string, role?: 'user' | 'assistant' | 'system') => string;
+  /** Delete one message from the active conversation and persist the transcript. */
+  deleteMessage: (messageId: string) => void;
+  /** Create a new chat session containing messages up to the chosen assistant reply. */
+  branchSessionFromMessage: (messageId: string) => void;
   clearBlockedSendTip: () => void;
   /**
    * Submit the user's answer to an interactive node message (the AI-return dock
@@ -547,6 +562,8 @@ export interface StoreState {
   setComposerDraft: (text: string) => void;
   appendComposerDraft: (text: string) => void;
   setWorkspace: (path: string) => void;
+  addWorkspaceFolder: (path: string) => void;
+  removeWorkspaceFolder: (path: string) => void;
   removeWorkspace: (path: string) => void;
 
   // Graph editing
@@ -653,6 +670,129 @@ function activeWorkflowSessionKey(
   };
 }
 
+type SessionChangesRootState = Pick<
+  StoreState,
+  | 'activeSessionId'
+  | 'activeWorkspaceId'
+  | 'composer'
+  | 'composerBySession'
+  | 'workspaces'
+> &
+  Partial<Pick<StoreState, 'sessions' | 'sessionTree'>>;
+
+function trimmedPath(path: string | null | undefined): string | null {
+  const trimmed = path?.trim();
+  return trimmed || null;
+}
+
+function workspacePathForId(
+  workspaces: WorkspaceSummary[],
+  workspaceId: string | null,
+): string | null {
+  if (!workspaceId) return null;
+  return trimmedPath(
+    workspaces.find((workspace) => workspace.id === workspaceId)?.path,
+  );
+}
+
+function composerWorkspaceForSessionKey(
+  state: SessionChangesRootState,
+  sessionKey: WorkflowSessionKey,
+): string | null {
+  const activeComposerPath = sameSessionKey(
+    activeWorkflowSessionKey(state),
+    sessionKey,
+  )
+    ? trimmedPath(state.composer.workspace)
+    : null;
+  const storedComposerPath = sessionKeyPersistable(sessionKey)
+    ? trimmedPath(
+        state.composerBySession[workflowSessionKeyId(sessionKey)]?.composer
+          .workspace,
+      )
+    : null;
+  return activeComposerPath || storedComposerPath;
+}
+
+export function sessionChangesRootPathForSession(
+  state: SessionChangesRootState,
+  sessionKey: WorkflowSessionKey,
+  rootOverride?: string | null,
+): string | null {
+  const overridePath = trimmedPath(rootOverride);
+  if (overridePath) return overridePath;
+
+  const liveRunPath = trimmedPath(
+    getRunChannel(sessionKey.workspaceId, sessionKey.sessionId)?.config.cwd,
+  );
+  if (liveRunPath) return liveRunPath;
+
+  const liveAiPath = trimmedPath(
+    getAiEditViewSource(sessionKey.workspaceId, sessionKey.sessionId)
+      ?.workspaceRootPath,
+  );
+  if (liveAiPath) return liveAiPath;
+
+  return (
+    composerWorkspaceForSessionKey(state, sessionKey) ||
+    workspacePathForId(state.workspaces, sessionKey.workspaceId)
+  );
+}
+
+export function sessionChangesBaselineAtForSession(
+  state: SessionChangesRootState,
+  sessionKey: WorkflowSessionKey,
+): number | null {
+  const session = sessionForKey(
+    {
+      sessions: state.sessions ?? [],
+      sessionTree: state.sessionTree ?? {},
+    },
+    sessionKey,
+  );
+  return typeof session?.createdAt === 'number' ? session.createdAt : null;
+}
+
+function ensureSessionChangeBaselineForKey(
+  state: SessionChangesRootState,
+  sessionKey: WorkflowSessionKey,
+  rootOverride?: string | null,
+): Promise<void> {
+  const rootPath = sessionChangesRootPathForSession(
+    state,
+    sessionKey,
+    rootOverride,
+  );
+  const cacheKey = sessionChangesCacheKey(
+    sessionKey.workspaceId,
+    sessionKey.sessionId,
+    rootPath,
+  );
+  const baselineAtMs = sessionChangesBaselineAtForSession(state, sessionKey);
+  if (!rootPath || !cacheKey) return Promise.resolve();
+  return ensureCachedSessionChangesBaseline(rootPath, cacheKey, baselineAtMs).catch(() => {});
+}
+
+function refreshSessionChangesForKey(
+  sessionKey: WorkflowSessionKey,
+  rootOverride?: string | null,
+): void {
+  const state = useStore.getState();
+  const rootPath = sessionChangesRootPathForSession(
+    state,
+    sessionKey,
+    rootOverride,
+  );
+  const cacheKey = sessionChangesCacheKey(
+    sessionKey.workspaceId,
+    sessionKey.sessionId,
+    rootPath,
+  );
+  const baselineAtMs = sessionChangesBaselineAtForSession(state, sessionKey);
+  if (!rootPath || !cacheKey) return;
+  void refreshCachedSessionChanges(rootPath, cacheKey, baselineAtMs).catch(() => {});
+}
+
 function sameSessionKey(
   a: WorkflowSessionKey,
   b: WorkflowSessionKey,
@@ -744,18 +884,69 @@ function withNewSessionGatewayDefaults(workflow: IRGraph): IRGraph {
   return selection ? withSessionGatewayDefaults(workflow, selection) : workflow;
 }
 
+function normalizeWorkspaceFolderList(
+  paths: unknown,
+  primary?: string,
+): string[] {
+  const primaryKey = primary ? workspacePathKey(primary) : '';
+  return uniqueWorkspaceHistory(Array.isArray(paths) ? paths : []).filter(
+    (path) => workspacePathKey(path) !== primaryKey,
+  );
+}
+
+function composerWorkspacePaths(composer: ComposerSettings): string[] {
+  return uniqueWorkspaceHistory([
+    composer.workspace,
+    ...normalizeWorkspaceFolderList(
+      composer.workspaceFolders,
+      composer.workspace,
+    ),
+  ]);
+}
+
+function composerCliWorkspaceOptions(composer: ComposerSettings): {
+  cwd?: string;
+  extraWorkspacePaths?: string[];
+} {
+  const [cwd, ...extraWorkspacePaths] = composerWorkspacePaths(composer);
+  return {
+    ...(cwd ? { cwd } : {}),
+    ...(extraWorkspacePaths.length > 0 ? { extraWorkspacePaths } : {}),
+  };
+}
+
+function workspaceHistoryWithRecentPaths(
+  paths: readonly unknown[],
+  history: readonly unknown[],
+): string[] {
+  return uniqueWorkspaceHistory(
+    [...paths, ...history],
+    WORKSPACE_HISTORY_LIMIT,
+  );
+}
+
 function defaultSessionComposer(workspace?: string): ComposerSettings {
   const trimmed = workspace?.trim();
   return normalizeComposerSettings(
-    { ...defaultComposer, workspace: trimmed || defaultComposer.workspace },
+    {
+      ...defaultComposer,
+      workspace: trimmed || defaultComposer.workspace,
+      workspaceFolders: [],
+    },
   );
 }
 
 function normalizeComposerSettings(value: Partial<ComposerSettings> | undefined): ComposerSettings {
   const source = value ?? {};
+  const workspace = normalizeWorkspacePath(source.workspace ?? defaultComposer.workspace);
   return {
     ...defaultComposer,
     ...source,
+    workspace,
+    workspaceFolders: normalizeWorkspaceFolderList(
+      source.workspaceFolders,
+      workspace,
+    ),
     modelStrategy: source.modelStrategy ?? defaultComposer.modelStrategy,
     imageMode: source.imageMode ?? defaultComposer.imageMode,
     imageModeStartedAt:
@@ -1371,6 +1562,18 @@ async function persistCurrentMessages(): Promise<void> {
   });
 }
 
+async function persistCurrentConversation(
+  messages: Message[],
+  workflow?: IRGraph,
+): Promise<void> {
+  const ctx = getActiveHistoryContext();
+  if (!ctx) return;
+  await historyStore.updateSession(ctx.workspaceId, ctx.sessionId, {
+    messages,
+    ...(workflow ? { workflow } : {}),
+  });
+}
+
 function historySessionKey(workspaceId: string, sessionId: string): string {
   return `${workspaceId}::${sessionId}`;
 }
@@ -1507,12 +1710,53 @@ function syncAndPersistSessionRunStatus(
   status: IRRunStatus | undefined,
 ): void {
   syncSessionRunStatus(sessionKey, status);
+  scheduleSessionRunCompletedNotification(sessionKey, status);
   if (!sessionKey.workspaceId || !sessionKey.sessionId) return;
   void historyStore
     .updateSession(sessionKey.workspaceId, sessionKey.sessionId, {
       meta: { runStatus: status ?? 'idle' },
     })
     .catch(() => {});
+}
+
+function sessionHasLiveActivity(sessionKey: WorkflowSessionKey): boolean {
+  return (
+    !!getRunChannel(sessionKey.workspaceId, sessionKey.sessionId) ||
+    getAiEditChannelsForSession(
+      sessionKey.workspaceId,
+      sessionKey.sessionId,
+    ).length > 0
+  );
+}
+
+function notifySessionRunCompleted(
+  sessionKey: WorkflowSessionKey,
+  status: IRRunStatus | undefined,
+): void {
+  if (!isNotifiableCompletionStatus(status)) return;
+  if (sessionHasLiveActivity(sessionKey)) return;
+  const state = useStore.getState();
+  const session = sessionForKey(state, sessionKey);
+  const sessionTitle =
+    session?.title?.trim() ||
+    state.workflow.meta?.name?.trim() ||
+    null;
+  void notifySessionComplete({
+    status,
+    sessionTitle,
+    workspaceId: sessionKey.workspaceId,
+    sessionId: sessionKey.sessionId,
+  });
+}
+
+function scheduleSessionRunCompletedNotification(
+  sessionKey: WorkflowSessionKey,
+  status: IRRunStatus | undefined,
+): void {
+  if (!isNotifiableCompletionStatus(status)) return;
+  globalThis.setTimeout(() => {
+    notifySessionRunCompleted(sessionKey, status);
+  }, 0);
 }
 
 function markLocalActiveSessionWorkflow(): void {
@@ -1866,6 +2110,136 @@ function previewFromText(text: string): string {
   return compact.length > 80 ? `${compact.slice(0, 80)}...` : compact;
 }
 
+function activeMessageSummaryPatch(
+  state: StoreState,
+  messages: Message[],
+): Pick<StoreState, 'sessions' | 'sessionTree'> {
+  const activeSessionId = state.activeSessionId;
+  if (!activeSessionId) {
+    return { sessions: state.sessions, sessionTree: state.sessionTree };
+  }
+  const last = [...messages].reverse().find((message) => message.text.trim());
+  const updatedAt = Date.now();
+  const updateSession = (session: Session): Session =>
+    session.id === activeSessionId
+      ? {
+          ...session,
+          updatedAt,
+          preview: last ? previewFromText(last.text) : undefined,
+          messageCount: messages.length,
+        }
+      : session;
+  return {
+    sessions: state.sessions.map(updateSession),
+    sessionTree: state.activeWorkspaceId
+      ? {
+          ...state.sessionTree,
+          [state.activeWorkspaceId]: (
+            state.sessionTree[state.activeWorkspaceId] ?? state.sessions
+          ).map(updateSession),
+        }
+      : state.sessionTree,
+  };
+}
+
+function removeMessagesById(messages: Message[], ids: Set<string>): Message[] {
+  if (ids.size === 0) return messages;
+  return messages.filter((message) => !ids.has(message.id));
+}
+
+function previousUserIdForAssistantTurn(
+  messages: Message[],
+  assistantIndex: number,
+): string | null {
+  for (let i = assistantIndex - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === 'user') return message.id;
+    if (message.role === 'assistant') return null;
+  }
+  return null;
+}
+
+function aiEditOwnedTurnIds(
+  workspaceId: string | null,
+  sessionId: string | null,
+  messageId: string,
+): Set<string> {
+  const ids = new Set<string>();
+  const sources = [
+    ...getAiEditChannelsForSession(workspaceId, sessionId),
+    ...getAiEditSnapshotsForSession(workspaceId, sessionId),
+  ];
+  for (const ch of sources) {
+    if (!ch.ownedMessageIds?.has(messageId)) continue;
+    for (const id of ch.ownedMessageIds) ids.add(id);
+  }
+  return ids;
+}
+
+function deletionIdsForAssistantTurn(
+  messages: Message[],
+  messageId: string,
+  sessionKey: WorkflowSessionKey,
+): Set<string> {
+  const ids = aiEditOwnedTurnIds(
+    sessionKey.workspaceId,
+    sessionKey.sessionId,
+    messageId,
+  );
+  const index = messages.findIndex((message) => message.id === messageId);
+  const target = index >= 0 ? messages[index] : null;
+  if (!target) return ids;
+  ids.add(messageId);
+  if (target.role === 'assistant') {
+    const previousUserId = previousUserIdForAssistantTurn(messages, index);
+    if (previousUserId) ids.add(previousUserId);
+  }
+  return ids;
+}
+
+function simpleWorkflowFromMessages(workflow: IRGraph, messages: Message[]): IRGraph {
+  if (workflow.meta?.simple !== true) return workflow;
+  return setStartUserInputs(workflow, chatUserInputsFromMessages(messages));
+}
+
+function pruneAiEditSourceMessages(
+  ch: AiEditChannel,
+  ids: Set<string>,
+): boolean {
+  const beforeCount = ch.messages.length;
+  ch.messages = removeMessagesById(ch.messages, ids);
+  for (const id of ids) ch.ownedMessageIds?.delete(id);
+  ch.workflow = simpleWorkflowFromMessages(ch.workflow, ch.messages);
+  return ch.messages.length !== beforeCount;
+}
+
+function pruneAiEditSourcesForDeletion(
+  workspaceId: string | null,
+  sessionId: string | null,
+  ids: Set<string>,
+): void {
+  const activeKeys = new Set<string>();
+  for (const ch of getAiEditChannelsForSession(workspaceId, sessionId)) {
+    activeKeys.add(ch.key);
+    const deletesOwnedTurn = [...ids].some((id) => ch.ownedMessageIds?.has(id));
+    const changed = pruneAiEditSourceMessages(ch, ids);
+    if (deletesOwnedTurn) {
+      ch.abortController.abort();
+      void cancelActiveAiEditRuns(ch);
+      removeAiEditChannel(ch);
+    } else if (changed) {
+      rememberAiEditSnapshot(ch);
+    }
+  }
+
+  for (const ch of getAiEditSnapshotsForSession(workspaceId, sessionId)) {
+    if (activeKeys.has(ch.key)) continue;
+    if (pruneAiEditSourceMessages(ch, ids)) {
+      aiEditSnapshots.set(ch.key, cloneAiEditSnapshot(ch));
+    }
+  }
+}
+
 function applyPromptTitle(
   state: StoreState,
   text: string,
@@ -1918,6 +2292,135 @@ function applyPromptTitle(
     : state.workflow;
 
   return { sessions, sessionTree, workflow };
+}
+
+function messagesThroughAssistantReply(
+  messages: Message[],
+  messageId: string,
+): Message[] {
+  const index = messages.findIndex((message) => message.id === messageId);
+  if (index < 0 || messages[index]?.role !== 'assistant') return [];
+  return messages.slice(0, index + 1).map((message) => ({ ...message }));
+}
+
+function branchSessionTitle(
+  sourceTitle: string | undefined,
+  messages: Message[],
+  locale: Locale,
+): string {
+  const fallback = locale === 'en-US' ? 'Session branch' : '会话分支';
+  const source =
+    sourceTitle && !isAutoTitlePlaceholder(sourceTitle)
+      ? sourceTitle
+      : messages.find((message) => message.role === 'user' && message.text.trim())
+          ?.text;
+  const prefix = locale === 'en-US' ? 'Branch: ' : '分支：';
+  return titleFromText(`${prefix}${source?.trim() || fallback}`, fallback);
+}
+
+async function branchChatSessionFromMessage(messageId: string): Promise<void> {
+  const state = useStore.getState();
+  const branchMessages = messagesThroughAssistantReply(state.messages, messageId);
+  if (branchMessages.length === 0) return;
+
+  const sourceSession = sessionForKey(state, activeWorkflowSessionKey(state));
+  const title = branchSessionTitle(
+    sourceSession?.title ?? state.workflow.meta?.name,
+    branchMessages,
+    state.locale,
+  );
+  const gatewaySelection = workflowDefaultGatewaySelection(
+    state.workflow,
+    state.composer.model,
+  );
+  const snapshot: SessionComposerSettings = {
+    composer: state.composer,
+    gatewaySelection,
+  };
+  const workspaceId = state.activeWorkspaceId;
+
+  if (!state.historyReady || !workspaceId) {
+    const createdAt = Date.now();
+    const last = [...branchMessages]
+      .reverse()
+      .find((message) => message.text.trim());
+    const session: Session = {
+      id: shortId('s'),
+      title,
+      createdAt,
+      updatedAt: createdAt,
+      isWorkflow: false,
+      preview: last ? previewFromText(last.text) : undefined,
+      messageCount: branchMessages.length,
+    };
+    const sessionKey = {
+      workspaceId: state.activeWorkspaceId ?? null,
+      sessionId: session.id,
+    };
+    useStore.setState((s) => {
+      const currentComposerBySession = rememberSessionComposer(s);
+      const composerBySession = {
+        ...currentComposerBySession,
+        [workflowSessionKeyId(sessionKey)]: snapshot,
+      };
+      saveComposerSoon({
+        composer: snapshot.composer,
+        composerBySession,
+        workspaceHistory: s.workspaceHistory,
+      });
+      const workflow = withSessionGatewayDefaults(
+        chatWorkflow(title, s.locale),
+        snapshot.gatewaySelection,
+      );
+      const draftPatch = composerDraftPatchForSession(s, sessionKey);
+      return {
+        workflow,
+        composer: normalizeComposerSettings(snapshot.composer),
+        composerBySession,
+        selectedNodeId: null,
+        dirty: false,
+        ...emptyRunProgress(),
+        sessions: [session, ...s.sessions],
+        activeSessionId: session.id,
+        messages: branchMessages,
+        canvasViewport: null,
+        currentFilePath: null,
+        mode: 'design' as const,
+        sessionTree: s.activeWorkspaceId
+          ? {
+              ...s.sessionTree,
+              [s.activeWorkspaceId]: [
+                session,
+                ...(s.sessionTree[s.activeWorkspaceId] ?? s.sessions),
+              ],
+            }
+          : s.sessionTree,
+        ...draftPatch,
+      };
+    });
+    return;
+  }
+
+  const record = await historyStore.createSession({
+    workspaceId,
+    isWorkflow: false,
+    messages: branchMessages,
+    title,
+  });
+  const sessionKey = { workspaceId, sessionId: record.id };
+  useStore.setState((s) => {
+    const composerBySession = {
+      ...rememberSessionComposer(s),
+      [workflowSessionKeyId(sessionKey)]: snapshot,
+    };
+    saveComposerSoon({
+      composer: snapshot.composer,
+      composerBySession,
+      workspaceHistory: s.workspaceHistory,
+    });
+    return { composerBySession };
+  });
+  await activateHistorySession(record.id, workspaceId);
 }
 
 async function createNewChatSession(): Promise<void> {
@@ -3053,6 +3556,7 @@ async function initHistoryFromDisk(): Promise<void> {
         {
           ...s.composer,
           workspace: workspace.path || s.composer.workspace,
+          workspaceFolders: [],
         },
       );
       return {
@@ -3737,6 +4241,12 @@ export const useStore = create<StoreState>((set, get) => ({
     const sessionKey = activeWorkflowSessionKey(state);
     if (hasSessionKey(state.chattingSessions, sessionKey)) return;
     if (state.blockedSendTip) set({ blockedSendTip: null });
+    const workspaceRootPath = sessionChangesRootPathForSession(state, sessionKey);
+    const changesBaselineReady = ensureSessionChangeBaselineForKey(
+      state,
+      sessionKey,
+      workspaceRootPath,
+    );
 
     const now = Date.now();
     const userMsg: Message = {
@@ -3763,6 +4273,7 @@ export const useStore = create<StoreState>((set, get) => ({
       sessionKey: runKey(sessionKey.workspaceId, sessionKey.sessionId),
       workspaceId: sessionKey.workspaceId,
       sessionId: sessionKey.sessionId,
+      workspaceRootPath,
       workflow: promptUpdate.workflow,
       messages: [...state.messages, userMsg, assistantMsg],
       cliRunIds: new Set<string>(),
@@ -3825,17 +4336,27 @@ export const useStore = create<StoreState>((set, get) => ({
       // run-progress card above the log text. Seeded with the wall-clock start.
       let progress: UltracodeRunProgress = { ...emptyProgress(), startedAt };
       let concurrencyForDisplay = parsed.options.concurrency ?? runConcurrency();
+      const ultracodeWorkspacePaths = composerWorkspacePaths(state.composer);
+      const workspaceSummary =
+        ultracodeWorkspacePaths.length > 0
+          ? `工作区: ${ultracodeWorkspacePaths[0]}${
+              ultracodeWorkspacePaths.length > 1
+                ? ` +${ultracodeWorkspacePaths.length - 1}`
+                : ''
+            }`
+          : '工作区: 默认';
       const composeLiveText = () =>
         [
           `⟳ /ultracode 执行中…`,
           `runId: ${runId}`,
-          `工作区: ${state.composer.workspace || '默认'}`,
+          workspaceSummary,
           `模式: ${modeLabel}`,
           `并发: ${concurrencyForDisplay}`,
           '',
           live.trim(),
         ].join('\n');
       try {
+        await changesBaselineReady;
         const gatewaySelection = ch.gatewaySelection;
         if (gatewaySelection && isFreeChannelSelection(gatewaySelection)) {
           await ensureFreeProxy(freeProxyOptionsForSelection(gatewaySelection));
@@ -3843,7 +4364,7 @@ export const useStore = create<StoreState>((set, get) => ({
         const concurrency = parsed.options.concurrency ?? runConcurrency();
         concurrencyForDisplay = concurrency;
         const result = await runUltracode(request, {
-          cwd: state.composer.workspace || undefined,
+          ...composerCliWorkspaceOptions(state.composer),
           adapter: gatewaySelection?.adapter,
           model:
             gatewaySelection?.modelOverride ||
@@ -3931,6 +4452,48 @@ export const useStore = create<StoreState>((set, get) => ({
     return msg.id;
   },
 
+  deleteMessage: (messageId) => {
+    const current = useStore.getState();
+    const sessionKey = activeWorkflowSessionKey(current);
+    const deleteIds = deletionIdsForAssistantTurn(
+      current.messages,
+      messageId,
+      sessionKey,
+    );
+    if (deleteIds.size === 0) return;
+    let nextMessages: Message[] | null = null;
+    let nextWorkflow: IRGraph | null = null;
+    let persistWorkflow = false;
+    set((state) => {
+      const messages = removeMessagesById(state.messages, deleteIds);
+      if (messages.length === state.messages.length) return state;
+      const workflow = simpleWorkflowFromMessages(state.workflow, messages);
+      const activeSession = sessionForKey(state, activeWorkflowSessionKey(state));
+      nextMessages = messages;
+      nextWorkflow = workflow;
+      persistWorkflow = activeSession?.isWorkflow === true;
+      return {
+        messages,
+        workflow,
+        ...activeMessageSummaryPatch(state, messages),
+      };
+    });
+    if (!nextMessages) return;
+    pruneAiEditSourcesForDeletion(
+      sessionKey.workspaceId,
+      sessionKey.sessionId,
+      deleteIds,
+    );
+    void persistCurrentConversation(
+      nextMessages,
+      persistWorkflow ? nextWorkflow ?? undefined : undefined,
+    );
+  },
+
+  branchSessionFromMessage: (messageId) => {
+    void branchChatSessionFromMessage(messageId);
+  },
+
   sendPrompt: (text, options) => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -3959,6 +4522,15 @@ export const useStore = create<StoreState>((set, get) => ({
       return;
     }
     if (state.blockedSendTip) set({ blockedSendTip: null });
+    const workspaceRootPath = sessionChangesRootPathForSession(
+      state,
+      aiEditingSession,
+    );
+    const changesBaselineReady = ensureSessionChangeBaselineForKey(
+      state,
+      aiEditingSession,
+      workspaceRootPath,
+    );
     const capturedStartInputs: string[] = [trimmed];
     // Accumulates how the blueprint was produced (research / candidates /
     // escalation). Each generation phase writes into it; stamped onto the Start
@@ -3996,6 +4568,7 @@ export const useStore = create<StoreState>((set, get) => ({
       sessionKey: chSessionKey,
       workspaceId: aiEditingSession.workspaceId,
       sessionId: aiEditingSession.sessionId,
+      workspaceRootPath,
       workflow: channelWorkflow,
       messages: [...baseMessages, userMsg],
       cliRunIds: new Set<string>(),
@@ -4274,12 +4847,14 @@ ${previousReply.slice(0, 4000)}
         cliCommand?: string;
         env?: Record<string, string>;
         cwd?: string;
+        extraWorkspacePaths?: string[];
         runId?: string;
         onProgress?: (chunk: string) => void;
         sessionId?: string;
         resume?: boolean;
       },
     ): Promise<string> => {
+      await changesBaselineReady;
       const policy = timeoutPolicyForSelection(cli.selection, prompt);
       const startedAt = Date.now();
       let firstProgressAt: number | undefined;
@@ -4303,6 +4878,21 @@ ${previousReply.slice(0, 4000)}
           firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
           ok: true,
         });
+        recordEstimatedModelUsageForSelection(
+          cli.selection,
+          prompt,
+          text,
+          {
+            baseUrl: cli.baseUrl,
+            model: cli.model,
+            providerName: cli.providerName,
+            channelName: cli.channelName,
+            label: cli.label,
+          },
+          {
+            context: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
+          },
+        );
         return text;
       } catch (err) {
         const failure = describeRunFailure(err);
@@ -4337,6 +4927,7 @@ ${previousReply.slice(0, 4000)}
           maxTokens: 8192,
           signal: ch.abortController.signal,
           runId,
+          usageContext: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
           onDelta: (chunk) => {
             firstProgressAt ??= Date.now();
             request.onDelta?.(chunk);
@@ -4782,7 +5373,7 @@ ${previousReply.slice(0, 4000)}
               model: cli.model,
               cliCommand: cli.cliCommand,
               env: cli.env,
-              cwd: state.composer.workspace || undefined,
+              ...composerCliWorkspaceOptions(state.composer),
               sessionId: nativeSession?.sessionId,
               resume: nativeSession ? nativeResume : undefined,
               onProgress: (chunk) => {
@@ -4882,7 +5473,7 @@ ${previousReply.slice(0, 4000)}
                     model: cli.model,
                     cliCommand: cli.cliCommand,
                     env: cli.env,
-                    cwd: state.composer.workspace || undefined,
+                    ...composerCliWorkspaceOptions(state.composer),
                   });
                 }
                 return await completeDirectWithSpeed({ system: researchSystem, userContent: convoR });
@@ -5078,7 +5669,7 @@ ${previousReply.slice(0, 4000)}
 
   setComposer: (patch) =>
     set((state) => {
-      const composer = { ...state.composer, ...patch };
+      const composer = normalizeComposerSettings({ ...state.composer, ...patch });
       const snapshot: SessionComposerSettings = {
         composer,
         gatewaySelection: workflowDefaultGatewaySelection(
@@ -5146,11 +5737,14 @@ ${previousReply.slice(0, 4000)}
     if (!trimmed) return;
     if (isActiveAiEditingSession(useStore.getState())) return;
     set((state) => {
-      const composer = { ...state.composer, workspace: trimmed };
-      const workspaceHistory = workspaceHistoryWithRecent(
-        trimmed,
+      const composer = normalizeComposerSettings({
+        ...state.composer,
+        workspace: trimmed,
+        workspaceFolders: state.composer.workspaceFolders,
+      });
+      const workspaceHistory = workspaceHistoryWithRecentPaths(
+        composerWorkspacePaths(composer),
         state.workspaceHistory,
-        WORKSPACE_HISTORY_LIMIT,
       );
       const snapshot: SessionComposerSettings = {
         composer,
@@ -5170,6 +5764,91 @@ ${previousReply.slice(0, 4000)}
     void activateWorkspacePath(trimmed);
   },
 
+  // Add a session-only workspace folder. The first folder becomes the primary
+  // cwd; later folders are passed to CLI adapters as extra allowed directories.
+  addWorkspaceFolder: (path) => {
+    const trimmed = normalizeWorkspacePath(path);
+    if (!trimmed) return;
+    const current = useStore.getState();
+    if (isActiveAiEditingSession(current)) return;
+    const shouldActivate = !normalizeWorkspacePath(current.composer.workspace);
+    set((state) => {
+      const composer = shouldActivate
+        ? normalizeComposerSettings({
+            ...state.composer,
+            workspace: trimmed,
+            workspaceFolders: [],
+          })
+        : normalizeComposerSettings({
+            ...state.composer,
+            workspaceFolders: [trimmed, ...state.composer.workspaceFolders],
+          });
+      const workspaceHistory = workspaceHistoryWithRecentPaths(
+        composerWorkspacePaths(composer),
+        state.workspaceHistory,
+      );
+      const snapshot: SessionComposerSettings = {
+        composer,
+        gatewaySelection: workflowDefaultGatewaySelection(
+          state.workflow,
+          composer.model,
+        ),
+      };
+      const composerBySession = rememberSessionComposer(
+        { ...state, composer },
+        state.composerBySession,
+        snapshot,
+      );
+      saveComposerSoon({ composer, composerBySession, workspaceHistory });
+      return { composer, composerBySession, workspaceHistory };
+    });
+    if (shouldActivate) void activateWorkspacePath(trimmed);
+  },
+
+  removeWorkspaceFolder: (path) => {
+    const key = workspacePathKey(path);
+    if (!key) return;
+    if (isActiveAiEditingSession(useStore.getState())) return;
+    set((state) => {
+      const primaryKey = workspacePathKey(state.composer.workspace);
+      const currentExtras = normalizeWorkspaceFolderList(
+        state.composer.workspaceFolders,
+        state.composer.workspace,
+      );
+      let workspace = state.composer.workspace;
+      let workspaceFolders = currentExtras.filter(
+        (item) => workspacePathKey(item) !== key,
+      );
+      if (primaryKey === key) {
+        workspace = workspaceFolders[0] ?? '';
+        workspaceFolders = workspaceFolders.slice(1);
+      }
+      const composer = normalizeComposerSettings({
+        ...state.composer,
+        workspace,
+        workspaceFolders,
+      });
+      const snapshot: SessionComposerSettings = {
+        composer,
+        gatewaySelection: workflowDefaultGatewaySelection(
+          state.workflow,
+          composer.model,
+        ),
+      };
+      const composerBySession = rememberSessionComposer(
+        { ...state, composer },
+        state.composerBySession,
+        snapshot,
+      );
+      saveComposerSoon({
+        composer,
+        composerBySession,
+        workspaceHistory: state.workspaceHistory,
+      });
+      return { composer, composerBySession };
+    });
+  },
+
   // Remove a folder from the workspace history. If it was the active
   // workspace, the active selection is cleared (falls back to "no folder").
   removeWorkspace: (path) => {
@@ -5184,10 +5863,11 @@ ${previousReply.slice(0, 4000)}
         return state;
       }
       const removingActive = workspacePathKey(state.composer.workspace) === key;
-      const composer = removingActive
-        ? { ...state.composer, workspace: '' }
-        : state.composer;
-      if (!removingActive) {
+      const currentExtras = normalizeWorkspaceFolderList(
+        state.composer.workspaceFolders,
+        state.composer.workspace,
+      ).filter((item) => workspacePathKey(item) !== key);
+      if (!removingActive && currentExtras.length === state.composer.workspaceFolders.length) {
         saveComposerSoon({
           composer: state.composer,
           composerBySession: state.composerBySession,
@@ -5195,6 +5875,11 @@ ${previousReply.slice(0, 4000)}
         });
         return { workspaceHistory };
       }
+      const composer = normalizeComposerSettings({
+        ...state.composer,
+        workspace: removingActive ? currentExtras[0] ?? '' : state.composer.workspace,
+        workspaceFolders: removingActive ? currentExtras.slice(1) : currentExtras,
+      });
       const snapshot: SessionComposerSettings = {
         composer,
         gatewaySelection: workflowDefaultGatewaySelection(
@@ -5719,16 +6404,31 @@ ${previousReply.slice(0, 4000)}
     }),
 }));
 
+setSessionNotificationClickHandler(({ workspaceId, sessionId }) => {
+  if (!sessionId) return;
+  useStore.getState().selectSession(sessionId, workspaceId ?? undefined);
+});
+
 /* -------------------------------------------------------------------------- */
 /* Run execution helpers                                                      */
 /* -------------------------------------------------------------------------- */
 
 interface RunConfig {
   cwd?: string;
+  extraWorkspacePaths?: string[];
   permission?: string;
   model?: string;
   cliCommand?: string;
   gatewaySelection?: GatewaySelection;
+}
+
+function formatRunWorkspaceSuffix(config: RunConfig): string {
+  const paths = uniqueWorkspaceHistory([
+    config.cwd,
+    ...(config.extraWorkspacePaths ?? []),
+  ]);
+  if (paths.length === 0) return '';
+  return ` · 工作区 ${paths[0]}${paths.length > 1 ? ` +${paths.length - 1}` : ''}`;
 }
 
 /**
@@ -5769,6 +6469,8 @@ interface AiEditChannel {
   sessionKey: string;
   workspaceId: string | null;
   sessionId: string | null;
+  /** Filesystem root used for this turn's session-change snapshot. */
+  workspaceRootPath?: string | null;
   workflow: IRGraph;
   messages: Message[];
   cliRunIds: Set<string>;
@@ -6060,9 +6762,12 @@ function addAiEditChannel(ch: AiEditChannel): void {
 
 function removeAiEditChannel(ch: AiEditChannel | null): void {
   if (!aiEditRegistered(ch)) return;
+  const sessionKey = { workspaceId: ch.workspaceId, sessionId: ch.sessionId };
+  const rootPath = ch.workspaceRootPath;
   rememberAiEditSnapshot(ch);
   activeAiEdits.delete(ch.key);
   syncAiEditingSessions();
+  refreshSessionChangesForKey(sessionKey, rootPath);
 }
 
 function stopActiveChat(): void {
@@ -6292,6 +6997,7 @@ async function refineImagePromptViaModel(
       userContent,
       maxTokens: 1024,
       signal: ch.abortController.signal,
+      usageContext: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
       onDelta: (chunk) => {
         full += chunk;
         onProgress(full);
@@ -6356,6 +7062,7 @@ async function refineMusicPromptViaModel(
       userContent,
       maxTokens: 1024,
       signal: ch.abortController.signal,
+      usageContext: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
       onDelta: (chunk) => {
         full += chunk;
         onProgress(full);
@@ -6424,6 +7131,7 @@ ${userText}`;
       userContent,
       maxTokens: 1024,
       signal: ch.abortController.signal,
+      usageContext: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
       onDelta: (chunk) => {
         full += chunk;
         onProgress(full);
@@ -6524,11 +7232,13 @@ function startImageGenerationTurn(
   const simpleMode = promptUpdate.workflow.meta?.simple === true;
   const baseMessages = state.messages;
   const chSessionKey = runKey(sessionKey.workspaceId, sessionKey.sessionId);
+  const workspaceRootPath = sessionChangesRootPathForSession(state, sessionKey);
   const ch: AiEditChannel = {
     key: chatTurnKey(chSessionKey, userMsg.id),
     sessionKey: chSessionKey,
     workspaceId: sessionKey.workspaceId,
     sessionId: sessionKey.sessionId,
+    workspaceRootPath,
     workflow: promptUpdate.workflow,
     messages: [...baseMessages, userMsg, assistantMsg],
     cliRunIds: new Set<string>(),
@@ -6696,11 +7406,13 @@ function startMusicGenerationTurn(
   const simpleMode = promptUpdate.workflow.meta?.simple === true;
   const baseMessages = state.messages;
   const chSessionKey = runKey(sessionKey.workspaceId, sessionKey.sessionId);
+  const workspaceRootPath = sessionChangesRootPathForSession(state, sessionKey);
   const ch: AiEditChannel = {
     key: chatTurnKey(chSessionKey, userMsg.id),
     sessionKey: chSessionKey,
     workspaceId: sessionKey.workspaceId,
     sessionId: sessionKey.sessionId,
+    workspaceRootPath,
     workflow: promptUpdate.workflow,
     messages: [...baseMessages, userMsg, assistantMsg],
     cliRunIds: new Set<string>(),
@@ -6873,11 +7585,13 @@ function startThreeDGenerationTurn(
   const simpleMode = promptUpdate.workflow.meta?.simple === true;
   const baseMessages = state.messages;
   const chSessionKey = runKey(sessionKey.workspaceId, sessionKey.sessionId);
+  const workspaceRootPath = sessionChangesRootPathForSession(state, sessionKey);
   const ch: AiEditChannel = {
     key: chatTurnKey(chSessionKey, userMsg.id),
     sessionKey: chSessionKey,
     workspaceId: sessionKey.workspaceId,
     sessionId: sessionKey.sessionId,
+    workspaceRootPath,
     workflow: promptUpdate.workflow,
     messages: [...baseMessages, userMsg, assistantMsg],
     cliRunIds: new Set<string>(),
@@ -7087,6 +7801,10 @@ function channelCommit(ch: RunChannel | null, status: IRRunStatus, persist = tru
   syncRunningSessionProgress();
   if (status !== 'running') {
     syncSessionRunStatus(
+      { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
+      status,
+    );
+    scheduleSessionRunCompletedNotification(
       { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
       status,
     );
@@ -7331,8 +8049,11 @@ function markRunNode(ch: RunChannel | null, id: string, state: NodeRunState): vo
 /** Tear down the active run channel and clear the Sidebar "running" markers. */
 function finishRun(ch: RunChannel | null): void {
   if (!ch) return;
+  const sessionKey = { workspaceId: ch.workspaceId, sessionId: ch.sessionId };
+  const rootPath = ch.config.cwd;
   activeRuns.delete(ch.key);
   syncRunningSessions();
+  refreshSessionChangesForKey(sessionKey, rootPath);
 }
 
 /**
@@ -7615,8 +8336,9 @@ function startWorkflowRun(resume: boolean): void {
   // Capture the run's workspace + permission (from the AIDock controls) so each
   // node's CLI agent runs in the right dir with enough access to act without
   // stalling on permission prompts.
+  const workspaceOptions = composerCliWorkspaceOptions(state.composer);
   const config: RunConfig = {
-    cwd: state.composer.workspace || undefined,
+    ...workspaceOptions,
     permission: state.composer.permission || 'full',
     model: gatewaySelection.modelClass,
     gatewaySelection,
@@ -7626,6 +8348,11 @@ function startWorkflowRun(resume: boolean): void {
   // view — is the run's source of truth from here on, so switching sessions
   // leaves it running in the background (writes route to its owning session).
   const ctx = getRunLaunchContext(state);
+  const changesBaselineReady = ensureSessionChangeBaselineForKey(
+    state,
+    ctx,
+    config.cwd,
+  );
   const key = runKey(ctx.workspaceId, ctx.sessionId);
   const ch: RunChannel = {
     key,
@@ -7659,7 +8386,7 @@ function startWorkflowRun(resume: boolean): void {
   const runMsg: Message = {
     id: shortId('m'),
     role: 'system',
-    text: `▶ ${action} "${name}"${from} · 开始 ${formatClock(runStartedAt)} · 运行时 ${adapter} · 模型 ${gatewaySelection.modelClass} · 权限 ${ch.config.permission}${ch.config.cwd ? ` · 工作区 ${ch.config.cwd}` : ''}`,
+    text: `▶ ${action} "${name}"${from} · 开始 ${formatClock(runStartedAt)} · 运行时 ${adapter} · 模型 ${gatewaySelection.modelClass} · 权限 ${ch.config.permission}${formatRunWorkspaceSuffix(ch.config)}`,
     createdAt: runStartedAt,
   };
   ch.messages = [...ch.messages, runMsg];
@@ -7682,11 +8409,14 @@ function startWorkflowRun(resume: boolean): void {
   */
 
   if (isTauri() || workflowHasDirectGatewayRoute(workflow, gatewaySelection)) {
-    void executeViaCliInterpreter(ch, workflow, adapter, runStartedAt, {
-      resumeFromNodeId,
-      seedOutputs,
-      seedNodeHashes,
-    });
+    void (async () => {
+      await changesBaselineReady;
+      await executeViaCliInterpreter(ch, workflow, adapter, runStartedAt, {
+        resumeFromNodeId,
+        seedOutputs,
+        seedNodeHashes,
+      });
+    })();
   } else {
     void executeViaSimulator(ch, workflow, { resumeFromNodeId, seedOutputs });
   }
@@ -7769,25 +8499,47 @@ async function invokeAgentCli(
     cliCommand?: string;
     env?: Record<string, string>;
     cwd?: string;
+    extraWorkspacePaths?: string[];
     permission?: string;
     timeoutSeconds?: number;
     idleTimeoutSeconds?: number;
     onProgress?: (text: string) => void;
     sessionId?: string;
     resume?: boolean;
+    selection?: GatewaySelection;
   } = {},
 ): Promise<string> {
   const runId = makeCliRunId();
   ch.cliRunIds.add(runId);
   try {
-    return await aiEditViaCli(prompt, adapter, {
+    const text = await aiEditViaCli(prompt, adapter, {
       ...opts,
       cliCommand: opts.cliCommand ?? ch.config.cliCommand,
+      extraWorkspacePaths:
+        opts.extraWorkspacePaths ?? ch.config.extraWorkspacePaths,
       env: opts.env,
       timeoutSeconds: opts.timeoutSeconds,
       idleTimeoutSeconds: opts.idleTimeoutSeconds,
       runId,
     });
+    if (opts.selection) {
+      recordEstimatedModelUsageForSelection(
+        opts.selection,
+        prompt,
+        text,
+        {
+          baseUrl:
+            opts.env?.ANTHROPIC_BASE_URL ||
+            opts.env?.OPENAI_BASE_URL ||
+            opts.env?.GOOGLE_GEMINI_BASE_URL,
+          model: opts.model,
+        },
+        {
+          context: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
+        },
+      );
+    }
+    return text;
   } finally {
     ch.cliRunIds.delete(runId);
   }
@@ -7827,15 +8579,18 @@ function buildGuiGateway(ch: RunChannel): RunGateway {
         system: '',
         userContent: prompt,
         maxTokens: 8192,
+        usageContext: { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
         onDelta,
       });
       return { text, adapter: direct.adapter };
     },
     spawnCliAgent: (prompt, adapter, opts) =>
       invokeAgentCli(ch, prompt, adapter, {
+        selection: opts.selection,
         model: opts.model,
         env: opts.env,
         cwd: opts.cwd,
+        extraWorkspacePaths: opts.extraWorkspacePaths,
         permission: opts.permission,
         timeoutSeconds: opts.timeoutSeconds,
         idleTimeoutSeconds: opts.idleTimeoutSeconds,
@@ -8041,6 +8796,7 @@ function buildGuiRunContext(ch: RunChannel, workflow: IRGraph): RuntimeRunContex
     personalInstructions,
     personalInstructionsByModel,
     cwd: ch.config.cwd,
+    extraWorkspacePaths: ch.config.extraWorkspacePaths,
     permission: ch.config.permission,
     concurrency: runConcurrency(),
     maxRetries: runMaxRetries(),

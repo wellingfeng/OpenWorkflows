@@ -11,6 +11,14 @@ import {
   type GatewaySelection,
   type GatewayTransport,
 } from '@/lib/modelGateway/types';
+import {
+  GATEWAY_CHANNEL_API_KEYS_SECRET,
+  PROVIDER_API_KEYS_SECRET,
+  gatewayChannelSecretKey,
+  readSecureRecordValue,
+  secureStorageAvailable,
+  writeSecureRecord,
+} from '@/lib/secureStorage';
 
 export const GATEWAY_CONFIG_STORAGE = 'fuc_model_gateway_v1';
 export const ACTIVE_GATEWAY_SELECTION_STORAGE =
@@ -123,6 +131,7 @@ function normalizeProvider(value: unknown): GatewayProvider | null {
   if (typeof value !== 'object' || value === null) return null;
   const raw = value as Record<string, unknown>;
   if (typeof raw.id !== 'string' || !raw.id) return null;
+  const providerId = raw.id;
   const adapter = normalizeAdapter(raw.adapter);
   const kind = typeof raw.kind === 'string' ? raw.kind : adapter;
   const rawChannels = Array.isArray(raw.channels) ? raw.channels : [];
@@ -137,7 +146,11 @@ function normalizeProvider(value: unknown): GatewayProvider | null {
       return {
         id: typeof c.id === 'string' && c.id ? c.id : 'default',
         name: typeof c.name === 'string' && c.name ? c.name : 'Default',
-        apiKey: typeof c.apiKey === 'string' ? c.apiKey : undefined,
+        apiKey: gatewayChannelApiKey(
+          providerId,
+          typeof c.id === 'string' && c.id ? c.id : 'default',
+          typeof c.apiKey === 'string' ? c.apiKey : undefined,
+        ),
         baseUrl: typeof c.baseUrl === 'string' ? c.baseUrl : undefined,
         model: typeof c.model === 'string' ? c.model : undefined,
         models:
@@ -160,12 +173,28 @@ function normalizeProvider(value: unknown): GatewayProvider | null {
       Boolean(channel),
     );
   return {
-    id: raw.id,
+    id: providerId,
     kind,
     name: typeof raw.name === 'string' && raw.name ? raw.name : raw.id,
     adapter,
     channels,
   };
+}
+
+function gatewayChannelApiKey(
+  providerId: string,
+  channelId: string,
+  fallback?: string,
+): string | undefined {
+  if (!secureStorageAvailable()) return fallback;
+  return (
+    readSecureRecordValue(
+      GATEWAY_CHANNEL_API_KEYS_SECRET,
+      gatewayChannelSecretKey(providerId, channelId),
+    ) ||
+    readSecureRecordValue(PROVIDER_API_KEYS_SECRET, providerId) ||
+    fallback
+  );
 }
 
 function stringRecord(value: object): Record<string, string> {
@@ -190,10 +219,33 @@ function readStoredGatewayConfig(): GatewayConfig {
           .map(normalizeProvider)
           .filter((provider): provider is GatewayProvider => provider !== null)
       : [];
+    if (
+      secureStorageAvailable() &&
+      Array.isArray(raw.providers) &&
+      raw.providers.some(providerHasInlineApiKey)
+    ) {
+      saveGatewayConfig({ version: 1, providers });
+    }
     return { version: 1, providers };
   } catch {
     return { version: 1, providers: [] };
   }
+}
+
+function providerHasInlineApiKey(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const channels = (value as Record<string, unknown>).channels;
+  return (
+    Array.isArray(channels) &&
+    channels.some(
+      (channel) =>
+        typeof channel === 'object' &&
+        channel !== null &&
+        typeof (channel as Record<string, unknown>).apiKey === 'string',
+    )
+  );
 }
 
 function readLegacyProviders(): LegacyProvider[] {
@@ -212,7 +264,10 @@ function readLegacyProviders(): LegacyProvider[] {
           kind: typeof raw.kind === 'string' ? raw.kind : undefined,
           adapter: typeof raw.adapter === 'string' ? raw.adapter : undefined,
           name: typeof raw.name === 'string' ? raw.name : undefined,
-          apiKey: typeof raw.apiKey === 'string' ? raw.apiKey : undefined,
+          apiKey: legacyProviderApiKey(
+            raw.id,
+            typeof raw.apiKey === 'string' ? raw.apiKey : undefined,
+          ),
           baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl : undefined,
           transport:
             typeof raw.transport === 'string' ? raw.transport : undefined,
@@ -223,6 +278,11 @@ function readLegacyProviders(): LegacyProvider[] {
   } catch {
     return [];
   }
+}
+
+function legacyProviderApiKey(providerId: string, fallback?: string): string | undefined {
+  if (!secureStorageAvailable()) return fallback;
+  return readSecureRecordValue(PROVIDER_API_KEYS_SECRET, providerId) || fallback;
 }
 
 function legacyKind(value: LegacyProvider): string {
@@ -327,19 +387,43 @@ export function loadGatewayConfig(): GatewayConfig {
 }
 
 export function saveGatewayConfig(config: GatewayConfig): void {
+  if (secureStorageAvailable()) {
+    const apiKeys: Record<string, string> = {};
+    for (const provider of config.providers) {
+      for (const channel of provider.channels) {
+        const apiKey = channel.apiKey?.trim();
+        if (apiKey) {
+          apiKeys[gatewayChannelSecretKey(provider.id, channel.id)] = apiKey;
+        }
+      }
+    }
+    writeSecureRecord(GATEWAY_CHANNEL_API_KEYS_SECRET, apiKeys);
+  }
   rawSet(
     GATEWAY_CONFIG_STORAGE,
     JSON.stringify({
       version: 1,
-      providers: config.providers.map((provider) => ({
-        ...provider,
-        channels: provider.channels.map((channel) => ({
-          ...channel,
-          route: { ...channel.route },
-        })),
-      })),
+      providers: config.providers.map(gatewayProviderForStorage),
     }),
   );
+}
+
+function gatewayProviderForStorage(provider: GatewayProvider): GatewayProvider {
+  if (!secureStorageAvailable()) {
+    return {
+      ...provider,
+      channels: provider.channels.map((channel) => ({
+        ...channel,
+        route: { ...channel.route },
+      })),
+    };
+  }
+  return {
+    ...provider,
+    channels: provider.channels.map((channel) => {
+      return { ...channel, apiKey: undefined, route: { ...channel.route } };
+    }),
+  };
 }
 
 export function listGatewayProviders(): GatewayProvider[] {

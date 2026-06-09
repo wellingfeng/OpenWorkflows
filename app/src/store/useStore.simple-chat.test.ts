@@ -24,6 +24,10 @@ const tauriMocks = vi.hoisted(() => ({
   tauriAvailable: vi.fn(() => false),
 }));
 
+const notificationMocks = vi.hoisted(() => ({
+  notifySessionComplete: vi.fn(),
+}));
+
 vi.mock('@/lib/modelGateway/modelGateway', async () => {
   const actual = await vi.importActual<
     typeof import('@/lib/modelGateway/modelGateway')
@@ -50,9 +54,20 @@ vi.mock('@/lib/tauri', async () => {
   };
 });
 
+vi.mock('@/lib/sessionNotification', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/sessionNotification')>(
+    '@/lib/sessionNotification',
+  );
+  return {
+    ...actual,
+    notifySessionComplete: notificationMocks.notifySessionComplete,
+  };
+});
+
 import { useStore } from './useStore';
 import { isActiveAiEditingSession, isWorkflowReadOnly } from './useStore';
 import { historyStore } from './history/store';
+import type { Message, Session } from './types';
 
 function cloneGraph(graph: IRGraph): IRGraph {
   return JSON.parse(JSON.stringify(graph)) as IRGraph;
@@ -147,6 +162,7 @@ afterEach(async () => {
   tauriMocks.freeProxyEnsure.mockReset();
   tauriMocks.isTauri.mockReset();
   tauriMocks.tauriAvailable.mockReset();
+  notificationMocks.notifySessionComplete.mockReset();
   tauriMocks.freeProxyEnsure.mockResolvedValue({ port: 8766, token: 'test-token' });
   tauriMocks.isTauri.mockReturnValue(false);
   tauriMocks.tauriAvailable.mockReturnValue(false);
@@ -187,6 +203,78 @@ describe('simple-workflow chat mode', () => {
     expect(record?.title).toBe('未命名会话');
     expect(record?.isWorkflow).toBe(false);
     expect(record?.workflow).toBeUndefined();
+  });
+
+  it('branches a chat session from a selected assistant reply', async () => {
+    window.localStorage.clear();
+    await historyStore.ready();
+    const workspace = await historyStore.resolveWorkspaceByPath('');
+    const sourceMessages: Message[] = [
+      { id: 'm_user_1', role: 'user', text: '第一个问题', createdAt: 1 },
+      { id: 'm_ai_1', role: 'assistant', text: '第一个回答', createdAt: 2 },
+      { id: 'm_user_2', role: 'user', text: '第二个问题', createdAt: 3 },
+      { id: 'm_ai_2', role: 'assistant', text: '第二个回答', createdAt: 4 },
+      { id: 'm_user_3', role: 'user', text: '第三个问题', createdAt: 5 },
+      { id: 'm_ai_3', role: 'assistant', text: '第三个回答', createdAt: 6 },
+    ];
+    const sourceRecord = await historyStore.createSession({
+      workspaceId: workspace.id,
+      isWorkflow: false,
+      title: '原始会话',
+      messages: sourceMessages,
+    });
+    const sourceSession: Session = {
+      id: sourceRecord.id,
+      workspaceId: workspace.id,
+      title: sourceRecord.title,
+      createdAt: sourceRecord.createdAt,
+      updatedAt: sourceRecord.updatedAt,
+      isWorkflow: false,
+      preview: sourceMessages.at(-1)?.text,
+      messageCount: sourceMessages.length,
+    };
+    resetStore(defaultBlueprint('Current workflow'));
+    useStore.setState({
+      historyReady: true,
+      activeWorkspaceId: workspace.id,
+      workspaces: [workspace],
+      sessions: [sourceSession],
+      sessionTree: { [workspace.id]: [sourceSession] },
+      activeSessionId: sourceRecord.id,
+      messages: sourceMessages,
+      workflow: simpleBlueprint('原始会话'),
+      locale: 'zh-CN',
+    });
+
+    useStore.getState().branchSessionFromMessage('m_ai_2');
+
+    await waitFor(
+      () =>
+        useStore.getState().activeSessionId !== sourceRecord.id &&
+        useStore.getState().messages.length === 4,
+      'branched chat session activation',
+    );
+
+    const state = useStore.getState();
+    const branchSessionId = state.activeSessionId;
+    const branchRecord = branchSessionId
+      ? await historyStore.getSession(workspace.id, branchSessionId)
+      : null;
+
+    expect(state.sessions[0]?.title).toBe('分支：原始会话');
+    expect(state.messages.map((message) => message.id)).toEqual([
+      'm_user_1',
+      'm_ai_1',
+      'm_user_2',
+      'm_ai_2',
+    ]);
+    expect(branchRecord?.messages.map((message) => message.id)).toEqual([
+      'm_user_1',
+      'm_ai_1',
+      'm_user_2',
+      'm_ai_2',
+    ]);
+    expect(branchRecord?.isWorkflow).toBe(false);
   });
 
   it('uses the General CLI selection as the default gateway for new simple sessions', async () => {
@@ -1370,6 +1458,44 @@ describe('simple-workflow chat mode', () => {
     ]);
   });
 
+  it('does not notify completion while another chat turn in the same session is still running', async () => {
+    resetStore(simpleBlueprint('Simple chat'));
+    mockDirectRoute();
+    const resolvers: Array<(value: string) => void> = [];
+    gatewayMocks.completeGatewayText.mockImplementation(
+      async () => new Promise<string>((resolve) => resolvers.push(resolve)),
+    );
+
+    useStore.getState().sendPrompt('问题一');
+    await waitFor(() => resolvers.length === 1, 'first chat call');
+    useStore.getState().sendPrompt('问题二');
+    await waitFor(() => resolvers.length === 2, 'second chat call');
+
+    resolvers[1]('答二');
+    await waitFor(
+      () =>
+        useStore
+          .getState()
+          .messages.some((m) => m.role === 'assistant' && m.text.includes('答二')),
+      'second chat reply',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notificationMocks.notifySessionComplete).not.toHaveBeenCalled();
+
+    resolvers[0]('答一');
+    await waitFor(
+      () => !useStore.getState().aiStreaming,
+      'all chat turns to finish',
+    );
+    await waitFor(
+      () => notificationMocks.notifySessionComplete.mock.calls.length === 1,
+      'session completion notification',
+    );
+    expect(notificationMocks.notifySessionComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'success' }),
+    );
+  });
+
   it('blocks sending to a different model while the current model is still answering', async () => {
     resetStore(simpleBlueprint('Simple chat'));
     mockDirectRoute();
@@ -1747,5 +1873,98 @@ describe('simple-workflow chat mode', () => {
       () => !useStore.getState().aiStreaming,
       'stream to settle',
     );
+  });
+
+  it('keeps a deleted simple chat turn deleted after switching sessions', async () => {
+    window.localStorage.clear();
+    await historyStore.ready();
+    const workspace = await historyStore.resolveWorkspaceByPath('');
+    resetStore(simpleBlueprint('Simple chat'));
+    const workflowA = simpleBlueprint('Chat A');
+    const sessionA = await historyStore.createSession({
+      workspaceId: workspace.id,
+      isWorkflow: true,
+      workflow: workflowA,
+      title: 'Chat A',
+    });
+    const sessionB = await historyStore.createSession({
+      workspaceId: workspace.id,
+      isWorkflow: true,
+      workflow: simpleBlueprint('Chat B'),
+      title: 'Chat B',
+    });
+    const sessionTree = {
+      [workspace.id]: [
+        {
+          id: sessionA.id,
+          workspaceId: workspace.id,
+          title: sessionA.title,
+          createdAt: sessionA.createdAt,
+          updatedAt: sessionA.updatedAt,
+          isWorkflow: true,
+          messageCount: 0,
+          simple: true,
+        },
+        {
+          id: sessionB.id,
+          workspaceId: workspace.id,
+          title: sessionB.title,
+          createdAt: sessionB.createdAt,
+          updatedAt: sessionB.updatedAt,
+          isWorkflow: true,
+          messageCount: 0,
+          simple: true,
+        },
+      ],
+    };
+    useStore.setState({
+      historyReady: true,
+      activeWorkspaceId: workspace.id,
+      activeSessionId: sessionA.id,
+      workspaces: [workspace],
+      sessions: sessionTree[workspace.id],
+      sessionTree,
+      workflow: workflowA,
+      locale: 'zh-CN',
+    });
+    mockDirectRoute();
+    gatewayMocks.completeGatewayText.mockResolvedValue('临时回答。');
+
+    useStore.getState().sendPrompt('临时问题');
+    await waitFor(
+      () =>
+        !useStore.getState().aiStreaming &&
+        useStore
+          .getState()
+          .messages.some((m) => m.role === 'assistant' && m.text.includes('临时回答')),
+      'simple chat answer',
+    );
+
+    const assistantId = useStore
+      .getState()
+      .messages.find((message) => message.role === 'assistant')?.id;
+    expect(assistantId).toBeTruthy();
+    useStore.getState().deleteMessage(assistantId!);
+
+    await waitFor(async () => {
+      const record = await historyStore.getSession(workspace.id, sessionA.id);
+      return record?.messages.length === 0;
+    }, 'deleted turn persistence');
+
+    useStore.getState().selectSession(sessionB.id, workspace.id);
+    await waitFor(
+      () => useStore.getState().activeSessionId === sessionB.id,
+      'session B activation',
+    );
+    useStore.getState().selectSession(sessionA.id, workspace.id);
+    await waitFor(
+      () => useStore.getState().activeSessionId === sessionA.id,
+      'session A reactivation',
+    );
+
+    const record = await historyStore.getSession(workspace.id, sessionA.id);
+    expect(useStore.getState().messages).toEqual([]);
+    expect(record?.messages).toEqual([]);
+    expect(record?.workflow?.nodes[0]?.params.userInputs).toEqual([]);
   });
 });

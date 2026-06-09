@@ -2,6 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, DownloadCloud, SquareTerminal, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import {
+  loadShortcutSettings,
+  matchesShortcut,
+  subscribeShortcutSettings,
+} from '@/lib/keyboardShortcuts';
+import {
   isTauri,
   localModelHardware,
   openExternal,
@@ -96,17 +101,25 @@ export default function LocalModelSetupDialog({
   const [starting, setStarting] = useState(false);
   const [started, setStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [shortcutSettings, setShortcutSettingsState] = useState(
+    loadShortcutSettings,
+  );
   const userPickedRef = useRef(false);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (!matchesShortcut(event, shortcutSettings['modal-close'])) return;
       event.preventDefault();
       onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [onClose, shortcutSettings]);
+
+  useEffect(
+    () => subscribeShortcutSettings(setShortcutSettingsState),
+    [],
+  );
 
   useEffect(() => {
     let disposed = false;

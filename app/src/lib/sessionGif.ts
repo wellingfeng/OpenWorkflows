@@ -14,7 +14,7 @@
  *   3. Quantize each frame to a 256-colour palette and encode with gifenc.
  *
  * Saving mirrors the PNG path: automatic desktop save under
- * `.omc/session-captures`, blob download in the browser.
+ * `.freeultracode/session-captures`, blob download in the browser.
  *
  * As with the static capture, faithful frames require every message to already
  * be mounted with its rich renderer — the caller forces eager rendering and

@@ -6,13 +6,18 @@ import {
 } from 'react';
 import {
   AlarmClock,
+  ChevronDown,
+  ChevronRight,
+  FolderOpen,
   Pencil,
   Search,
+  Settings as SettingsGlyph,
   Star,
   Trash2,
   X,
 } from 'lucide-react';
 import StatusIndicator, { type StatusTone } from '@/components/StatusIndicator';
+import { cn } from '@/lib/cn';
 import {
   sessionLiveStatus,
   useStore,
@@ -24,9 +29,16 @@ import {
 import type { ScheduledTaskConfig, Session } from '@/store/types';
 import type { WorkspaceSummary } from '@/store/history/types';
 import type { Locale } from '@/lib/i18n';
+import { projectHealth, type ProjectHealthTone } from '@/lib/projectSettings';
+import {
+  openWorkspaceDirectory,
+  scanProjectEnvironment,
+  type ProjectEnvironmentScan,
+} from '@/lib/tauri';
 import { useResizableWidth } from '@/lib/useResizableWidth';
 import { t } from '@/lib/i18n';
 import SettingsModal from './SettingsModal';
+import ProjectSettingsModal from './ProjectSettingsModal';
 import ScheduledTaskDialog from './ScheduledTaskDialog';
 
 /**
@@ -60,6 +72,10 @@ type SidebarLiveState = {
   runningSessions: WorkflowSessionKey[];
   aiEditingSessions: WorkflowSessionKey[];
   chattingSessions: WorkflowSessionKey[];
+};
+type ProjectScanCacheEntry = {
+  path: string;
+  scan: ProjectEnvironmentScan | null;
 };
 
 function sessionSortTimestamp(session: Session): number {
@@ -153,6 +169,14 @@ function historyStatusTone(
     return 'failed';
   }
   return session.isWorkflow && !session.simple ? 'unrun' : null;
+}
+
+function projectStatusClassName(tone: ProjectHealthTone): string {
+  if (tone === 'connected') return 'bg-emerald-400 shadow-[0_0_0_2px_rgba(52,211,153,0.16)]';
+  if (tone === 'failed') return 'bg-red-400 shadow-[0_0_0_2px_rgba(248,113,113,0.16)]';
+  if (tone === 'configured') return 'bg-amber-400 shadow-[0_0_0_2px_rgba(251,191,36,0.16)]';
+  if (tone === 'detected') return 'bg-sky-400 shadow-[0_0_0_2px_rgba(56,189,248,0.16)]';
+  return 'bg-fg-faint/40';
 }
 
 function deleteProtectionLabel(
@@ -263,6 +287,7 @@ export default function Sidebar() {
   const aiEditingSessions = useStore((s) => s.aiEditingSessions);
   const chattingSessions = useStore((s) => s.chattingSessions);
   const newSession = useStore((s) => s.newSession);
+  const setWorkspace = useStore((s) => s.setWorkspace);
   const selectSession = useStore((s) => s.selectSession);
   const deleteSession = useStore((s) => s.deleteSession);
   const renameWorkflowSession = useStore((s) => s.renameWorkflowSession);
@@ -273,7 +298,15 @@ export default function Sidebar() {
     (s) => s.setWorkflowScheduledTaskSession,
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [projectSettingsWorkspace, setProjectSettingsWorkspace] =
+    useState<WorkspaceSummary | null>(null);
+  const [projectScanCache, setProjectScanCache] = useState<
+    Record<string, ProjectScanCacheEntry>
+  >({});
   const [workspaceLimits, setWorkspaceLimits] = useState<Record<string, number>>({});
+  const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<
+    Record<string, boolean>
+  >({});
   const [flatLimit, setFlatLimit] = useState(WORKFLOW_HISTORY_PAGE_SIZE);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTab, setActiveTab] = useState<SidebarTab>('history');
@@ -307,6 +340,11 @@ export default function Sidebar() {
   const [renameDraft, setRenameDraft] = useState('');
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameSaving, setRenameSaving] = useState(false);
+  const [workspaceMenu, setWorkspaceMenu] = useState<{
+    x: number;
+    y: number;
+    path: string;
+  } | null>(null);
 
   const menuDeleteProtectionReason = useMemo(() => {
     if (!menu) return null;
@@ -349,6 +387,7 @@ export default function Sidebar() {
       const aside = event.currentTarget.closest('aside');
       if (!aside) return;
       const rect = aside.getBoundingClientRect();
+      setWorkspaceMenu(null);
       setMenu({
         x: event.clientX - rect.left,
         y: event.clientY - rect.top,
@@ -363,6 +402,36 @@ export default function Sidebar() {
     },
     [],
   );
+
+  const onWorkspaceContextMenu = useCallback(
+    (event: React.MouseEvent, workspace: WorkspaceSummary) => {
+      const path = workspace.path?.trim();
+      if (!path) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const aside = event.currentTarget.closest('aside');
+      if (!aside) return;
+      const rect = aside.getBoundingClientRect();
+      setMenu(null);
+      setWorkspaceMenu({
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+        path,
+      });
+    },
+    [],
+  );
+
+  const handleOpenWorkspaceDirectory = useCallback(() => {
+    if (!workspaceMenu) return;
+    const path = workspaceMenu.path;
+    setWorkspaceMenu(null);
+    void openWorkspaceDirectory(path).then((opened) => {
+      if (!opened && typeof window !== 'undefined') {
+        window.alert('当前环境不能打开系统文件浏览器。请使用桌面端。');
+      }
+    });
+  }, [workspaceMenu]);
 
   const handleDelete = useCallback(() => {
     if (!menu) return;
@@ -545,13 +614,65 @@ export default function Sidebar() {
 
   /** Close the context menu on Escape. */
   useEffect(() => {
-    if (!menu) return;
+    if (!menu && !workspaceMenu) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenu(null);
+      if (e.key === 'Escape') {
+        setMenu(null);
+        setWorkspaceMenu(null);
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [menu]);
+  }, [menu, workspaceMenu]);
+
+  useEffect(() => {
+    const targets = workspaces.filter((workspace) => {
+      const path = workspace.path?.trim();
+      if (!path) return false;
+      return projectScanCache[workspace.id]?.path !== path;
+    });
+    if (targets.length === 0) return;
+
+    let cancelled = false;
+    setProjectScanCache((prev) => {
+      const next = { ...prev };
+      for (const workspace of targets) {
+        next[workspace.id] = { path: workspace.path.trim(), scan: null };
+      }
+      return next;
+    });
+    for (const workspace of targets) {
+      const path = workspace.path.trim();
+      void scanProjectEnvironment(path)
+        .then((scan) => {
+          if (cancelled) return;
+          setProjectScanCache((prev) => ({
+            ...prev,
+            [workspace.id]: { path, scan },
+          }));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setProjectScanCache((prev) => ({
+            ...prev,
+            [workspace.id]: { path, scan: null },
+          }));
+        });
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectScanCache, workspaces]);
+
+  const handleProjectWorkspaceUpdated = useCallback(
+    (updated: WorkspaceSummary) => {
+      setProjectSettingsWorkspace((current) =>
+        current?.id === updated.id ? updated : current,
+      );
+    },
+    [],
+  );
 
   const loadMoreWorkspace = useCallback((workspaceId: string) => {
     setWorkspaceLimits((prev) => ({
@@ -570,6 +691,13 @@ export default function Sidebar() {
         (prev[workspaceId] ?? WORKFLOW_HISTORY_PAGE_SIZE) -
           WORKFLOW_HISTORY_PAGE_SIZE,
       ),
+    }));
+  }, []);
+
+  const toggleWorkspaceCollapsed = useCallback((workspaceId: string) => {
+    setCollapsedWorkspaces((prev) => ({
+      ...prev,
+      [workspaceId]: !prev[workspaceId],
     }));
   }, []);
 
@@ -919,6 +1047,8 @@ export default function Sidebar() {
                 const fullList = tabSessions;
                 const currentLimit =
                   workspaceLimits[workspace.id] ?? WORKFLOW_HISTORY_PAGE_SIZE;
+                const workspaceCollapsed =
+                  !isSearching && collapsedWorkspaces[workspace.id] === true;
                 const visibleList = isSearching
                   ? list
                   : list.slice(0, currentLimit);
@@ -930,34 +1060,73 @@ export default function Sidebar() {
                 const showWorkspaceLoadMore =
                   !isSearching && fullList.length > currentLimit;
                 const workspaceActive = workspace.id === activeWorkspaceId;
+                const projectScan = projectScanCache[workspace.id]?.scan;
+                const projectState = projectHealth(workspace, projectScan);
                 return (
                   <li key={workspace.id} className="flex flex-col gap-1.5">
                     <div
+                      onContextMenu={(e) => onWorkspaceContextMenu(e, workspace)}
                       className={
-                        'rounded-md border px-2.5 py-1.5 transition-colors ' +
+                        'grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-1.5 rounded-md border px-2.5 py-1.5 transition-colors ' +
                         (workspaceActive
                           ? 'border-border bg-panel-2'
                           : 'border-border-soft bg-panel hover:border-border hover:bg-panel-2/60')
                       }
                     >
-                      <div className="flex items-center gap-2 text-[11px] font-semibold text-fg">
-                        <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded border border-border-soft bg-bg-alt text-fg-faint">
-                          ▾
-                        </span>
-                        <span className="min-w-0 flex-1 truncate" title={workspace.path}>
-                          {workspace.name}
-                        </span>
-                        <span className="rounded border border-border-soft bg-bg-alt px-1.5 py-0.5 font-mono text-[10px] font-semibold leading-none text-fg-dim">
+                      <button
+                        type="button"
+                        aria-expanded={!workspaceCollapsed}
+                        aria-label={workspaceCollapsed ? '展开工作区会话' : '收起工作区会话'}
+                        title={workspaceCollapsed ? '展开工作区会话' : '收起工作区会话'}
+                        onClick={() => toggleWorkspaceCollapsed(workspace.id)}
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-border-soft bg-bg-alt text-fg-faint transition-colors hover:border-accent hover:text-fg"
+                      >
+                        {workspaceCollapsed ? (
+                          <ChevronRight size={12} aria-hidden="true" />
+                        ) : (
+                          <ChevronDown size={12} aria-hidden="true" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setWorkspace(workspace.path)}
+                        className="min-w-0 text-left"
+                      >
+                        <div className="flex min-w-0 items-center gap-2 text-[11px] font-semibold leading-4 text-fg">
+                          <span
+                            className={cn(
+                              'h-2 w-2 shrink-0 rounded-full',
+                              projectStatusClassName(projectState.tone),
+                            )}
+                            title={`${projectState.label}：${projectState.detail}`}
+                            aria-label={projectState.label}
+                          />
+                          <span className="min-w-0 flex-1 truncate" title={workspace.path}>
+                            {workspace.name}
+                          </span>
+                        </div>
+                        {workspace.path && (
+                          <div className="truncate pl-8 font-mono text-[9px] text-fg-faint">
+                            {workspace.path}
+                          </div>
+                        )}
+                      </button>
+                      <div className="flex h-6 shrink-0 items-center gap-1 self-center">
+                        <span className="inline-flex h-5 min-w-6 items-center justify-center rounded border border-border-soft bg-bg-alt px-1.5 font-mono text-[10px] font-semibold leading-none tabular-nums text-fg-dim">
                           {fullList.length}
                         </span>
+                        <button
+                          type="button"
+                          title="项目设置"
+                          aria-label="项目设置"
+                          onClick={() => setProjectSettingsWorkspace(workspace)}
+                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-border-soft bg-bg-alt text-fg-faint transition-colors hover:border-accent hover:text-fg"
+                        >
+                          <SettingsGlyph size={13} aria-hidden="true" />
+                        </button>
                       </div>
-                      {workspace.path && (
-                        <div className="truncate pl-6 font-mono text-[9px] text-fg-faint">
-                          {workspace.path}
-                        </div>
-                      )}
                     </div>
-                    {list.length === 0 ? (
+                    {workspaceCollapsed ? null : list.length === 0 ? (
                       <div className="px-6 py-1 text-xs text-fg-faint">
                         {t(locale, 'sidebar.emptySessions')}
                       </div>
@@ -1335,6 +1504,14 @@ export default function Sidebar() {
         <SettingsModal onClose={() => setSettingsOpen(false)} />
       )}
 
+      {projectSettingsWorkspace && (
+        <ProjectSettingsModal
+          workspace={projectSettingsWorkspace}
+          onWorkspaceUpdated={handleProjectWorkspaceUpdated}
+          onClose={() => setProjectSettingsWorkspace(null)}
+        />
+      )}
+
       {menu && (
         <SessionContextMenu
           x={menu.x}
@@ -1355,6 +1532,15 @@ export default function Sidebar() {
           onClose={() => setMenu(null)}
         />
       )}
+      {workspaceMenu && (
+        <WorkspaceContextMenu
+          x={workspaceMenu.x}
+          y={workspaceMenu.y}
+          locale={locale}
+          onOpenDirectory={handleOpenWorkspaceDirectory}
+          onClose={() => setWorkspaceMenu(null)}
+        />
+      )}
       {scheduleDialog && (
         <ScheduledTaskDialog
           locale={locale}
@@ -1366,6 +1552,46 @@ export default function Sidebar() {
         />
       )}
     </aside>
+  );
+}
+
+function WorkspaceContextMenu({
+  x,
+  y,
+  locale,
+  onOpenDirectory,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  locale: Locale;
+  onOpenDirectory: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-30"
+        onClick={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        className="absolute z-40 min-w-[156px] overflow-hidden rounded-md border border-border bg-panel shadow-2xl"
+        style={{ left: x, top: y }}
+      >
+        <button
+          type="button"
+          onClick={onOpenDirectory}
+          className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-fg-dim transition-colors hover:bg-panel-2 hover:text-fg"
+        >
+          <FolderOpen size={13} className="text-fg-faint" />
+          <span>{t(locale, 'sidebar.openWorkspaceDirectory')}</span>
+        </button>
+      </div>
+    </>
   );
 }
 

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "FreeUltraCode",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "identifier": "com.freeultracode.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -20,7 +20,8 @@
         "minHeight": 700,
         "resizable": true,
         "fullscreen": false,
-        "center": true
+        "center": true,
+        "dragDropEnabled": true
       }
     ],
     "security": {

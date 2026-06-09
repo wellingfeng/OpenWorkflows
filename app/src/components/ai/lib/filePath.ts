@@ -163,6 +163,10 @@ function decodePercentPath(raw: string): string {
   }
 }
 
+function stripFileMentionPrefix(path: string): string {
+  return path.startsWith('@') ? path.slice(1) : path;
+}
+
 function pathFromFileUrl(raw: string): string | null {
   if (!/^file:\/\//i.test(raw)) return null;
   try {
@@ -185,12 +189,14 @@ export function looksLikePath(raw: string, opts: FileRefParseOptions = {}): bool
   if (!opts.allowSpaces && /\s/.test(s)) return false;
   const fileUrlPath = pathFromFileUrl(s);
   if (fileUrlPath) return looksLikePath(fileUrlPath, opts);
-  if (/^[a-z]+:\/\//i.test(s)) return false; // url scheme -> not a file chip
-  if (/[\\/]/.test(s)) return true; // a path separator is strong evidence
+  const candidate = stripFileMentionPrefix(s);
+  if (!candidate) return false;
+  if (/^[a-z]+:\/\//i.test(candidate)) return false; // url scheme -> not a file chip
+  if (/[\\/]/.test(candidate)) return true; // a path separator is strong evidence
   // No separator: require a recognised file extension so `2.0` / `react.foo`
   // are not mistaken for files, or a known extensionless config/build filename.
-  const ext = extensionOf(s);
-  return (ext != null && KNOWN_EXT.has(ext)) || knownBasename(s);
+  const ext = extensionOf(candidate);
+  return (ext != null && KNOWN_EXT.has(ext)) || knownBasename(candidate);
 }
 
 function basenameOf(path: string): string {
@@ -224,7 +230,8 @@ export function parseFileRef(
   const m = FILE_REF.exec(s);
   if (!m) return null;
 
-  const path = m[1];
+  const rawPath = m[1];
+  const path = stripFileMentionPrefix(rawPath);
   // The path on its own must still look like a file (the line/col may have
   // consumed a trailing number, so re-check the captured path part): a
   // separator, or a recognised file extension.
@@ -249,7 +256,7 @@ export function parseFileRef(
   let endLine: number | undefined;
   let col: number | undefined;
   if (second !== undefined) {
-    const tail = s.slice(path.length);
+    const tail = s.slice(rawPath.length);
     if (/-/.test(tail)) endLine = second;
     else col = second;
   }

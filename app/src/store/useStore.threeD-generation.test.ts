@@ -24,14 +24,26 @@ import { useStore } from './useStore';
 
 const THREE_D_SETTINGS_KEY = 'freeultracode.threeDGeneration.v1';
 
+type ThreeDSettingsTestOverride = Partial<Omit<ThreeDGenerationSettings, 'rigging'>> & {
+  rigging?: Partial<ThreeDGenerationSettings['rigging']>;
+};
+
 function cloneGraph(graph: IRGraph): IRGraph {
   return JSON.parse(JSON.stringify(graph)) as IRGraph;
 }
 
-function writeThreeDSettings(partial: Partial<ThreeDGenerationSettings>): void {
+function writeThreeDSettings(partial: ThreeDSettingsTestOverride): void {
+  const { rigging, ...rest } = partial;
   window.localStorage.setItem(
     THREE_D_SETTINGS_KEY,
-    JSON.stringify({ ...DEFAULT_THREE_D_GENERATION_SETTINGS, ...partial }),
+    JSON.stringify({
+      ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      ...rest,
+      rigging: {
+        ...DEFAULT_THREE_D_GENERATION_SETTINGS.rigging,
+        ...rigging,
+      },
+    }),
   );
 }
 
@@ -111,8 +123,8 @@ describe('3D generation chat flow', () => {
     );
     tauriMocks.downloadModelAsset.mockImplementation(async (url: string) => ({
       path: url.endsWith('.zip')
-        ? 'E:\\OpenWorkflows\\.omc\\model-assets\\model.zip'
-        : 'E:\\OpenWorkflows\\.omc\\model-assets\\model.glb',
+        ? 'E:\\OpenWorkflows\\.freeultracode\\model-assets\\model.zip'
+        : 'E:\\OpenWorkflows\\.freeultracode\\model-assets\\model.glb',
       mime: url.endsWith('.zip') ? 'application/zip' : 'model/gltf-binary',
       sizeBytes: 4,
     }));
@@ -146,7 +158,7 @@ describe('3D generation chat flow', () => {
     );
     expect(assistant?.text).toContain('已下载到本地');
     expect(assistant?.text).toContain(
-      '[预览 3D 模型 1](file:///E:/OpenWorkflows/.omc/model-assets/model.glb)',
+      '[预览 3D 模型 1](file:///E:/OpenWorkflows/.freeultracode/model-assets/model.glb)',
     );
     expect(assistant?.text).not.toContain(
       '[预览 3D 模型 1](https://assets.meshy.ai/tasks/refined/model.glb)',
@@ -162,6 +174,7 @@ describe('3D generation chat flow', () => {
         'local-3d-server': 'http://127.0.0.1:8080/generate',
         'fal-meshy-v6': 'https://queue.test',
       },
+      rigging: { enabled: true },
     });
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
@@ -184,7 +197,7 @@ describe('3D generation chat flow', () => {
         ),
       );
     tauriMocks.downloadModelAsset.mockResolvedValue({
-      path: 'E:\\OpenWorkflows\\.omc\\model-assets\\character-rigged.glb',
+      path: 'E:\\OpenWorkflows\\.freeultracode\\model-assets\\character-rigged.glb',
       mime: 'model/gltf-binary',
       sizeBytes: 4,
     });
@@ -220,7 +233,7 @@ describe('3D generation chat flow', () => {
     );
     expect(assistant?.text).toContain('fal.ai Meshy Rigging 自动绑骨完成');
     expect(assistant?.text).toContain(
-      '[预览 3D 模型 1](file:///E:/OpenWorkflows/.omc/model-assets/character-rigged.glb)',
+      '[预览 3D 模型 1](file:///E:/OpenWorkflows/.freeultracode/model-assets/character-rigged.glb)',
     );
     expect(assistant?.text).not.toContain('character.glb)');
   });
@@ -244,7 +257,7 @@ describe('3D generation chat flow', () => {
       ),
     );
     tauriMocks.downloadModelAsset.mockResolvedValue({
-      path: 'E:\\OpenWorkflows\\.omc\\model-assets\\young-doll.glb',
+      path: 'E:\\OpenWorkflows\\.freeultracode\\model-assets\\young-doll.glb',
       mime: 'model/gltf-binary',
       sizeBytes: 4,
     });

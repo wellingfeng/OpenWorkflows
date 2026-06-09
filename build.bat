@@ -16,10 +16,32 @@ node -e "const [maj,min]=process.versions.node.split('.').map(Number); process.e
 where cargo >nul 2>nul || ( echo [X] Rust/cargo not found: https://rustup.rs & pause & exit /b 1 )
 for /f "delims=" %%v in ('node -v') do echo [OK] Node.js %%v
 for /f "delims=" %%v in ('cargo -V') do echo [OK] %%v
+where rc >nul 2>nul
+if errorlevel 1 (
+    set "RC="
+    for /f "delims=" %%R in ('powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\find-windows-rc.ps1" x64 2^>nul') do set "RC=%%R"
+    if not defined RC (
+        echo [X] Windows SDK resource compiler rc.exe not found.
+        echo     Install "Windows SDK" or Visual Studio Build Tools with "Desktop development with C++".
+        pause & exit /b 1
+    )
+    for %%D in ("!RC!") do set "PATH=%%~dpD;!PATH!"
+    echo [OK] Windows resource compiler: !RC!
+) else (
+    for /f "delims=" %%R in ('where rc 2^>nul') do (
+        echo [OK] Windows resource compiler: %%R
+    )
+)
 
-if not exist "node_modules" (
-    echo [..] installing dependencies ...
-    call npm install || ( echo [X] npm install failed & pause & exit /b 1 )
+echo [..] checking dependencies ...
+call npm install || ( echo [X] npm install failed & pause & exit /b 1 )
+
+if exist "src-tauri\target\release\FreeUltraCode.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\stop-running-exe.ps1" "src-tauri\target\release\FreeUltraCode.exe"
+    if errorlevel 1 (
+        echo [X] failed to close running exe before rebuild.
+        pause & exit /b 1
+    )
 )
 
 echo.
@@ -33,6 +55,13 @@ call npm run package
 if errorlevel 1 (
     echo.
     echo [X] build failed. See the log above.
+    pause & exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\needs-rebuild.ps1" "%~dp0app\src-tauri\target\release\FreeUltraCode.exe" "%~dp0" -WriteStamp
+if errorlevel 1 (
+    echo.
+    echo [X] failed to save build fingerprint.
     pause & exit /b 1
 )
 

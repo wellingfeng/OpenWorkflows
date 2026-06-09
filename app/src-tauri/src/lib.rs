@@ -14,6 +14,8 @@ mod cc_switch_import;
 mod cli_runtime;
 mod free_proxy;
 mod history;
+mod secure_store;
+mod storage_paths;
 
 /// Windows CreateProcess flag: don't allocate a console window for the child.
 /// Without this, spawning the `claude` console binary pops up a black terminal
@@ -28,6 +30,7 @@ const TRAY_MENU_QUIT_ID: &str = "tray-quit";
 const GITHUB_REPOSITORY_URL: &str = "https://github.com/wellingfeng/FreeUltraCode";
 const SINGLE_INSTANCE_WARNING_EVENT: &str = "single-instance-warning";
 const SINGLE_INSTANCE_WARNING_MESSAGE: &str = "只能同时运行一个进程";
+const SESSION_NOTIFICATION_CLICKED_EVENT: &str = "session-notification-clicked";
 const SLASH_CATALOG_UPDATED_EVENT: &str = "slash-catalog-updated";
 const MAX_SLASH_ENTRIES: usize = 800;
 const MAX_COMMAND_SCAN_DEPTH: usize = 4;
@@ -39,6 +42,123 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionNotificationClickPayload {
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+}
+
+fn emit_session_notification_click<R: Runtime>(
+    app: &AppHandle<R>,
+    payload: SessionNotificationClickPayload,
+) {
+    show_main_window(app);
+    let _ = app.emit(SESSION_NOTIFICATION_CLICKED_EVENT, payload);
+}
+
+#[tauri::command]
+fn focus_main_window(app: AppHandle) {
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn notify_session_complete(
+    app: AppHandle,
+    title: String,
+    body: String,
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+) -> Result<bool, String> {
+    let payload = SessionNotificationClickPayload {
+        workspace_id,
+        session_id,
+    };
+    show_session_completion_notification(app, title, body, payload)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_notification_app_id(app: &AppHandle) -> String {
+    let identifier = app.config().identifier.clone();
+    let current_dir = tauri::utils::platform::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()));
+    let Some(current_dir) = current_dir else {
+        return identifier;
+    };
+    let sep = std::path::MAIN_SEPARATOR;
+    if current_dir.ends_with(format!("{sep}target{sep}debug").as_str())
+        || current_dir.ends_with(format!("{sep}target{sep}release").as_str())
+    {
+        tauri_winrt_notification::Toast::POWERSHELL_APP_ID.to_string()
+    } else {
+        identifier
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_session_completion_notification(
+    app: AppHandle,
+    title: String,
+    body: String,
+    payload: SessionNotificationClickPayload,
+) -> Result<bool, String> {
+    use tauri_winrt_notification::{Duration, Toast};
+
+    let app_id = windows_notification_app_id(&app);
+    Toast::new(&app_id)
+        .title(&title)
+        .text2(&body)
+        .duration(Duration::Short)
+        .on_activated(move |_| {
+            emit_session_notification_click(&app, payload.clone());
+            Ok(())
+        })
+        .show()
+        .map_err(|err| format!("发送 Windows 通知失败: {err}"))?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn show_session_completion_notification(
+    app: AppHandle,
+    title: String,
+    body: String,
+    payload: SessionNotificationClickPayload,
+) -> Result<bool, String> {
+    std::thread::spawn(move || {
+        let bundle = if tauri::is_dev() {
+            "com.apple.Terminal".to_string()
+        } else {
+            app.config().identifier.clone()
+        };
+        let _ = mac_notification_sys::set_application(&bundle);
+        let mut notification = mac_notification_sys::Notification::new();
+        let response = notification
+            .title(&title)
+            .message(&body)
+            .wait_for_click(true)
+            .send();
+        if matches!(
+            response,
+            Ok(mac_notification_sys::NotificationResponse::Click)
+        ) {
+            emit_session_notification_click(&app, payload);
+        }
+    });
+    Ok(true)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn show_session_completion_notification(
+    _app: AppHandle,
+    _title: String,
+    _body: String,
+    _payload: SessionNotificationClickPayload,
+) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// Apply the no-console-window flag to a Command on Windows (no-op elsewhere).
@@ -261,6 +381,13 @@ struct UltracodeRunResult {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AiCliResult {
+    text: String,
+    usage: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct LocalFilePreview {
     path: String,
     file_name: String,
@@ -270,6 +397,87 @@ struct LocalFilePreview {
     truncated: bool,
     text: Option<String>,
     base64: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceTreeEntry {
+    name: String,
+    path: String,
+    relative_path: String,
+    kind: String,
+    hidden: bool,
+    size_bytes: Option<u64>,
+    modified_at_ms: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDirectoryListing {
+    root_path: String,
+    relative_path: String,
+    entries: Vec<WorkspaceTreeEntry>,
+    truncated: bool,
+    total_entries: usize,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChangeLine {
+    kind: String,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    content: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChangeFile {
+    path: String,
+    old_path: Option<String>,
+    status: String,
+    binary: bool,
+    truncated: bool,
+    lines: Vec<WorkspaceChangeLine>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChanges {
+    root_path: String,
+    generated_at_ms: u64,
+    source: String,
+    files: Vec<WorkspaceChangeFile>,
+    truncated: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChangeSnapshotFile {
+    path: String,
+    size_bytes: u64,
+    modified_at_ms: Option<u64>,
+    binary: bool,
+    truncated: bool,
+    content: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChangeBaseline {
+    root_path: String,
+    generated_at_ms: u64,
+    files: Vec<WorkspaceChangeSnapshotFile>,
+    truncated: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChangeBaselineSummary {
+    root_path: String,
+    generated_at_ms: u64,
+    file_count: usize,
+    truncated: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1607,6 +1815,10 @@ fn free_channel_key_file_candidates() -> Vec<PathBuf> {
             out.push(PathBuf::from(trimmed));
         }
     }
+    if let Ok(root) = storage_paths::global_root() {
+        out.push(root.join("channels").join("free-channels.private.json"));
+        out.push(root.join("free-channels.private.json"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             out.push(dir.join("free-channels.private.json"));
@@ -1708,14 +1920,22 @@ fn repair_claude_binary() {
     }
 }
 
-/// Write the generated script to a uniquely-named temp file and return its path.
-fn write_temp_script(script: &str) -> Result<std::path::PathBuf, String> {
-    let mut path = std::env::temp_dir();
-    let stamp = std::time::SystemTime::now()
+fn temp_stamp() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    path.push(format!("freeultracode-{stamp}.sh"));
+        .unwrap_or(0)
+}
+
+fn managed_temp_path(cwd: Option<&str>, bucket: &str, prefix: &str, ext: &str) -> PathBuf {
+    let mut path = storage_paths::managed_artifact_dir(cwd, bucket);
+    path.push(format!("{prefix}-{}.{ext}", temp_stamp()));
+    path
+}
+
+/// Write the generated script to a uniquely-named temp file and return its path.
+fn write_temp_script(script: &str) -> Result<std::path::PathBuf, String> {
+    let path = managed_temp_path(None, "scripts", "freeultracode", "sh");
     let mut file = std::fs::File::create(&path).map_err(|e| format!("无法创建临时脚本: {e}"))?;
     file.write_all(script.as_bytes())
         .map_err(|e| format!("写入临时脚本失败: {e}"))?;
@@ -1724,13 +1944,11 @@ fn write_temp_script(script: &str) -> Result<std::path::PathBuf, String> {
 
 /// Return a unique temp path for CLI side-channel output.
 fn temp_output_path(prefix: &str, ext: &str) -> std::path::PathBuf {
-    let mut path = std::env::temp_dir();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    path.push(format!("{prefix}-{stamp}.{ext}"));
-    path
+    temp_output_path_for_cwd(None, prefix, ext)
+}
+
+fn temp_output_path_for_cwd(cwd: Option<&str>, prefix: &str, ext: &str) -> std::path::PathBuf {
+    managed_temp_path(cwd, "sidecar", prefix, ext)
 }
 
 struct TempFileGuard {
@@ -1950,6 +2168,49 @@ async fn open_external(url: String) -> Result<(), String> {
         .map_err(|e| format!("打开外部链接任务失败: {e}"))?
 }
 
+fn open_workspace_directory_blocking(path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("工作区路径为空".to_string());
+    }
+
+    let dir = PathBuf::from(trimmed);
+    let metadata = std::fs::metadata(&dir).map_err(|e| format!("读取工作区目录失败：{e}"))?;
+    if !metadata.is_dir() {
+        return Err("工作区路径不是目录".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = new_spawn_command("explorer.exe");
+        c.arg(&dir);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = new_spawn_command("open");
+        c.arg(&dir);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = new_spawn_command("xdg-open");
+        c.arg(&dir);
+        c
+    };
+
+    cmd.spawn()
+        .map_err(|e| format!("打开工作区目录失败：{e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_workspace_directory(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || open_workspace_directory_blocking(path))
+        .await
+        .map_err(|e| format!("打开工作区目录任务失败: {e}"))?
+}
+
 const PREVIEW_TEXT_LIMIT: u64 = 1_500_000;
 const PREVIEW_IMAGE_LIMIT: u64 = 12 * 1024 * 1024;
 const PREVIEW_BASENAME_SEARCH_LIMIT: usize = 20_000;
@@ -2031,6 +2292,2187 @@ fn display_preview_path(path: &Path) -> String {
 #[cfg(not(windows))]
 fn display_preview_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+const WORKSPACE_TREE_ENTRY_LIMIT: usize = 500;
+const WORKSPACE_TREE_EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".freeultracode",
+    ".worktree",
+    ".omc",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".cache",
+    "binaries",
+    "deriveddatacache",
+    "intermediate",
+    "saved",
+];
+
+fn workspace_tree_relative_key(relative_path: Option<String>) -> String {
+    relative_path
+        .unwrap_or_default()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .trim()
+        .trim_matches('/')
+        .to_string()
+}
+
+fn workspace_tree_modified_at_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn workspace_tree_child_relative(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn workspace_tree_excluded_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    WORKSPACE_TREE_EXCLUDED_DIRS
+        .iter()
+        .any(|excluded| lower == *excluded)
+}
+
+fn workspace_tree_resolve_dir(
+    root_path: &str,
+    relative_path: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let root = PathBuf::from(root_path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("工作区路径为空。".to_string());
+    }
+    let root = std::fs::canonicalize(&root).map_err(|e| format!("读取工作区失败：{e}"))?;
+    if !root.is_dir() {
+        return Err("工作区不是文件夹。".to_string());
+    }
+
+    let relative = PathBuf::from(relative_path);
+    if relative.is_absolute() {
+        return Err("目录路径必须在工作区内。".to_string());
+    }
+    let target = if relative_path.is_empty() {
+        root.clone()
+    } else {
+        root.join(relative)
+    };
+    let target = std::fs::canonicalize(&target).map_err(|e| format!("读取目录失败：{e}"))?;
+    if !target.starts_with(&root) {
+        return Err("目录路径超出工作区。".to_string());
+    }
+    if !target.is_dir() {
+        return Err("目标不是文件夹。".to_string());
+    }
+
+    Ok((root, target))
+}
+
+fn list_workspace_dir_blocking(
+    root_path: String,
+    relative_path: Option<String>,
+) -> Result<WorkspaceDirectoryListing, String> {
+    let relative_path = workspace_tree_relative_key(relative_path);
+    let (root, target) = workspace_tree_resolve_dir(&root_path, &relative_path)?;
+    let mut entries = Vec::new();
+
+    for entry in std::fs::read_dir(&target).map_err(|e| format!("读取目录失败：{e}"))? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_dir = file_type.is_dir();
+        if is_dir && workspace_tree_excluded_dir(&name) {
+            continue;
+        }
+
+        let metadata = entry.metadata().ok();
+        entries.push(WorkspaceTreeEntry {
+            relative_path: workspace_tree_child_relative(&relative_path, &name),
+            path: display_preview_path(&entry.path()),
+            hidden: name.starts_with('.'),
+            size_bytes: metadata
+                .as_ref()
+                .and_then(|m| m.is_file().then_some(m.len())),
+            modified_at_ms: metadata.as_ref().and_then(workspace_tree_modified_at_ms),
+            kind: if is_dir { "directory" } else { "file" }.to_string(),
+            name,
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        let dir_rank = if a.kind == b.kind {
+            std::cmp::Ordering::Equal
+        } else if a.kind == "directory" {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
+        dir_rank.then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+                .then_with(|| a.name.cmp(&b.name))
+        })
+    });
+
+    let total_entries = entries.len();
+    let truncated = total_entries > WORKSPACE_TREE_ENTRY_LIMIT;
+    entries.truncate(WORKSPACE_TREE_ENTRY_LIMIT);
+
+    Ok(WorkspaceDirectoryListing {
+        root_path: display_preview_path(&root),
+        relative_path,
+        entries,
+        truncated,
+        total_entries,
+    })
+}
+
+#[tauri::command]
+async fn list_workspace_dir(
+    root_path: String,
+    relative_path: Option<String>,
+) -> Result<WorkspaceDirectoryListing, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        list_workspace_dir_blocking(root_path, relative_path)
+    })
+    .await
+    .map_err(|e| format!("文件树读取任务失败: {e}"))?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectEngineDetection {
+    engine: String,
+    label: String,
+    confidence: f32,
+    project_file: Option<String>,
+    version: Option<String>,
+    markers: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSkillRootSnapshot {
+    id: String,
+    label: String,
+    path: String,
+    exists: bool,
+    skill_count: usize,
+    skills: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectMcpServerSuggestion {
+    id: String,
+    label: String,
+    description: String,
+    transport: String,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    available: bool,
+    availability_note: String,
+    requires_user_approval: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectEnvironmentScan {
+    root_path: String,
+    scanned_at_ms: u64,
+    engine: ProjectEngineDetection,
+    skill_roots: Vec<ProjectSkillRootSnapshot>,
+    suggested_mcp_servers: Vec<ProjectMcpServerSuggestion>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectMcpProbeServerConfig {
+    id: String,
+    transport: String,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    url: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectMcpProbeResult {
+    server_id: String,
+    ok: bool,
+    status: String,
+    message: String,
+    tools_count: Option<usize>,
+    checked_at_ms: u64,
+}
+
+fn project_path_display(path: &Path) -> String {
+    display_preview_path(path)
+}
+
+fn project_scan_root(root_path: &str) -> Result<PathBuf, String> {
+    let trimmed = root_path.trim();
+    if trimmed.is_empty() {
+        return Err("工作区路径为空。".to_string());
+    }
+    let root = std::fs::canonicalize(PathBuf::from(trimmed))
+        .map_err(|e| format!("读取工作区失败：{e}"))?;
+    if !root.is_dir() {
+        return Err("工作区不是文件夹。".to_string());
+    }
+    Ok(root)
+}
+
+fn project_relative_marker(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
+}
+
+fn project_first_root_file_with_ext(root: &Path, ext: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn project_read_small_text(path: &Path, max_bytes: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let slice = if bytes.len() > max_bytes {
+        &bytes[..max_bytes]
+    } else {
+        &bytes
+    };
+    String::from_utf8(slice.to_vec()).ok()
+}
+
+fn project_json_string(path: &Path, key: &str) -> Option<String> {
+    let text = project_read_small_text(path, 256 * 1024)?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(|value| value.to_string())
+}
+
+fn unity_editor_version(root: &Path) -> Option<String> {
+    let text = project_read_small_text(&root.join("ProjectSettings/ProjectVersion.txt"), 4096)?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("m_EditorVersion:"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn godot_project_format(root: &Path) -> Option<String> {
+    let text = project_read_small_text(&root.join("project.godot"), 64 * 1024)?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("config_version="))
+        .map(|value| format!("project format {}", value.trim()))
+        .filter(|value| !value.ends_with(' '))
+}
+
+fn detect_project_engine(root: &Path) -> ProjectEngineDetection {
+    if let Some(project_file) = project_first_root_file_with_ext(root, "uproject") {
+        let mut markers = vec![project_relative_marker(root, &project_file)];
+        if root.join("Config/DefaultEngine.ini").exists() {
+            markers.push("Config/DefaultEngine.ini".to_string());
+        }
+        let version = project_json_string(&project_file, "EngineAssociation");
+        return ProjectEngineDetection {
+            engine: "unreal".to_string(),
+            label: "Unreal Engine".to_string(),
+            confidence: 0.96,
+            project_file: Some(project_path_display(&project_file)),
+            version,
+            markers,
+        };
+    }
+
+    let unity_manifest = root.join("Packages/manifest.json");
+    let unity_settings = root.join("ProjectSettings");
+    if unity_manifest.is_file() && unity_settings.is_dir() {
+        let mut markers = vec![
+            "Packages/manifest.json".to_string(),
+            "ProjectSettings/".to_string(),
+        ];
+        if root.join("Assets").is_dir() {
+            markers.push("Assets/".to_string());
+        }
+        return ProjectEngineDetection {
+            engine: "unity".to_string(),
+            label: "Unity".to_string(),
+            confidence: 0.94,
+            project_file: Some(project_path_display(&unity_manifest)),
+            version: unity_editor_version(root),
+            markers,
+        };
+    }
+
+    let godot_file = root.join("project.godot");
+    if godot_file.is_file() {
+        return ProjectEngineDetection {
+            engine: "godot".to_string(),
+            label: "Godot".to_string(),
+            confidence: 0.95,
+            project_file: Some(project_path_display(&godot_file)),
+            version: godot_project_format(root),
+            markers: vec!["project.godot".to_string()],
+        };
+    }
+
+    ProjectEngineDetection {
+        engine: "unknown".to_string(),
+        label: "未识别".to_string(),
+        confidence: 0.0,
+        project_file: None,
+        version: None,
+        markers: Vec::new(),
+    }
+}
+
+fn project_expand_path_text(input: &str) -> String {
+    let mut value = input.trim().to_string();
+    if value.starts_with("~/") || value.starts_with("~\\") {
+        if let Some(home) = user_home_dir() {
+            value = home
+                .join(
+                    value
+                        .trim_start_matches('~')
+                        .trim_start_matches(&['/', '\\'][..]),
+                )
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        value = value.replace("%USERPROFILE%", &home);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        value = value.replace("$HOME", &home);
+    }
+    value
+}
+
+fn project_command_available(command: &str) -> (bool, String) {
+    let command = project_expand_path_text(command);
+    if command.trim().is_empty() {
+        return (false, "命令为空".to_string());
+    }
+    let path_like =
+        command.contains('/') || command.contains('\\') || Path::new(&command).is_absolute();
+    if path_like {
+        let exists = Path::new(&command).exists();
+        return (
+            exists,
+            if exists {
+                "命令路径存在".to_string()
+            } else {
+                "命令路径不存在，需在项目设置里修正".to_string()
+            },
+        );
+    }
+    match cli_runtime::resolve_command_path(&command) {
+        Some(path) => (true, format!("已找到 {}", project_path_display(&path))),
+        None => (false, "PATH 中未找到命令".to_string()),
+    }
+}
+
+fn project_suggested_mcp_servers(engine: &str) -> Vec<ProjectMcpServerSuggestion> {
+    let mut suggestions = Vec::new();
+    let mut push = |id: &str,
+                    label: &str,
+                    description: &str,
+                    command: &str,
+                    args: Vec<&str>,
+                    requires_user_approval: bool| {
+        let (available, availability_note) = project_command_available(command);
+        suggestions.push(ProjectMcpServerSuggestion {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: description.to_string(),
+            transport: "stdio".to_string(),
+            command: command.to_string(),
+            args: args.into_iter().map(|value| value.to_string()).collect(),
+            env: HashMap::new(),
+            available,
+            availability_note,
+            requires_user_approval,
+        });
+    };
+
+    match engine {
+        "unity" => {
+            #[cfg(target_os = "windows")]
+            let unity_relay = "%USERPROFILE%\\.unity\\relay\\unity-mcp-relay.exe";
+            #[cfg(not(target_os = "windows"))]
+            let unity_relay = "~/.unity/relay/unity-mcp-relay";
+            push(
+                "unity-official",
+                "Unity 官方 MCP",
+                "Unity Assistant relay；首次连接通常需要在 Unity Editor 中授权。",
+                unity_relay,
+                vec!["--mcp"],
+                true,
+            );
+        }
+        "unreal" => {
+            push(
+                "unreal-mcp",
+                "Unreal MCP",
+                "第三方 Unreal Editor MCP；需要项目插件/Remote Control 等 Editor 侧能力。",
+                "uvx",
+                vec!["mcp-unreal"],
+                true,
+            );
+        }
+        "godot" => {
+            push(
+                "godot-mcp",
+                "Godot MCP",
+                "第三方 Godot MCP；通过 npm 启动，工作区路径以 {workspace} 传入。",
+                "npx",
+                vec!["-y", "@coding-solo/godot-mcp", "--path", "{workspace}"],
+                true,
+            );
+        }
+        _ => {}
+    }
+    suggestions
+}
+
+fn project_skill_roots(root: &Path) -> Vec<ProjectSkillRootSnapshot> {
+    [
+        ("codex", "Codex 项目 Skill", ".codex/skills"),
+        ("agents", "Agents 项目 Skill", ".agents/skills"),
+        ("claude", "Claude 项目 Skill", ".claude/skills"),
+    ]
+    .into_iter()
+    .map(|(id, label, rel)| {
+        let path = root.join(rel);
+        let mut skills = Vec::new();
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    let skill_dir = entry.path();
+                    if skill_dir.is_dir() && skill_dir.join("SKILL.md").is_file() {
+                        if let Some(name) = skill_dir.file_name().and_then(|value| value.to_str()) {
+                            skills.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        skills.sort();
+        ProjectSkillRootSnapshot {
+            id: id.to_string(),
+            label: label.to_string(),
+            path: project_path_display(&path),
+            exists: path.is_dir(),
+            skill_count: skills.len(),
+            skills,
+        }
+    })
+    .collect()
+}
+
+fn project_environment_scan_blocking(root_path: String) -> Result<ProjectEnvironmentScan, String> {
+    let root = project_scan_root(&root_path)?;
+    let engine = detect_project_engine(&root);
+    let suggested_mcp_servers = project_suggested_mcp_servers(&engine.engine);
+    Ok(ProjectEnvironmentScan {
+        root_path: project_path_display(&root),
+        scanned_at_ms: now_ms(),
+        skill_roots: project_skill_roots(&root),
+        engine,
+        suggested_mcp_servers,
+    })
+}
+
+#[tauri::command]
+async fn project_environment_scan(root_path: String) -> Result<ProjectEnvironmentScan, String> {
+    tauri::async_runtime::spawn_blocking(move || project_environment_scan_blocking(root_path))
+        .await
+        .map_err(|e| format!("项目检测任务失败: {e}"))?
+}
+
+fn project_probe_parse_line(
+    line: &str,
+    initialize_seen: &mut bool,
+) -> Option<Result<Option<usize>, String>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    let id = value.get("id").and_then(|item| item.as_i64());
+    if let Some(error) = value.get("error") {
+        return Some(Err(format!("MCP 返回错误: {error}")));
+    }
+    match id {
+        Some(1) => {
+            if value.get("result").is_some() {
+                *initialize_seen = true;
+            }
+            Some(Ok(None))
+        }
+        Some(2) => {
+            let tools_count = value
+                .pointer("/result/tools")
+                .and_then(|tools| tools.as_array())
+                .map(|tools| tools.len())
+                .unwrap_or(0);
+            Some(Ok(Some(tools_count)))
+        }
+        _ => None,
+    }
+}
+
+fn project_mcp_probe_stdio(
+    root: &Path,
+    server: &ProjectMcpProbeServerConfig,
+) -> ProjectMcpProbeResult {
+    let command = match server
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(command) => project_expand_path_text(command),
+        None => {
+            return ProjectMcpProbeResult {
+                server_id: server.id.clone(),
+                ok: false,
+                status: "missing-command".to_string(),
+                message: "MCP 命令为空。".to_string(),
+                tools_count: None,
+                checked_at_ms: now_ms(),
+            }
+        }
+    };
+
+    let root_text = project_path_display(root);
+    let args: Vec<String> = server
+        .args
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|arg| project_expand_path_text(&arg.replace("{workspace}", &root_text)))
+        .collect();
+
+    let mut cmd = new_spawn_command(&command);
+    cmd.current_dir(root);
+    cmd.args(&args);
+    if let Some(env) = &server.env {
+        for (key, value) in env {
+            if !key.trim().is_empty() {
+                cmd.env(key, value.replace("{workspace}", &root_text));
+            }
+        }
+    }
+    cmd.env("MCP_CLIENT_NAME", "FreeUltraCode");
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return ProjectMcpProbeResult {
+                server_id: server.id.clone(),
+                ok: false,
+                status: "spawn-failed".to_string(),
+                message: format!("启动 MCP 失败: {e}"),
+                tools_count: None,
+                checked_at_ms: now_ms(),
+            }
+        }
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_child_tree(&mut child);
+        return ProjectMcpProbeResult {
+            server_id: server.id.clone(),
+            ok: false,
+            status: "stdin-unavailable".to_string(),
+            message: "MCP stdin 不可用。".to_string(),
+            tools_count: None,
+            checked_at_ms: now_ms(),
+        };
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    if let Some(stdout) = child.stdout.take() {
+        let tx_out = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = tx_out.send(line);
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let tx_err = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = tx_err.send(line);
+            }
+        });
+    }
+
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "FreeUltraCode",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    });
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+    let tools = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    });
+    let payload = format!("{init}\n{initialized}\n{tools}\n");
+    if let Err(e) = stdin
+        .write_all(payload.as_bytes())
+        .and_then(|_| stdin.flush())
+    {
+        terminate_child_tree(&mut child);
+        return ProjectMcpProbeResult {
+            server_id: server.id.clone(),
+            ok: false,
+            status: "write-failed".to_string(),
+            message: format!("写入 MCP 握手失败: {e}"),
+            tools_count: None,
+            checked_at_ms: now_ms(),
+        };
+    }
+    drop(stdin);
+
+    let mut initialize_seen = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            if let Some(parsed) = project_probe_parse_line(&line, &mut initialize_seen) {
+                match parsed {
+                    Ok(Some(tools_count)) => {
+                        terminate_child_tree(&mut child);
+                        let _ = child.wait();
+                        return ProjectMcpProbeResult {
+                            server_id: server.id.clone(),
+                            ok: true,
+                            status: "connected".to_string(),
+                            message: format!("MCP 已连接，发现 {tools_count} 个工具。"),
+                            tools_count: Some(tools_count),
+                            checked_at_ms: now_ms(),
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        terminate_child_tree(&mut child);
+                        let _ = child.wait();
+                        return ProjectMcpProbeResult {
+                            server_id: server.id.clone(),
+                            ok: false,
+                            status: "protocol-error".to_string(),
+                            message,
+                            tools_count: None,
+                            checked_at_ms: now_ms(),
+                        };
+                    }
+                }
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return ProjectMcpProbeResult {
+                    server_id: server.id.clone(),
+                    ok: false,
+                    status: "exited".to_string(),
+                    message: format!("MCP 进程提前退出: {status}"),
+                    tools_count: None,
+                    checked_at_ms: now_ms(),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                terminate_child_tree(&mut child);
+                return ProjectMcpProbeResult {
+                    server_id: server.id.clone(),
+                    ok: false,
+                    status: "wait-failed".to_string(),
+                    message: format!("等待 MCP 失败: {e}"),
+                    tools_count: None,
+                    checked_at_ms: now_ms(),
+                };
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            let detail = if initialize_seen {
+                "initialize 成功，但 tools/list 超时。"
+            } else {
+                "initialize 未完成。"
+            };
+            return ProjectMcpProbeResult {
+                server_id: server.id.clone(),
+                ok: false,
+                status: "timeout".to_string(),
+                message: format!("MCP 探测超时：{detail}"),
+                tools_count: None,
+                checked_at_ms: now_ms(),
+            };
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn project_mcp_probe_blocking(
+    root_path: String,
+    server: ProjectMcpProbeServerConfig,
+) -> Result<ProjectMcpProbeResult, String> {
+    let root = project_scan_root(&root_path)?;
+    if server.transport == "stdio" {
+        return Ok(project_mcp_probe_stdio(&root, &server));
+    }
+    Ok(ProjectMcpProbeResult {
+        server_id: server.id,
+        ok: false,
+        status: "unsupported-transport".to_string(),
+        message: format!(
+            "暂不支持自动探测 {} 传输{}。",
+            server.transport,
+            server
+                .url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| format!("（{url}）"))
+                .unwrap_or_default()
+        ),
+        tools_count: None,
+        checked_at_ms: now_ms(),
+    })
+}
+
+#[tauri::command]
+async fn project_mcp_probe(
+    root_path: String,
+    server: ProjectMcpProbeServerConfig,
+) -> Result<ProjectMcpProbeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || project_mcp_probe_blocking(root_path, server))
+        .await
+        .map_err(|e| format!("MCP 探测任务失败: {e}"))?
+}
+
+const WORKSPACE_CHANGE_LINE_LIMIT: usize = 320;
+const WORKSPACE_CHANGE_TOTAL_LINE_LIMIT: usize = 2400;
+const WORKSPACE_CHANGE_SNAPSHOT_TEXT_LIMIT: usize = 160 * 1024;
+const WORKSPACE_CHANGE_DIFF_DP_CELL_LIMIT: usize = 1_500_000;
+
+fn workspace_change_safe_cache_key(cache_key: &str) -> String {
+    let mut out = String::new();
+    for ch in cache_key.chars().take(180) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "session".to_string()
+    } else {
+        out
+    }
+}
+
+fn workspace_change_cache_file(root: &Path, cache_key: &str, suffix: &str) -> PathBuf {
+    let cwd = display_preview_path(root);
+    storage_paths::managed_artifact_dir(Some(&cwd), "session-changes").join(format!(
+        "{}.{suffix}.json",
+        workspace_change_safe_cache_key(cache_key)
+    ))
+}
+
+fn read_json_cache<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_json_cache<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    }
+    let json = serde_json::to_vec(value).map_err(|e| format!("序列化会话改动缓存失败: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("写入会话改动缓存失败: {e}"))?;
+    std::fs::rename(&tmp, path)
+        .or_else(|_| {
+            std::fs::remove_file(path).ok();
+            std::fs::rename(&tmp, path)
+        })
+        .map_err(|e| format!("替换会话改动缓存失败: {e}"))
+}
+
+fn mark_replacement_hunk(hunk: &mut [WorkspaceChangeLine]) {
+    if hunk.is_empty() {
+        return;
+    }
+    let has_added = hunk.iter().any(|line| line.kind == "added");
+    let has_deleted = hunk.iter().any(|line| line.kind == "deleted");
+    if has_added && has_deleted {
+        for line in hunk.iter_mut() {
+            if line.kind == "added" {
+                line.kind = "replacedAdded".to_string();
+            } else if line.kind == "deleted" {
+                line.kind = "replacedDeleted".to_string();
+            }
+        }
+    }
+}
+
+fn flush_change_hunk(out: &mut Vec<WorkspaceChangeLine>, hunk: &mut Vec<WorkspaceChangeLine>) {
+    mark_replacement_hunk(hunk);
+    out.append(hunk);
+}
+
+fn workspace_change_line_no(index: usize) -> u32 {
+    (index + 1).min(u32::MAX as usize) as u32
+}
+
+fn scan_workspace_snapshot(root: &Path) -> (Vec<WorkspaceChangeSnapshotFile>, bool) {
+    let mut files = Vec::new();
+    let mut truncated = false;
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+
+    while let Some((dir, relative_dir)) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            truncated = true;
+            continue;
+        };
+        let mut entries: Vec<_> = read_dir.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                truncated = true;
+                continue;
+            };
+            let relative_path = workspace_tree_child_relative(&relative_dir, &name);
+            if file_type.is_dir() {
+                if !workspace_tree_excluded_dir(&name) {
+                    stack.push((entry.path(), relative_path));
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                truncated = true;
+                continue;
+            };
+            files.push(snapshot_file_from_path(
+                entry.path(),
+                relative_path,
+                &metadata,
+            ));
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    (files, truncated)
+}
+
+fn snapshot_file_from_path(
+    path: PathBuf,
+    relative_path: String,
+    metadata: &std::fs::Metadata,
+) -> WorkspaceChangeSnapshotFile {
+    let mut binary = false;
+    let mut content = None;
+    let mut truncated = false;
+    let mut bytes = Vec::new();
+    match std::fs::File::open(&path) {
+        Ok(mut handle) => {
+            let read_limit = WORKSPACE_CHANGE_SNAPSHOT_TEXT_LIMIT as u64 + 1;
+            if std::io::Read::by_ref(&mut handle)
+                .take(read_limit)
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                truncated = true;
+            } else {
+                if bytes.len() > WORKSPACE_CHANGE_SNAPSHOT_TEXT_LIMIT {
+                    bytes.truncate(WORKSPACE_CHANGE_SNAPSHOT_TEXT_LIMIT);
+                    truncated = true;
+                }
+                if probably_binary(&bytes) {
+                    binary = true;
+                } else if truncated {
+                    content = None;
+                } else {
+                    content = decode_preview_text(bytes).or_else(|| {
+                        binary = true;
+                        None
+                    });
+                }
+            }
+        }
+        Err(_) => truncated = true,
+    }
+
+    WorkspaceChangeSnapshotFile {
+        path: relative_path.replace('\\', "/"),
+        size_bytes: metadata.len(),
+        modified_at_ms: workspace_tree_modified_at_ms(metadata),
+        binary,
+        truncated,
+        content,
+    }
+}
+
+fn lines_from_snapshot(content: &str, kind: &str, use_old_line: bool) -> Vec<WorkspaceChangeLine> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| WorkspaceChangeLine {
+            kind: kind.to_string(),
+            old_line: use_old_line.then_some(workspace_change_line_no(idx)),
+            new_line: (!use_old_line).then_some(workspace_change_line_no(idx)),
+            content: line.to_string(),
+        })
+        .collect()
+}
+
+fn snapshot_file_to_change(
+    file: &WorkspaceChangeSnapshotFile,
+    status: &str,
+) -> WorkspaceChangeFile {
+    let use_old_line = status == "deleted";
+    let kind = if use_old_line { "deleted" } else { "added" };
+    WorkspaceChangeFile {
+        path: file.path.clone(),
+        old_path: None,
+        status: status.to_string(),
+        binary: file.binary,
+        truncated: file.truncated,
+        lines: file
+            .content
+            .as_deref()
+            .map(|content| lines_from_snapshot(content, kind, use_old_line))
+            .unwrap_or_default(),
+    }
+}
+
+fn diff_text_lines(old_text: &str, new_text: &str) -> (Vec<WorkspaceChangeLine>, bool) {
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    let mut prefix = 0_usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut old_end = old_lines.len();
+    let mut new_end = new_lines.len();
+    while old_end > prefix && new_end > prefix && old_lines[old_end - 1] == new_lines[new_end - 1] {
+        old_end -= 1;
+        new_end -= 1;
+    }
+
+    let old_mid = &old_lines[prefix..old_end];
+    let new_mid = &new_lines[prefix..new_end];
+    let cells = (old_mid.len() + 1).saturating_mul(new_mid.len() + 1);
+    let mut out = Vec::new();
+    let mut hunk = Vec::new();
+
+    if cells > WORKSPACE_CHANGE_DIFF_DP_CELL_LIMIT {
+        for (idx, line) in old_mid.iter().enumerate() {
+            hunk.push(WorkspaceChangeLine {
+                kind: "deleted".to_string(),
+                old_line: Some(workspace_change_line_no(prefix + idx)),
+                new_line: None,
+                content: (*line).to_string(),
+            });
+        }
+        for (idx, line) in new_mid.iter().enumerate() {
+            hunk.push(WorkspaceChangeLine {
+                kind: "added".to_string(),
+                old_line: None,
+                new_line: Some(workspace_change_line_no(prefix + idx)),
+                content: (*line).to_string(),
+            });
+        }
+        flush_change_hunk(&mut out, &mut hunk);
+        return (out, true);
+    }
+
+    let cols = new_mid.len() + 1;
+    let mut dp = vec![0_u32; (old_mid.len() + 1) * cols];
+    for i in (0..old_mid.len()).rev() {
+        for j in (0..new_mid.len()).rev() {
+            let idx = i * cols + j;
+            dp[idx] = if old_mid[i] == new_mid[j] {
+                dp[(i + 1) * cols + j + 1].saturating_add(1)
+            } else {
+                dp[(i + 1) * cols + j].max(dp[i * cols + j + 1])
+            };
+        }
+    }
+
+    let mut i = 0_usize;
+    let mut j = 0_usize;
+    while i < old_mid.len() && j < new_mid.len() {
+        if old_mid[i] == new_mid[j] {
+            flush_change_hunk(&mut out, &mut hunk);
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * cols + j] >= dp[i * cols + j + 1] {
+            hunk.push(WorkspaceChangeLine {
+                kind: "deleted".to_string(),
+                old_line: Some(workspace_change_line_no(prefix + i)),
+                new_line: None,
+                content: old_mid[i].to_string(),
+            });
+            i += 1;
+        } else {
+            hunk.push(WorkspaceChangeLine {
+                kind: "added".to_string(),
+                old_line: None,
+                new_line: Some(workspace_change_line_no(prefix + j)),
+                content: new_mid[j].to_string(),
+            });
+            j += 1;
+        }
+    }
+    while i < old_mid.len() {
+        hunk.push(WorkspaceChangeLine {
+            kind: "deleted".to_string(),
+            old_line: Some(workspace_change_line_no(prefix + i)),
+            new_line: None,
+            content: old_mid[i].to_string(),
+        });
+        i += 1;
+    }
+    while j < new_mid.len() {
+        hunk.push(WorkspaceChangeLine {
+            kind: "added".to_string(),
+            old_line: None,
+            new_line: Some(workspace_change_line_no(prefix + j)),
+            content: new_mid[j].to_string(),
+        });
+        j += 1;
+    }
+    flush_change_hunk(&mut out, &mut hunk);
+    (out, false)
+}
+
+fn diff_snapshot_file(
+    old: &WorkspaceChangeSnapshotFile,
+    new: &WorkspaceChangeSnapshotFile,
+) -> Option<WorkspaceChangeFile> {
+    if old.size_bytes == new.size_bytes
+        && old.modified_at_ms == new.modified_at_ms
+        && old.content == new.content
+        && old.binary == new.binary
+    {
+        return None;
+    }
+
+    let content_unavailable = old.content.is_none() || new.content.is_none();
+    if old.binary || new.binary || content_unavailable {
+        return Some(WorkspaceChangeFile {
+            path: new.path.clone(),
+            old_path: None,
+            status: "modified".to_string(),
+            binary: old.binary || new.binary,
+            truncated: old.truncated || new.truncated || content_unavailable,
+            lines: Vec::new(),
+        });
+    }
+
+    let old_content = old.content.as_deref().unwrap_or_default();
+    let new_content = new.content.as_deref().unwrap_or_default();
+    if old_content == new_content {
+        return None;
+    }
+    let (lines, diff_truncated) = diff_text_lines(old_content, new_content);
+    Some(WorkspaceChangeFile {
+        path: new.path.clone(),
+        old_path: None,
+        status: "modified".to_string(),
+        binary: false,
+        truncated: old.truncated || new.truncated || diff_truncated,
+        lines,
+    })
+}
+
+fn snapshot_modified_since(file: &WorkspaceChangeSnapshotFile, baseline_at_ms: u64) -> bool {
+    file.modified_at_ms
+        .map(|modified_at_ms| modified_at_ms >= baseline_at_ms)
+        .unwrap_or(false)
+}
+
+fn snapshot_file_to_modified_marker(file: &WorkspaceChangeSnapshotFile) -> WorkspaceChangeFile {
+    WorkspaceChangeFile {
+        path: file.path.clone(),
+        old_path: None,
+        status: "modified".to_string(),
+        binary: file.binary,
+        truncated: true,
+        lines: Vec::new(),
+    }
+}
+
+fn truncate_workspace_changes(files: &mut Vec<WorkspaceChangeFile>) -> bool {
+    let mut truncated = false;
+
+    let mut total_lines = 0_usize;
+    for file in files.iter_mut() {
+        if file.lines.len() > WORKSPACE_CHANGE_LINE_LIMIT {
+            file.lines.truncate(WORKSPACE_CHANGE_LINE_LIMIT);
+            file.truncated = true;
+            truncated = true;
+        }
+
+        if total_lines >= WORKSPACE_CHANGE_TOTAL_LINE_LIMIT {
+            if !file.lines.is_empty() {
+                file.lines.clear();
+                file.truncated = true;
+                truncated = true;
+            }
+            continue;
+        }
+
+        let remaining = WORKSPACE_CHANGE_TOTAL_LINE_LIMIT - total_lines;
+        if file.lines.len() > remaining {
+            file.lines.truncate(remaining);
+            file.truncated = true;
+            truncated = true;
+        }
+        total_lines += file.lines.len();
+    }
+    truncated
+}
+
+const WORKSPACE_STATUS_COMMAND_TIMEOUT_MS: u64 = 6_000;
+
+struct WorkspaceStatusCommandOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+fn workspace_status_temp_seq() -> u64 {
+    static SEQ: OnceLock<Mutex<u64>> = OnceLock::new();
+    let seq = SEQ.get_or_init(|| Mutex::new(0));
+    let mut guard = seq.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = guard.saturating_add(1);
+    *guard
+}
+
+fn read_workspace_status_temp(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn run_workspace_status_command(
+    root: &Path,
+    program: &str,
+    args: &[&str],
+) -> Result<WorkspaceStatusCommandOutput, String> {
+    let temp_id = format!(
+        "fuc-status-{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        workspace_status_temp_seq()
+    );
+    let stdout_path = std::env::temp_dir().join(format!("{temp_id}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("{temp_id}.stderr"));
+    let stdout_file =
+        std::fs::File::create(&stdout_path).map_err(|e| format!("创建状态输出缓存失败: {e}"))?;
+    let stderr_file =
+        std::fs::File::create(&stderr_path).map_err(|e| format!("创建状态错误缓存失败: {e}"))?;
+
+    let mut cmd = new_spawn_command(program);
+    cmd.current_dir(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            return Err(err.to_string());
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(WORKSPACE_STATUS_COMMAND_TIMEOUT_MS);
+    let mut timed_out = false;
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                timed_out = true;
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+
+    let stdout = read_workspace_status_temp(&stdout_path);
+    let stderr = read_workspace_status_temp(&stderr_path);
+    let _ = std::fs::remove_file(stdout_path);
+    let _ = std::fs::remove_file(stderr_path);
+
+    Ok(WorkspaceStatusCommandOutput {
+        success,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn workspace_status_error(output: &WorkspaceStatusCommandOutput) -> String {
+    let message = output.stderr.trim();
+    if message.is_empty() {
+        "命令返回失败".to_string()
+    } else {
+        message.to_string()
+    }
+}
+
+fn normalize_vcs_status_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn strip_git_workspace_prefix(path: &str, prefix: &str) -> String {
+    let path = normalize_vcs_status_path(path);
+    let prefix = normalize_vcs_status_path(prefix)
+        .trim_end_matches('/')
+        .to_string();
+    if prefix.is_empty() {
+        return path;
+    }
+    path.strip_prefix(&(prefix + "/"))
+        .unwrap_or(path.as_str())
+        .to_string()
+}
+
+fn workspace_change_relative_path(root: &Path, relative_path: &str) -> Option<PathBuf> {
+    let normalized = normalize_vcs_status_path(relative_path);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let relative = PathBuf::from(&normalized);
+    if relative.is_absolute() {
+        return None;
+    }
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    let candidate = root.join(relative);
+    if let Ok(resolved) = std::fs::canonicalize(&candidate) {
+        if !resolved.starts_with(root) {
+            return None;
+        }
+        return Some(resolved);
+    }
+    Some(candidate)
+}
+
+fn relative_status_path_from_root(root: &Path, path: &str) -> String {
+    let normalized = path.trim().trim_matches('"').replace('\\', "/");
+    if normalized.starts_with("//") {
+        return normalized
+            .split('#')
+            .next()
+            .unwrap_or(&normalized)
+            .to_string();
+    }
+
+    let candidate = PathBuf::from(path.trim().trim_matches('"'));
+    if candidate.is_absolute() {
+        if let Ok(relative) = candidate.strip_prefix(root) {
+            return normalize_vcs_status_path(&relative.to_string_lossy());
+        }
+    }
+
+    normalize_vcs_status_path(normalized.split('#').next().unwrap_or(normalized.as_str()))
+}
+
+fn workspace_change_file_from_status(
+    path: String,
+    old_path: Option<String>,
+    status: &str,
+) -> Option<WorkspaceChangeFile> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    Some(WorkspaceChangeFile {
+        path,
+        old_path: old_path.filter(|value| !value.trim().is_empty()),
+        status: status.to_string(),
+        binary: false,
+        truncated: true,
+        lines: Vec::new(),
+    })
+}
+
+fn workspace_status_from_git_xy(xy: &str) -> Option<&'static str> {
+    if xy == "??" || xy.contains('A') {
+        return Some("added");
+    }
+    if xy.contains('R') {
+        return Some("renamed");
+    }
+    if xy.contains('D') {
+        return Some("deleted");
+    }
+    if xy.contains('M') || xy.contains('T') || xy.contains('U') {
+        return Some("modified");
+    }
+    None
+}
+
+fn parse_git_workspace_changes(stdout: &str, prefix: &str) -> Vec<WorkspaceChangeFile> {
+    let parts: Vec<&str> = stdout.split('\0').filter(|part| !part.is_empty()).collect();
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < parts.len() {
+        let record = parts[index];
+        if record.len() < 4 {
+            index += 1;
+            continue;
+        }
+
+        let xy = &record[..2];
+        let Some(status) = workspace_status_from_git_xy(xy) else {
+            index += 1;
+            continue;
+        };
+        let path = strip_git_workspace_prefix(&record[3..], prefix);
+        let mut old_path = None;
+        if status == "renamed" {
+            if let Some(next) = parts.get(index + 1) {
+                old_path = Some(strip_git_workspace_prefix(next, prefix));
+                index += 1;
+            }
+        }
+        if let Some(file) = workspace_change_file_from_status(path, old_path, status) {
+            files.push(file);
+        }
+        index += 1;
+    }
+    files
+}
+
+fn git_diff_path(path: &str, prefix: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed == "/dev/null" {
+        return None;
+    }
+    let trimmed = trimmed.trim_matches('"');
+    let trimmed = trimmed
+        .strip_prefix("a/")
+        .or_else(|| trimmed.strip_prefix("b/"))
+        .unwrap_or(trimmed);
+    Some(strip_git_workspace_prefix(trimmed, prefix))
+}
+
+fn parse_git_diff_header_paths(
+    line: &str,
+    prefix: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let rest = line.strip_prefix("diff --git ")?;
+    let separator = rest.rfind(" b/")?;
+    let old_path = git_diff_path(&rest[..separator], prefix);
+    let new_path = git_diff_path(&rest[(separator + 1)..], prefix);
+    Some((old_path, new_path))
+}
+
+fn parse_git_hunk_start(token: &str) -> Option<u32> {
+    let range = token.get(1..)?;
+    range.split(',').next()?.parse::<u32>().ok()
+}
+
+fn parse_git_hunk_header(line: &str) -> Option<(u32, u32)> {
+    if !line.starts_with("@@ ") {
+        return None;
+    }
+
+    let mut old_start = None;
+    let mut new_start = None;
+    for token in line.split_whitespace() {
+        if token.starts_with('-') {
+            old_start = parse_git_hunk_start(token);
+        } else if token.starts_with('+') {
+            new_start = parse_git_hunk_start(token);
+        }
+        if old_start.is_some() && new_start.is_some() {
+            break;
+        }
+    }
+    Some((old_start?, new_start?))
+}
+
+fn flush_git_diff_file(
+    files: &mut Vec<WorkspaceChangeFile>,
+    current: &mut Option<WorkspaceChangeFile>,
+    hunk: &mut Vec<WorkspaceChangeLine>,
+) {
+    let Some(mut file) = current.take() else {
+        return;
+    };
+    flush_change_hunk(&mut file.lines, hunk);
+    if !file.path.trim().is_empty() {
+        files.push(file);
+    }
+}
+
+fn parse_git_diff_workspace_changes(stdout: &str, prefix: &str) -> Vec<WorkspaceChangeFile> {
+    let mut files = Vec::new();
+    let mut current: Option<WorkspaceChangeFile> = None;
+    let mut hunk: Vec<WorkspaceChangeLine> = Vec::new();
+    let mut old_line = 0_u32;
+    let mut new_line = 0_u32;
+    let mut in_hunk = false;
+
+    for line in stdout.lines() {
+        if line.starts_with("diff --git ") {
+            flush_git_diff_file(&mut files, &mut current, &mut hunk);
+            let (old_path, new_path) =
+                parse_git_diff_header_paths(line, prefix).unwrap_or((None, None));
+            current = Some(WorkspaceChangeFile {
+                path: new_path
+                    .clone()
+                    .or_else(|| old_path.clone())
+                    .unwrap_or_default(),
+                old_path: None,
+                status: "modified".to_string(),
+                binary: false,
+                truncated: false,
+                lines: Vec::new(),
+            });
+            in_hunk = false;
+            continue;
+        }
+
+        let Some(file) = current.as_mut() else {
+            continue;
+        };
+
+        if line.starts_with("new file mode ") {
+            file.status = "added".to_string();
+            continue;
+        }
+        if line.starts_with("deleted file mode ") {
+            file.status = "deleted".to_string();
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("rename from ") {
+            if let Some(path) = git_diff_path(path, prefix) {
+                file.old_path = Some(path);
+                file.status = "renamed".to_string();
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("rename to ") {
+            if let Some(path) = git_diff_path(path, prefix) {
+                file.path = path;
+                file.status = "renamed".to_string();
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("--- ") {
+            if git_diff_path(path, prefix).is_none() {
+                file.status = "added".to_string();
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("+++ ") {
+            match git_diff_path(path, prefix) {
+                Some(path) => file.path = path,
+                None => file.status = "deleted".to_string(),
+            }
+            continue;
+        }
+        if line.starts_with("Binary files ") || line.starts_with("Binary file ") {
+            file.binary = true;
+            file.truncated = true;
+            continue;
+        }
+        if let Some((old_start, new_start)) = parse_git_hunk_header(line) {
+            flush_change_hunk(&mut file.lines, &mut hunk);
+            old_line = old_start;
+            new_line = new_start;
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if line == r"\ No newline at end of file" {
+            continue;
+        }
+        if let Some(content) = line.strip_prefix('+') {
+            hunk.push(WorkspaceChangeLine {
+                kind: "added".to_string(),
+                old_line: None,
+                new_line: Some(new_line),
+                content: content.to_string(),
+            });
+            new_line = new_line.saturating_add(1);
+        } else if let Some(content) = line.strip_prefix('-') {
+            hunk.push(WorkspaceChangeLine {
+                kind: "deleted".to_string(),
+                old_line: Some(old_line),
+                new_line: None,
+                content: content.to_string(),
+            });
+            old_line = old_line.saturating_add(1);
+        } else if line.starts_with(' ') {
+            flush_change_hunk(&mut file.lines, &mut hunk);
+            old_line = old_line.saturating_add(1);
+            new_line = new_line.saturating_add(1);
+        }
+    }
+
+    flush_git_diff_file(&mut files, &mut current, &mut hunk);
+    files
+}
+
+fn workspace_change_file_from_current_path(
+    root: &Path,
+    file: &WorkspaceChangeFile,
+) -> Option<WorkspaceChangeFile> {
+    let path = workspace_change_relative_path(root, &file.path)?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let snapshot = snapshot_file_from_path(path, file.path.clone(), &metadata);
+    let mut change = snapshot_file_to_change(&snapshot, "added");
+    change.status = file.status.clone();
+    change.old_path = file.old_path.clone();
+    Some(change)
+}
+
+fn merge_workspace_status_files_with_diff(
+    root: &Path,
+    status_files: Vec<WorkspaceChangeFile>,
+    diff_files: Vec<WorkspaceChangeFile>,
+) -> Vec<WorkspaceChangeFile> {
+    let mut diff_by_path: HashMap<String, WorkspaceChangeFile> = HashMap::new();
+    for file in diff_files {
+        diff_by_path
+            .entry(file.path.clone())
+            .and_modify(|existing| {
+                existing.lines.extend(file.lines.clone());
+                existing.binary |= file.binary;
+                existing.truncated |= file.truncated;
+                if existing.old_path.is_none() {
+                    existing.old_path = file.old_path.clone();
+                }
+                if existing.status == "modified" && file.status != "modified" {
+                    existing.status = file.status.clone();
+                }
+            })
+            .or_insert(file);
+    }
+
+    let mut merged = Vec::new();
+    for file in status_files {
+        if let Some(mut diff_file) = diff_by_path.remove(&file.path) {
+            diff_file.status = file.status.clone();
+            if file.old_path.is_some() {
+                diff_file.old_path = file.old_path.clone();
+            }
+            merged.push(diff_file);
+        } else if file.status == "added" && file.old_path.is_none() {
+            merged.push(workspace_change_file_from_current_path(root, &file).unwrap_or(file));
+        } else {
+            merged.push(file);
+        }
+    }
+
+    merged.extend(diff_by_path.into_values());
+    merged
+}
+
+fn git_workspace_diff_changes(
+    root: &Path,
+    prefix: &str,
+) -> Result<Vec<WorkspaceChangeFile>, String> {
+    let head_diff = run_workspace_status_command(
+        root,
+        "git",
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=0",
+            "HEAD",
+            "--",
+            ".",
+        ],
+    )
+    .map_err(|err| format!("Git diff 读取失败: {err}"))?;
+    if head_diff.timed_out {
+        return Err("Git diff 读取超时".to_string());
+    }
+    if head_diff.success {
+        return Ok(parse_git_diff_workspace_changes(&head_diff.stdout, prefix));
+    }
+
+    let mut files = Vec::new();
+    let mut any_success = false;
+    for args in [
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=0",
+            "--",
+            ".",
+        ][..],
+        &[
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=0",
+            "--",
+            ".",
+        ][..],
+    ] {
+        let output = run_workspace_status_command(root, "git", args)
+            .map_err(|err| format!("Git diff 读取失败: {err}"))?;
+        if output.timed_out {
+            return Err("Git diff 读取超时".to_string());
+        }
+        if output.success {
+            any_success = true;
+            files.extend(parse_git_diff_workspace_changes(&output.stdout, prefix));
+        }
+    }
+
+    if any_success {
+        Ok(files)
+    } else {
+        Err(format!(
+            "Git diff 读取失败: {}",
+            workspace_status_error(&head_diff)
+        ))
+    }
+}
+
+fn parse_svn_workspace_changes(stdout: &str) -> Vec<WorkspaceChangeFile> {
+    let mut files = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('>') {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let first = chars.first().copied().unwrap_or(' ');
+        let second = chars.get(1).copied().unwrap_or(' ');
+        let status = match first {
+            '?' | 'A' => Some("added"),
+            '!' | 'D' => Some("deleted"),
+            'R' => Some("renamed"),
+            'M' | '~' | 'C' => Some("modified"),
+            ' ' if second == 'M' => Some("modified"),
+            _ => None,
+        };
+        let Some(status) = status else {
+            continue;
+        };
+        let path = if line.len() > 8 {
+            &line[8..]
+        } else {
+            trimmed.split_whitespace().last().unwrap_or_default()
+        };
+        if let Some(file) =
+            workspace_change_file_from_status(normalize_vcs_status_path(path), None, status)
+        {
+            files.push(file);
+        }
+    }
+    files
+}
+
+fn parse_p4_workspace_changes(root: &Path, stdout: &str) -> Vec<WorkspaceChangeFile> {
+    let mut files = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("... ") {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let status = if lower.contains("move/add") || lower.contains("move/delete") {
+            Some("renamed")
+        } else if lower.contains("reconcile to add")
+            || lower.contains("opened for add")
+            || lower.contains(" - add")
+        {
+            Some("added")
+        } else if lower.contains("reconcile to delete")
+            || lower.contains("opened for delete")
+            || lower.contains(" - delete")
+            || lower.contains("missing")
+        {
+            Some("deleted")
+        } else if lower.contains("reconcile to edit")
+            || lower.contains("opened for edit")
+            || lower.contains(" - edit")
+            || lower.contains("changed")
+        {
+            Some("modified")
+        } else {
+            None
+        };
+        let Some(status) = status else {
+            continue;
+        };
+
+        let path_text = trimmed
+            .split_once(" - ")
+            .map(|(path, _)| path)
+            .unwrap_or(trimmed);
+        let path = relative_status_path_from_root(root, path_text);
+        if let Some(file) = workspace_change_file_from_status(path, None, status) {
+            files.push(file);
+        }
+    }
+    files
+}
+
+fn dedupe_workspace_status_files(files: Vec<WorkspaceChangeFile>) -> Vec<WorkspaceChangeFile> {
+    let mut by_key: HashMap<String, WorkspaceChangeFile> = HashMap::new();
+    for file in files {
+        let key = format!(
+            "{}\0{}",
+            file.old_path.as_deref().unwrap_or_default(),
+            file.path
+        );
+        by_key.entry(key).or_insert(file);
+    }
+    let mut out: Vec<_> = by_key.into_values().collect();
+    out.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.old_path.cmp(&b.old_path))
+    });
+    out
+}
+
+fn workspace_changes_from_status_files(
+    root: &Path,
+    source: &str,
+    files: Vec<WorkspaceChangeFile>,
+    source_truncated: bool,
+) -> WorkspaceChanges {
+    let mut files = dedupe_workspace_status_files(files);
+    let truncated = truncate_workspace_changes(&mut files);
+    WorkspaceChanges {
+        root_path: display_preview_path(root),
+        generated_at_ms: now_ms(),
+        source: source.to_string(),
+        files,
+        truncated: truncated || source_truncated,
+    }
+}
+
+fn git_workspace_changes(root: &Path) -> Option<Result<WorkspaceChanges, String>> {
+    let probe =
+        match run_workspace_status_command(root, "git", &["rev-parse", "--is-inside-work-tree"]) {
+            Ok(output) => output,
+            Err(_) => return None,
+        };
+    if probe.timed_out {
+        return Some(Err("Git 状态收集超时".to_string()));
+    }
+    if !probe.success || probe.stdout.trim() != "true" {
+        return None;
+    }
+
+    let prefix = match run_workspace_status_command(root, "git", &["rev-parse", "--show-prefix"]) {
+        Ok(output) if output.timed_out => return Some(Err("Git 工作区前缀读取超时".to_string())),
+        Ok(output) if output.success => output.stdout.trim().to_string(),
+        _ => String::new(),
+    };
+    let status = match run_workspace_status_command(
+        root,
+        "git",
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(err) => return Some(Err(format!("Git 状态读取失败: {err}"))),
+    };
+    if status.timed_out {
+        return Some(Err("Git 状态收集超时".to_string()));
+    }
+    if !status.success {
+        return Some(Err(format!(
+            "Git 状态读取失败: {}",
+            workspace_status_error(&status)
+        )));
+    }
+
+    let status_files = parse_git_workspace_changes(&status.stdout, &prefix);
+    let (diff_files, diff_truncated) = match git_workspace_diff_changes(root, &prefix) {
+        Ok(files) => (files, false),
+        Err(_) => (Vec::new(), true),
+    };
+    let files = merge_workspace_status_files_with_diff(root, status_files, diff_files);
+    Some(Ok(workspace_changes_from_status_files(
+        root,
+        "git",
+        files,
+        diff_truncated,
+    )))
+}
+
+fn svn_workspace_changes(root: &Path) -> Option<Result<WorkspaceChanges, String>> {
+    let probe = match run_workspace_status_command(root, "svn", &["info"]) {
+        Ok(output) => output,
+        Err(_) => return None,
+    };
+    if probe.timed_out {
+        return Some(Err("SVN 状态收集超时".to_string()));
+    }
+    if !probe.success {
+        return None;
+    }
+
+    let status = match run_workspace_status_command(root, "svn", &["status", "--ignore-externals"])
+    {
+        Ok(output) => output,
+        Err(err) => return Some(Err(format!("SVN 状态读取失败: {err}"))),
+    };
+    if status.timed_out {
+        return Some(Err("SVN 状态收集超时".to_string()));
+    }
+    if !status.success {
+        return Some(Err(format!(
+            "SVN 状态读取失败: {}",
+            workspace_status_error(&status)
+        )));
+    }
+
+    let files = parse_svn_workspace_changes(&status.stdout);
+    Some(Ok(workspace_changes_from_status_files(
+        root, "svn", files, false,
+    )))
+}
+
+fn p4_workspace_changes(root: &Path) -> Option<Result<WorkspaceChanges, String>> {
+    let probe = match run_workspace_status_command(root, "p4", &["info"]) {
+        Ok(output) => output,
+        Err(_) => return None,
+    };
+    if probe.timed_out {
+        return Some(Err("P4 状态收集超时".to_string()));
+    }
+    if !probe.success {
+        return None;
+    }
+
+    let mut files = Vec::new();
+    let mut truncated = false;
+    for args in [
+        &["status", "..."][..],
+        &["reconcile", "-n", "-ead", "..."][..],
+        &["opened", "..."][..],
+    ] {
+        let output = match run_workspace_status_command(root, "p4", args) {
+            Ok(output) => output,
+            Err(err) => return Some(Err(format!("P4 状态读取失败: {err}"))),
+        };
+        if output.timed_out {
+            return Some(Err("P4 状态收集超时".to_string()));
+        }
+        if !output.success {
+            let stderr = output.stderr.to_ascii_lowercase();
+            if stderr.contains("not under client's root")
+                || stderr.contains("file(s) not in client view")
+            {
+                return None;
+            }
+            if stderr.contains("file(s) not opened")
+                || stderr.contains("not opened on this client")
+                || stderr.contains("no file(s) to reconcile")
+                || args.first() == Some(&"status")
+            {
+                continue;
+            }
+            if !files.is_empty() {
+                truncated = true;
+                continue;
+            }
+            return Some(Err(format!(
+                "P4 状态读取失败: {}",
+                workspace_status_error(&output)
+            )));
+        }
+        files.extend(parse_p4_workspace_changes(root, &output.stdout));
+    }
+
+    Some(Ok(workspace_changes_from_status_files(
+        root, "p4", files, truncated,
+    )))
+}
+
+fn vcs_workspace_changes(root: &Path) -> Option<Result<WorkspaceChanges, String>> {
+    git_workspace_changes(root)
+        .or_else(|| svn_workspace_changes(root))
+        .or_else(|| p4_workspace_changes(root))
+}
+
+fn workspace_changes_baseline_blocking(
+    root_path: String,
+    cache_key: String,
+    baseline_at_ms: Option<u64>,
+) -> Result<WorkspaceChangeBaseline, String> {
+    let (root, _) = workspace_tree_resolve_dir(&root_path, "")?;
+    let cache_file = workspace_change_cache_file(&root, &cache_key, "baseline");
+    let root_label = display_preview_path(&root);
+    if let Some(mut cached) = read_json_cache::<WorkspaceChangeBaseline>(&cache_file) {
+        if cached.root_path == root_label {
+            if let Some(baseline_at_ms) = baseline_at_ms {
+                if baseline_at_ms < cached.generated_at_ms {
+                    cached.generated_at_ms = baseline_at_ms;
+                    let _ = write_json_cache(&cache_file, &cached);
+                }
+            }
+            return Ok(cached);
+        }
+    }
+
+    let (files, truncated) = scan_workspace_snapshot(&root);
+    let baseline = WorkspaceChangeBaseline {
+        root_path: root_label,
+        generated_at_ms: baseline_at_ms.unwrap_or_else(now_ms),
+        files,
+        truncated,
+    };
+    write_json_cache(&cache_file, &baseline)?;
+    Ok(baseline)
+}
+
+fn workspace_change_baseline_summary(
+    baseline: WorkspaceChangeBaseline,
+) -> WorkspaceChangeBaselineSummary {
+    WorkspaceChangeBaselineSummary {
+        root_path: baseline.root_path,
+        generated_at_ms: baseline.generated_at_ms,
+        file_count: baseline.files.len(),
+        truncated: baseline.truncated,
+    }
+}
+
+fn workspace_changes_blocking(
+    root_path: String,
+    cache_key: String,
+    baseline_at_ms: Option<u64>,
+) -> Result<WorkspaceChanges, String> {
+    let (root, _) = workspace_tree_resolve_dir(&root_path, "")?;
+    if let Some(changes) = vcs_workspace_changes(&root) {
+        let changes = changes?;
+        let cache_file = workspace_change_cache_file(&root, &cache_key, "changes");
+        write_json_cache(&cache_file, &changes)?;
+        return Ok(changes);
+    }
+
+    let baseline =
+        workspace_changes_baseline_blocking(root_path.clone(), cache_key.clone(), baseline_at_ms)?;
+    let (current_files, current_truncated) = scan_workspace_snapshot(&root);
+    let mut current_by_path: HashMap<String, WorkspaceChangeSnapshotFile> = current_files
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
+    let mut files = Vec::new();
+
+    for old in baseline.files.iter() {
+        match current_by_path.remove(&old.path) {
+            Some(new) => {
+                if let Some(change) = diff_snapshot_file(old, &new) {
+                    files.push(change);
+                } else if snapshot_modified_since(&new, baseline.generated_at_ms) {
+                    files.push(snapshot_file_to_modified_marker(&new));
+                }
+            }
+            None => files.push(snapshot_file_to_change(old, "deleted")),
+        }
+    }
+    for new in current_by_path.into_values() {
+        files.push(snapshot_file_to_change(&new, "added"));
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let truncated = truncate_workspace_changes(&mut files);
+    let changes = WorkspaceChanges {
+        root_path: display_preview_path(&root),
+        generated_at_ms: now_ms(),
+        source: "snapshot".to_string(),
+        files,
+        truncated: truncated || baseline.truncated || current_truncated,
+    };
+    let cache_file = workspace_change_cache_file(&root, &cache_key, "changes");
+    write_json_cache(&cache_file, &changes)?;
+    Ok(changes)
+}
+
+fn workspace_changes_cached_blocking(
+    root_path: String,
+    cache_key: String,
+) -> Result<Option<WorkspaceChanges>, String> {
+    let (root, _) = workspace_tree_resolve_dir(&root_path, "")?;
+    let cache_file = workspace_change_cache_file(&root, &cache_key, "changes");
+    Ok(read_json_cache(&cache_file))
+}
+
+#[tauri::command]
+async fn workspace_changes_baseline(
+    root_path: String,
+    cache_key: String,
+    baseline_at_ms: Option<u64>,
+) -> Result<WorkspaceChangeBaselineSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_changes_baseline_blocking(root_path, cache_key, baseline_at_ms)
+            .map(workspace_change_baseline_summary)
+    })
+    .await
+    .map_err(|e| format!("会话改动基线任务失败: {e}"))?
+}
+
+#[tauri::command]
+async fn workspace_changes(
+    root_path: String,
+    cache_key: String,
+    baseline_at_ms: Option<u64>,
+) -> Result<WorkspaceChanges, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_changes_blocking(root_path, cache_key, baseline_at_ms)
+    })
+    .await
+    .map_err(|e| format!("会话改动读取任务失败: {e}"))?
+}
+
+#[tauri::command]
+async fn workspace_changes_cached(
+    root_path: String,
+    cache_key: String,
+) -> Result<Option<WorkspaceChanges>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_changes_cached_blocking(root_path, cache_key)
+    })
+    .await
+    .map_err(|e| format!("会话改动缓存读取任务失败: {e}"))?
 }
 
 fn image_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
@@ -2484,16 +4926,7 @@ fn clipboard_image_extension(mime: &str, file_name: Option<&str>) -> Result<&'st
 }
 
 fn clipboard_image_dir(cwd: Option<&str>) -> PathBuf {
-    let cwd = cwd.unwrap_or_default().trim();
-    if !cwd.is_empty() {
-        let root = PathBuf::from(cwd);
-        if root.is_dir() {
-            return root.join(".omc").join("clipboard-images");
-        }
-    }
-    std::env::temp_dir()
-        .join("freeultracode")
-        .join("clipboard-images")
+    storage_paths::managed_artifact_dir(cwd, "clipboard-images")
 }
 
 fn random_hex_u64() -> String {
@@ -2541,29 +4974,11 @@ fn write_unique_clipboard_image(dir: &Path, ext: &str, bytes: &[u8]) -> Result<P
 }
 
 fn session_capture_dir(cwd: Option<&str>) -> PathBuf {
-    let cwd = cwd.unwrap_or_default().trim();
-    if !cwd.is_empty() {
-        let root = PathBuf::from(cwd);
-        if root.is_dir() {
-            return root.join(".omc").join("session-captures");
-        }
-    }
-    std::env::temp_dir()
-        .join("freeultracode")
-        .join("session-captures")
+    storage_paths::managed_artifact_dir(cwd, "session-captures")
 }
 
 fn model_asset_dir(cwd: Option<&str>) -> PathBuf {
-    let cwd = cwd.unwrap_or_default().trim();
-    if !cwd.is_empty() {
-        let root = PathBuf::from(cwd);
-        if root.is_dir() {
-            return root.join(".omc").join("model-assets");
-        }
-    }
-    std::env::temp_dir()
-        .join("freeultracode")
-        .join("model-assets")
+    storage_paths::managed_artifact_dir(cwd, "model-assets")
 }
 
 fn safe_session_capture_stem(file_name: Option<&str>) -> String {
@@ -3482,7 +5897,8 @@ fn setup_local_model_blocking(model: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let script_path = std::env::temp_dir().join("freeultracode-setup-local-model.ps1");
+        let script_path =
+            managed_temp_path(None, "scripts", "freeultracode-setup-local-model", "ps1");
         std::fs::write(&script_path, LOCAL_MODEL_SETUP_PS1.as_bytes())
             .map_err(|e| format!("写入本地模型安装脚本失败: {e}"))?;
 
@@ -3704,6 +6120,7 @@ fn emit_ultracode_progress(app: &tauri::AppHandle, run_id: &str, stream: &str, t
 async fn run_ultracode(
     task: String,
     cwd: Option<String>,
+    extra_workspace_paths: Option<Vec<String>>,
     adapter: Option<String>,
     model: Option<String>,
     provider: Option<String>,
@@ -3734,21 +6151,35 @@ async fn run_ultracode(
             .filter(|path| path.is_dir())
             .unwrap_or_else(|| default_ultracode_workdir(&cli_path));
         let deep_research_workflow = bundled_deep_research_workflow_root(&app);
+        let extra_workspace_paths =
+            normalize_extra_workspace_paths(cwd.as_deref(), extra_workspace_paths);
+        let workspace_context = if extra_workspace_paths.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n附加工作区目录：\n{}\n这些目录属于同一次会话上下文；需要跨项目/引擎源码分析时可按绝对路径读取。",
+                extra_workspace_paths
+                    .iter()
+                    .map(|path| format!("- {path}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
         let task = if task.contains("执行 deep-research")
             || task.contains("Run deep research")
             || task.contains("/deep-research")
         {
             match &deep_research_workflow {
                 Some(root) => format!(
-                    "{task}\n\n内置 deep-research workflow 路径：{root}\n请优先读取并遵循该目录下 WORKFLOW.md 和 protocol/model-agnostic-deep-research.md；这是随 FreeUltraCode 发布的内置 workflow，不是用户电脑上的普通 skill，不要依赖用户工作区里是否存在 skills/ 目录。",
+                    "{task}{workspace_context}\n\n内置 deep-research workflow 路径：{root}\n请优先读取并遵循该目录下 WORKFLOW.md 和 protocol/model-agnostic-deep-research.md；这是随 FreeUltraCode 发布的内置 workflow，不是用户电脑上的普通 skill，不要依赖用户工作区里是否存在 skills/ 目录。",
                     root = root.to_string_lossy()
                 ),
                 None => format!(
-                    "{task}\n\n内置 deep-research workflow 路径：未找到 Tauri bundled workflow resource；请按内置 deep-research 协议摘要执行，并在最终报告中记录该资源缺口。"
+                    "{task}{workspace_context}\n\n内置 deep-research workflow 路径：未找到 Tauri bundled workflow resource；请按内置 deep-research 协议摘要执行，并在最终报告中记录该资源缺口。"
                 ),
             }
         } else {
-            task
+            format!("{task}{workspace_context}")
         };
 
         let mut args = vec![
@@ -4289,14 +6720,165 @@ fn claude_gateway_settings_json(env_vars: &HashMap<String, String>) -> Option<se
 
 fn write_claude_gateway_settings(
     env_vars: Option<&HashMap<String, String>>,
+    cwd: Option<&str>,
 ) -> Result<Option<TempFileGuard>, String> {
     let Some(settings) = env_vars.and_then(claude_gateway_settings_json) else {
         return Ok(None);
     };
-    let path = temp_output_path("freeultracode-claude-settings", "json");
+    let path = temp_output_path_for_cwd(cwd, "freeultracode-claude-settings", "json");
     let bytes =
         serde_json::to_vec(&settings).map_err(|e| format!("生成 Claude 临时配置失败: {e}"))?;
     std::fs::write(&path, bytes).map_err(|e| format!("写入 Claude 临时配置失败: {e}"))?;
+    Ok(Some(TempFileGuard::new(path)))
+}
+
+fn project_history_path_key(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw = PathBuf::from(trimmed);
+    let resolved = std::fs::canonicalize(&raw).unwrap_or(raw);
+    let text = resolved.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        Some(text.to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        Some(text)
+    }
+}
+
+fn project_settings_for_cwd(cwd: Option<&str>) -> Option<serde_json::Value> {
+    let cwd_key = project_history_path_key(cwd?)?;
+    let index_path = storage_paths::global_root()
+        .ok()?
+        .join("workspaces")
+        .join("index.json");
+    let index_text = std::fs::read_to_string(index_path).ok()?;
+    let workspaces = serde_json::from_str::<serde_json::Value>(&index_text).ok()?;
+    let workspaces = workspaces.as_array()?;
+    let workspace = workspaces.iter().find(|workspace| {
+        workspace
+            .get("path")
+            .and_then(|value| value.as_str())
+            .and_then(project_history_path_key)
+            .is_some_and(|path| path == cwd_key)
+    })?;
+    workspace
+        .pointer("/metadata/projectSettings")
+        .cloned()
+        .filter(|value| value.is_object())
+}
+
+fn project_mcp_server_key(id: &str, used: &mut HashSet<String>) -> String {
+    let mut key: String = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if key.trim_matches('_').is_empty() {
+        key = "project-mcp".to_string();
+    }
+    let base = key.clone();
+    let mut suffix = 2;
+    while !used.insert(key.clone()) {
+        key = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    key
+}
+
+fn project_mcp_settings_json(cwd: Option<&str>) -> Option<serde_json::Value> {
+    let settings = project_settings_for_cwd(cwd)?;
+    if settings
+        .pointer("/mcp/enabled")
+        .and_then(|value| value.as_bool())
+        == Some(false)
+    {
+        return None;
+    }
+    let workspace = cwd.unwrap_or_default().trim();
+    let servers = settings.pointer("/mcp/servers")?.as_array()?;
+    let mut used = HashSet::new();
+    let mut mcp_servers = serde_json::Map::new();
+    for server in servers {
+        if server.get("enabled").and_then(|value| value.as_bool()) != Some(true) {
+            continue;
+        }
+        if server.get("transport").and_then(|value| value.as_str()) != Some("stdio") {
+            continue;
+        }
+        let Some(command) = server
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let id = server
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("project-mcp");
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "command".to_string(),
+            serde_json::Value::String(project_expand_path_text(command)),
+        );
+        if let Some(args) = server.get("args").and_then(|value| value.as_array()) {
+            let args = args
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| serde_json::Value::String(value.replace("{workspace}", workspace)))
+                .collect::<Vec<_>>();
+            entry.insert("args".to_string(), serde_json::Value::Array(args));
+        }
+        if let Some(env) = server.get("env").and_then(|value| value.as_object()) {
+            let env = env
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| {
+                        (
+                            key.clone(),
+                            serde_json::Value::String(value.replace("{workspace}", workspace)),
+                        )
+                    })
+                })
+                .collect::<serde_json::Map<_, _>>();
+            if !env.is_empty() {
+                entry.insert("env".to_string(), serde_json::Value::Object(env));
+            }
+        }
+        mcp_servers.insert(
+            project_mcp_server_key(id, &mut used),
+            serde_json::Value::Object(entry),
+        );
+    }
+    if mcp_servers.is_empty() {
+        return None;
+    }
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "mcpServers".to_string(),
+        serde_json::Value::Object(mcp_servers),
+    );
+    Some(serde_json::Value::Object(root))
+}
+
+fn write_project_mcp_settings(cwd: Option<&str>) -> Result<Option<TempFileGuard>, String> {
+    let Some(settings) = project_mcp_settings_json(cwd) else {
+        return Ok(None);
+    };
+    let path = temp_output_path_for_cwd(cwd, "freeultracode-project-mcp", "json");
+    let bytes = serde_json::to_vec(&settings).map_err(|e| format!("生成项目 MCP 配置失败: {e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("写入项目 MCP 配置失败: {e}"))?;
     Ok(Some(TempFileGuard::new(path)))
 }
 
@@ -4470,6 +7052,20 @@ fn emit_progress(app: &tauri::AppHandle, run_id: &str, text: &str) {
         "ai-cli-progress",
         serde_json::json!({ "runId": run_id, "text": text }),
     );
+}
+
+fn emit_usage(app: &tauri::AppHandle, run_id: &str, usage: &serde_json::Value) {
+    let _ = app.emit(
+        "ai-cli-usage",
+        serde_json::json!({ "runId": run_id, "usage": usage }),
+    );
+}
+
+fn ai_cli_result(text: String, usage: &Arc<Mutex<Option<serde_json::Value>>>) -> AiCliResult {
+    AiCliResult {
+        text,
+        usage: usage.lock().ok().and_then(|current| (*current).clone()),
+    }
 }
 
 /// Summarize a `tool_use` event into one readable progress line, e.g.
@@ -4675,6 +7271,17 @@ fn codex_turn_completion_status(event: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn codex_turn_usage(event: &serde_json::Value) -> Option<&serde_json::Value> {
+    match codex_event_kind(event) {
+        Some("turn.completed") | Some("turn/completed") | Some("turn_complete") => event
+            .get("usage")
+            .or_else(|| event.pointer("/params/usage"))
+            .or_else(|| event.pointer("/params/turn/usage"))
+            .or_else(|| event.pointer("/turn/usage")),
+        _ => None,
+    }
+}
+
 fn codex_status_success(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
@@ -4720,6 +7327,45 @@ fn cancel_ai_cli(run_id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn workspace_dir_key(path: &Path) -> String {
+    let text = display_preview_path(path).replace('\\', "/");
+    if cfg!(windows) {
+        text.to_ascii_lowercase()
+    } else {
+        text
+    }
+}
+
+fn normalize_extra_workspace_paths(
+    cwd: Option<&str>,
+    extra_workspace_paths: Option<Vec<String>>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    if let Some(dir) = cwd.map(str::trim).filter(|dir| !dir.is_empty()) {
+        let path = Path::new(dir);
+        if path.is_dir() {
+            seen.insert(workspace_dir_key(path));
+        }
+    }
+
+    let mut out = Vec::new();
+    for raw in extra_workspace_paths.unwrap_or_default() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = Path::new(trimmed);
+        if !path.is_dir() {
+            continue;
+        }
+        let key = workspace_dir_key(path);
+        if seen.insert(key) {
+            out.push(display_preview_path(path));
+        }
+    }
+    out
+}
+
 /// Run a prompt through the locally-installed agent CLI (e.g. `claude`) using the
 /// machine's own environment/credentials — no API key is passed from the app.
 ///
@@ -4741,6 +7387,7 @@ async fn ai_cli(
     cli_command: Option<String>,
     model: Option<String>,
     cwd: Option<String>,
+    extra_workspace_paths: Option<Vec<String>>,
     permission: Option<String>,
     env_vars: Option<HashMap<String, String>>,
     timeout_seconds: Option<u64>,
@@ -4755,10 +7402,12 @@ async fn ai_cli(
     // Optional launch shell wrapping (from the General settings "启动 Shell").
     shell: Option<ShellSpec>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+) -> Result<AiCliResult, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<AiCliResult, String> {
         let env_vars = normalize_spawn_env(env_vars);
         let progress_model_hint = gateway_progress_model_hint(env_vars.as_ref());
+        let extra_workspace_paths =
+            normalize_extra_workspace_paths(cwd.as_deref(), extra_workspace_paths);
         let binary = match cli_command
             .as_deref()
             .map(cli_runtime::normalize_cli_command_override)
@@ -4770,7 +7419,11 @@ async fn ai_cli(
         let protocol = cli_runtime::adapter_protocol(&adapter);
         let is_codex = protocol == "codex";
         let codex_last_message_path = if is_codex {
-            Some(temp_output_path("freeultracode-codex-last", "txt"))
+            Some(temp_output_path_for_cwd(
+                cwd.as_deref(),
+                "freeultracode-codex-last",
+                "txt",
+            ))
         } else {
             None
         };
@@ -4836,6 +7489,10 @@ async fn ai_cli(
                     args.push(dir.to_string());
                 }
             }
+            for dir in &extra_workspace_paths {
+                args.push("--add-dir".into());
+                args.push(dir.clone());
+            }
 
             if let Some(path) = codex_last_message_path.as_ref() {
                 args.push("-o".into());
@@ -4860,7 +7517,9 @@ async fn ai_cli(
             {
                 args.push("--bare".into());
             }
-            if let Some(settings_file) = write_claude_gateway_settings(env_vars.as_ref())? {
+            if let Some(settings_file) =
+                write_claude_gateway_settings(env_vars.as_ref(), cwd.as_deref())?
+            {
                 args.push("--settings".into());
                 args.push(settings_file.path().to_string_lossy().to_string());
                 temp_files.push(settings_file);
@@ -4881,7 +7540,13 @@ async fn ai_cli(
             // we add it only when MCP is explicitly disabled
             // (FREEULTRACODE_ENABLE_MCP=0) to skip the ~2-4s cold-start MCP
             // init per node.
-            if !mcp_enabled() {
+            if mcp_enabled() {
+                if let Some(project_mcp_file) = write_project_mcp_settings(cwd.as_deref())? {
+                    args.push("--mcp-config".into());
+                    args.push(project_mcp_file.path().to_string_lossy().to_string());
+                    temp_files.push(project_mcp_file);
+                }
+            } else {
                 args.push("--strict-mcp-config".into());
             }
 
@@ -4926,6 +7591,10 @@ async fn ai_cli(
                     args.push("--add-dir".into());
                     args.push(dir.to_string());
                 }
+            }
+            for dir in &extra_workspace_paths {
+                args.push("--add-dir".into());
+                args.push(dir.clone());
             }
         }
 
@@ -4973,6 +7642,8 @@ async fn ai_cli(
         let progress_model_hint2 = progress_model_hint.clone();
         let codex_turn_status = Arc::new(Mutex::new(None::<String>));
         let codex_turn_status_reader = Arc::clone(&codex_turn_status);
+        let codex_usage = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let codex_usage_reader = Arc::clone(&codex_usage);
         let codex_streamed_output = Arc::new(Mutex::new(String::new()));
         let codex_streamed_output_reader = Arc::clone(&codex_streamed_output);
         let stdout_activity = Arc::clone(&last_activity);
@@ -5007,6 +7678,12 @@ async fn ai_cli(
                         Err(_) => continue,
                     };
                     if parse_codex {
+                        if let Some(usage) = codex_turn_usage(&v) {
+                            if let Ok(mut current) = codex_usage_reader.lock() {
+                                *current = Some(usage.clone());
+                            }
+                            emit_usage(&app2, &run2, usage);
+                        }
                         if let Some(status) = codex_turn_completion_status(&v) {
                             if let Ok(mut current) = codex_turn_status_reader.lock() {
                                 *current = Some(status);
@@ -5359,7 +8036,7 @@ async fn ai_cli(
                         ));
                     }
                     if codex_status_success(status) {
-                        return Ok(terminal_output);
+                        return Ok(ai_cli_result(terminal_output, &codex_usage));
                     }
                     return Err(format!(
                         "CLI \"{binary}\" turn status {status}: {}",
@@ -5377,7 +8054,7 @@ async fn ai_cli(
                             "",
                         ));
                     }
-                    return Ok(terminal_output);
+                    return Ok(ai_cli_result(terminal_output, &codex_usage));
                 }
                 _ => {}
             }
@@ -5409,7 +8086,9 @@ async fn ai_cli(
 
         match wait_result {
             Err(err) => Err(append_cli_error_context(err, &output, &stderr)),
-            Ok(WaitOutcome::Exited(status)) if status.success() => Ok(output),
+            Ok(WaitOutcome::Exited(status)) if status.success() => {
+                Ok(ai_cli_result(output, &codex_usage))
+            }
             Ok(WaitOutcome::Exited(status)) => {
                 let code = status.code().unwrap_or(-1);
                 let detail = if stderr.trim().is_empty() {
@@ -5420,7 +8099,7 @@ async fn ai_cli(
                 Err(format!("CLI \"{binary}\" 退出码 {code}: {detail}"))
             }
             Ok(WaitOutcome::CodexTurnCompleted(status)) if codex_status_success(&status) => {
-                Ok(output)
+                Ok(ai_cli_result(output, &codex_usage))
             }
             Ok(WaitOutcome::CodexTurnCompleted(status)) => {
                 let detail = if stderr.trim().is_empty() {
@@ -5430,7 +8109,7 @@ async fn ai_cli(
                 };
                 Err(format!("CLI \"{binary}\" turn status {status}: {detail}"))
             }
-            Ok(WaitOutcome::CodexLastMessageReady) => Ok(output),
+            Ok(WaitOutcome::CodexLastMessageReady) => Ok(ai_cli_result(output, &codex_usage)),
         }
     })
     .await
@@ -5601,11 +8280,18 @@ mod tests {
 
         let turn = serde_json::json!({
             "type": "turn.completed",
-            "status": "completed"
+            "status": "completed",
+            "usage": { "input_tokens": 22451, "cached_input_tokens": 11648, "output_tokens": 28 }
         });
         assert_eq!(
             codex_turn_completion_status(&turn).as_deref(),
             Some("completed")
+        );
+        assert_eq!(
+            codex_turn_usage(&turn)
+                .and_then(|v| v.get("cached_input_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(11648)
         );
     }
 
@@ -5624,11 +8310,20 @@ mod tests {
 
         let turn = serde_json::json!({
             "method": "turn/completed",
-            "params": { "turn": { "status": "completed" } }
+            "params": {
+                "turn": { "status": "completed" },
+                "usage": { "input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2 }
+            }
         });
         assert_eq!(
             codex_turn_completion_status(&turn).as_deref(),
             Some("completed")
+        );
+        assert_eq!(
+            codex_turn_usage(&turn)
+                .and_then(|v| v.get("cached_input_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(4)
         );
     }
 
@@ -5812,6 +8507,179 @@ mod tests {
     }
 
     #[test]
+    fn scan_workspace_snapshot_does_not_limit_file_count() {
+        let root = std::env::temp_dir().join(format!(
+            "freeultracode-session-changes-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        for index in 0..300 {
+            let path = root.join(format!("{index:05}.txt"));
+            std::fs::write(path, format!("file {index}\n")).expect("write test file");
+        }
+
+        let (files, truncated) = scan_workspace_snapshot(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!truncated);
+        assert_eq!(files.len(), 300);
+        let last = files.last().expect("last file");
+        assert_eq!(last.path, "00299.txt");
+        assert!(!last.binary);
+        assert!(!last.truncated);
+        assert_eq!(last.content.as_deref(), Some("file 299\n"));
+    }
+
+    #[test]
+    fn truncate_workspace_changes_does_not_limit_file_count() {
+        let mut files: Vec<WorkspaceChangeFile> = (0..300)
+            .map(|index| WorkspaceChangeFile {
+                path: format!("{index:03}.txt"),
+                old_path: None,
+                status: "modified".to_string(),
+                binary: false,
+                truncated: false,
+                lines: Vec::new(),
+            })
+            .collect();
+
+        let truncated = truncate_workspace_changes(&mut files);
+
+        assert!(!truncated);
+        assert_eq!(files.len(), 300);
+    }
+
+    #[test]
+    fn parse_git_workspace_changes_strips_workspace_prefix() {
+        let files = parse_git_workspace_changes(
+            " M app/src/main.ts\0?? app/src/new.ts\0R  app/src/next.ts\0app/src/old.ts\0",
+            "app/",
+        );
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "src/main.ts");
+        assert_eq!(files[0].status, "modified");
+        assert_eq!(files[1].path, "src/new.ts");
+        assert_eq!(files[1].status, "added");
+        assert_eq!(files[2].path, "src/next.ts");
+        assert_eq!(files[2].old_path.as_deref(), Some("src/old.ts"));
+        assert_eq!(files[2].status, "renamed");
+    }
+
+    #[test]
+    fn parse_git_diff_workspace_changes_reads_hunks() {
+        let files = parse_git_diff_workspace_changes(
+            "diff --git a/app/src/main.ts b/app/src/main.ts\n\
+             index 1111111..2222222 100644\n\
+             --- a/app/src/main.ts\n\
+             +++ b/app/src/main.ts\n\
+             @@ -4 +4,2 @@\n\
+             -old line\n\
+             +new line\n\
+             +extra line\n",
+            "app/",
+        );
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.ts");
+        assert_eq!(files[0].status, "modified");
+        assert_eq!(files[0].lines.len(), 3);
+        assert_eq!(files[0].lines[0].kind, "replacedDeleted");
+        assert_eq!(files[0].lines[0].old_line, Some(4));
+        assert_eq!(files[0].lines[1].kind, "replacedAdded");
+        assert_eq!(files[0].lines[1].new_line, Some(4));
+        assert_eq!(files[0].lines[2].content, "extra line");
+    }
+
+    #[test]
+    fn merge_workspace_status_files_with_diff_keeps_status() {
+        let status_files = parse_git_workspace_changes(" M app/src/main.ts\0", "app/");
+        let diff_files = parse_git_diff_workspace_changes(
+            "diff --git a/app/src/main.ts b/app/src/main.ts\n\
+             --- a/app/src/main.ts\n\
+             +++ b/app/src/main.ts\n\
+             @@ -0,0 +1 @@\n\
+             +new line\n",
+            "app/",
+        );
+
+        let files = merge_workspace_status_files_with_diff(
+            Path::new("E:/OpenWorkflow"),
+            status_files,
+            diff_files,
+        );
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.ts");
+        assert_eq!(files[0].status, "modified");
+        assert_eq!(files[0].lines.len(), 1);
+        assert_eq!(files[0].lines[0].kind, "added");
+    }
+
+    #[test]
+    fn parse_svn_workspace_changes_maps_statuses() {
+        let files =
+            parse_svn_workspace_changes("M       edited.ts\n?       new.ts\n!       missing.ts\n");
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].status, "modified");
+        assert_eq!(files[1].status, "added");
+        assert_eq!(files[2].status, "deleted");
+    }
+
+    #[test]
+    fn parse_p4_workspace_changes_uses_preview_actions() {
+        let root = Path::new("E:/Depot/Client");
+        let files = parse_p4_workspace_changes(
+            root,
+            "Source/New.cpp - reconcile to add //depot/Source/New.cpp\n\
+             Source/Edit.cpp - reconcile to edit //depot/Source/Edit.cpp#3\n\
+             //depot/Source/Gone.cpp#2 - opened for delete\n",
+        );
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "Source/New.cpp");
+        assert_eq!(files[0].status, "added");
+        assert_eq!(files[1].status, "modified");
+        assert_eq!(files[2].path, "//depot/Source/Gone.cpp");
+        assert_eq!(files[2].status, "deleted");
+    }
+
+    #[test]
+    fn workspace_changes_uses_session_time_when_baseline_is_late() {
+        let root = std::env::temp_dir().join(format!(
+            "freeultracode-session-time-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let baseline_at_ms = now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::fs::write(root.join("changed.txt"), "changed\n").expect("write test file");
+
+        let key = format!("test-{}", now_ms());
+        let _ = workspace_changes_baseline_blocking(
+            display_preview_path(&root),
+            key.clone(),
+            Some(baseline_at_ms),
+        )
+        .expect("baseline");
+        let changes =
+            workspace_changes_blocking(display_preview_path(&root), key, Some(baseline_at_ms))
+                .expect("changes");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(changes.files[0].path, "changed.txt");
+        assert_eq!(changes.files[0].status, "modified");
+        assert!(changes.files[0].truncated);
+    }
+
+    #[test]
     fn normalizes_spawn_env_known_provider_models() {
         let mut env = HashMap::new();
         env.insert(
@@ -5859,6 +8727,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -5918,6 +8787,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            focus_main_window,
+            notify_session_complete,
             ai_edit_graph,
             run_workflow,
             run_ultracode,
@@ -5934,6 +8805,13 @@ pub fn run() {
             list_remote_models,
             setup_local_model,
             open_external,
+            open_workspace_directory,
+            list_workspace_dir,
+            project_environment_scan,
+            project_mcp_probe,
+            workspace_changes_baseline,
+            workspace_changes,
+            workspace_changes_cached,
             preview_local_file,
             save_clipboard_image,
             save_session_capture,
@@ -5947,6 +8825,9 @@ pub fn run() {
             history::history_remove,
             history::history_list_dir,
             cc_switch_import::import_cc_switch_claude,
+            secure_store::secure_secret_get_many,
+            secure_store::secure_secret_set,
+            secure_store::secure_secret_delete,
             free_proxy::free_proxy_ensure,
             free_proxy::free_proxy_stop
         ])

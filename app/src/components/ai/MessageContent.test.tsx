@@ -31,11 +31,11 @@ describe('MessageContent integration', () => {
   ].join('\n');
 
   it('preserves Windows clipboard-image paths through markdown so preview works', () => {
-    // CommonMark would collapse the `\.omc` escape and corrupt the path, leaving
+    // CommonMark would collapse the `\.freeultracode` escape and corrupt the path, leaving
     // the file chip pointing at a non-existent file (so clicking it cannot
     // preview). The protect pass keeps the original separators intact.
     const B = String.fromCharCode(92);
-    const winPath = `E:${B}OpenWorkflow${B}.omc${B}clipboard-images${B}pasted-1780825313768-e964bfa29a1d4c87-0.png`;
+    const winPath = `E:${B}OpenWorkflow${B}.freeultracode${B}clipboard-images${B}pasted-1780825313768-e964bfa29a1d4c87-0.png`;
     const html = renderToStaticMarkup(
       createElement(MessageContent, {
         text: `已保存截图 ${winPath} 完成。`,
@@ -44,9 +44,9 @@ describe('MessageContent integration', () => {
       }),
     );
     expect(html).toMatch(/ai-file-chip--interactive/);
-    // The `.omc` separator must survive: no `OpenWorkflow.omc` collapse.
-    expect(html).not.toMatch(/OpenWorkflow\.omc/);
-    expect(html).toMatch(/OpenWorkflow\\\.omc\\clipboard-images/);
+    // The `.freeultracode` separator must survive: no `OpenWorkflow.freeultracode` collapse.
+    expect(html).not.toMatch(/OpenWorkflow\.freeultracode/);
+    expect(html).toMatch(/OpenWorkflow\\\.freeultracode\\clipboard-images/);
   });
 
   it('renders highlighted code, table, and file chip', () => {
@@ -60,6 +60,25 @@ describe('MessageContent integration', () => {
     expect(html).toMatch(/JetBrains|ai-code/); // code block chrome rendered
     expect(html).toMatch(/example\.com/); // external link survived
     expect(html).toMatch(/Heading/);
+  });
+
+  it('renders HLSL fences with syntax highlighting', () => {
+    const html = renderToStaticMarkup(
+      createElement(MessageContent, {
+        text: [
+          '```hlsl',
+          'float Dist = DistanceToNearestSurface(WorldPosition + Normal * Bias);',
+          'float Mask = 1 - saturate(Dist / BlendWidth);',
+          'float3 Result = lerp(BaseMaterial, BlendMaterial, Mask);',
+          '```',
+        ].join('\n'),
+        streaming: false,
+      }),
+    );
+
+    expect(html).toMatch(/language-hlsl/);
+    expect(html).toMatch(/hljs-type/);
+    expect(html).toMatch(/hljs-built_in|hljs-title/);
   });
 
   it('renders a reasoning block separately from the answer', () => {
@@ -173,7 +192,7 @@ describe('MessageContent integration', () => {
   it('renders downloaded local 3D model links as viewports', () => {
     const html = renderToStaticMarkup(
       createElement(MessageContent, {
-        text: '[预览 3D 模型 1](file:///E:/OpenWorkflows/.omc/model-assets/model.glb)',
+        text: '[预览 3D 模型 1](file:///E:/OpenWorkflows/.freeultracode/model-assets/model.glb)',
         streaming: false,
       }),
     );
@@ -199,7 +218,7 @@ describe('MessageContent integration', () => {
   it('falls back to a file chip for unsupported local 3D model formats', () => {
     const html = renderToStaticMarkup(
       createElement(MessageContent, {
-        text: '[预览 3D 模型 5](file:///E:/OpenWorkflows/.omc/model-assets/model.zip)',
+        text: '[预览 3D 模型 5](file:///E:/OpenWorkflows/.freeultracode/model-assets/model.zip)',
         streaming: false,
         onOpenFile: () => {},
       }),
@@ -217,7 +236,7 @@ describe('MessageContent integration', () => {
         text:
           '✓ 3D 模型生成完成\n' +
           '骨骼：已按可绑骨资产请求骨骼绑定和 Idle、Walk、Run 预览动画\n\n' +
-          '[预览 3D 模型 1](file:///E:/OpenWorkflows/.omc/model-assets/model.glb)',
+          '[预览 3D 模型 1](file:///E:/OpenWorkflows/.freeultracode/model-assets/model.glb)',
       }),
     );
 
@@ -255,7 +274,7 @@ describe('MessageContent integration', () => {
 
   it('renders backticked Windows capture paths with spaces as interactive file chips', () => {
     const B = String.fromCharCode(92);
-    const path = `E:${B}Open Workflow${B}.omc${B}session-captures${B}session-2026-06-07-1432.png`;
+    const path = `E:${B}Open Workflow${B}.freeultracode${B}session-captures${B}session-2026-06-07-1432.png`;
     const html = renderToStaticMarkup(
       createElement(MessageContent, {
         text: `保存到（点击路径可预览）：\n- \`${path}\``,

@@ -1,6 +1,15 @@
 import type { GatewaySelection } from '@/core/ir';
 import type { GatewayProvider } from '@/lib/modelGateway/types';
 import { freeChannelAutoKeys, freeProxyEnsure, isTauri } from '@/lib/tauri';
+import {
+  FREE_CHANNEL_API_KEYS_SECRET,
+  FREE_PROXY_TOKEN_SECRET,
+  readSecureRecord,
+  readSecureSecret,
+  secureStorageAvailable,
+  writeSecureRecord,
+  writeSecureSecret,
+} from '@/lib/secureStorage';
 
 /**
  * CONTRACT: catalog + helpers for the built-in "free channels" feature.
@@ -13,11 +22,11 @@ import { freeChannelAutoKeys, freeProxyEnsure, isTauri } from '@/lib/tauri';
  * merges synthetic CLI providers so the existing resolver/launcher pathway
  * (gatewayRouteEnv -> ANTHROPIC_BASE_URL/...) lights up unchanged.
  *
- * Storage keys (localStorage):
- *   fuc_free_channel_keys_v1   -> { [id]: apiKey }
+ * Storage keys:
+ *   OS keychain (Tauri)        -> { [id]: apiKey }
  *   fuc_free_channel_models_v1 -> { [id]: modelOverride }
  *   fuc_free_proxy_port_v1     -> number (default 8766)
- *   fuc_free_proxy_token_v1    -> per-process local proxy auth token
+ *   OS keychain (Tauri)        -> per-process local proxy auth token
  *
  * Exports the UI phase relies on:
  *   FREE_CHANNELS, FREE_CHANNEL_PROVIDER_PREFIX, freeChannelById,
@@ -398,15 +407,24 @@ const hasWindow = (): boolean => typeof window !== 'undefined';
 function readRecord(key: string): Record<string, string> {
   try {
     if (!hasWindow()) return {};
+    const secureKeys = key === KEYS_STORAGE && secureStorageAvailable();
     const raw = window.localStorage.getItem(key);
     const out: Record<string, string> = {};
 
+    if (secureKeys) {
+      Object.assign(out, readSecureRecord(FREE_CHANNEL_API_KEYS_SECRET));
+    }
+
+    let migratedCurrent = false;
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as unknown;
         if (typeof parsed === 'object' && parsed !== null) {
           for (const [k, v] of Object.entries(parsed)) {
-            if (typeof v === 'string') out[k] = v;
+            if (typeof v !== 'string') continue;
+            if (secureKeys && v.trim()) migratedCurrent = true;
+            if (secureKeys && out[k]?.trim()) continue;
+            out[k] = v;
           }
         }
       } catch {
@@ -431,7 +449,7 @@ function readRecord(key: string): Record<string, string> {
       }
     }
 
-    if (mergedLegacy) writeRecord(key, out);
+    if (mergedLegacy || migratedCurrent) writeRecord(key, out);
     return out;
   } catch {
     return {};
@@ -442,6 +460,15 @@ function writeRecord(key: string, value: Record<string, string>): boolean {
   try {
     if (!hasWindow()) return false;
     const next = JSON.stringify(value);
+    if (key === KEYS_STORAGE && secureStorageAvailable()) {
+      const changed = writeSecureRecord(FREE_CHANNEL_API_KEYS_SECRET, value);
+      window.localStorage.removeItem(key);
+      for (const legacyKey of LEGACY_RECORD_STORAGE[key] ?? []) {
+        window.localStorage.removeItem(legacyKey);
+      }
+      if (changed) window.dispatchEvent(new Event('fuc:gateway-config-changed'));
+      return changed;
+    }
     if (window.localStorage.getItem(key) === next) return false;
     window.localStorage.setItem(key, next);
     window.dispatchEvent(new Event('fuc:gateway-config-changed'));
@@ -748,6 +775,9 @@ function setCachedFreeProxyPort(port: number): void {
 function getCachedFreeProxyToken(): string {
   try {
     if (!hasWindow()) return '';
+    if (secureStorageAvailable()) {
+      return readSecureSecret(FREE_PROXY_TOKEN_SECRET).trim();
+    }
     return window.localStorage.getItem(TOKEN_STORAGE)?.trim() ?? '';
   } catch {
     return '';
@@ -758,6 +788,12 @@ function setCachedFreeProxyToken(token: string): void {
   try {
     if (!hasWindow()) return;
     const trimmed = token.trim();
+    if (secureStorageAvailable()) {
+      const changed = writeSecureSecret(FREE_PROXY_TOKEN_SECRET, trimmed);
+      window.localStorage.removeItem(TOKEN_STORAGE);
+      if (changed) window.dispatchEvent(new Event('fuc:gateway-config-changed'));
+      return;
+    }
     const prev = window.localStorage.getItem(TOKEN_STORAGE);
     if (trimmed) window.localStorage.setItem(TOKEN_STORAGE, trimmed);
     else window.localStorage.removeItem(TOKEN_STORAGE);

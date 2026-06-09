@@ -3,10 +3,10 @@
  *
  * CommonMark treats a backslash before ASCII punctuation as an escape and drops
  * it (`\.` -> `.`, `\(` -> `(`). A Windows path such as
- * `E:\OpenWorkflow\.omc\clipboard-images\shot.png` therefore renders as
- * `E:\OpenWorkflow.omc\clipboard-images\shot.png` — the `\.` segment loses its
+ * `E:\OpenWorkflow\.freeultracode\clipboard-images\shot.png` therefore renders as
+ * `E:\OpenWorkflow.freeultracode\clipboard-images\shot.png` — the `\.` segment loses its
  * separator, so the resulting file chip points at a path that does not exist and
- * the in-app preview fails to open. (Clipboard images always live under `\.omc\`,
+ * the in-app preview fails to open. (Clipboard images always live under `\.freeultracode\`,
  * so every pasted screenshot path hits this.)
  *
  * This pure pre-pass finds Windows-style path tokens (drive-letter `X:\…` and

@@ -50,6 +50,15 @@
   <img src="https://img.shields.io/badge/QQ%20Group-149523963-12B7F5?style=flat-square&labelColor=161b22" alt="QQ Group 149523963">
 </p>
 
+## ❤️ Sponsor
+
+<table>
+<tr>
+<td width="180"><a href="http://apinode.pro/"><img src="app/doc/images/sponsor-apinode.svg" alt="API NODE" width="150"></a></td>
+<td>Thanks to <strong>API NODE</strong> for sponsoring this project! API NODE is an AI API gateway that provides stable, cost-effective relay access to Claude Code, Codex, Gemini, and other leading models through a single endpoint — a great fit for routing FreeUltraCode requests through one reliable provider. Register via <a href="http://apinode.pro/">this link</a>.</td>
+</tr>
+</table>
+
 <p align="center">
   <strong>Free channel routing</strong><br>
   <img src="app/doc/images/hero-free-channels.png" alt="FreeUltraCode free channel routing screenshot" width="960">
@@ -230,17 +239,12 @@ Image mode turns the chat composer into a text-to-image surface while keeping th
 1. Open **Settings** -> **Images**, choose a default image provider, and fill in the required API key, account ID, base URL, or local ComfyUI endpoint. Providers with complete configuration are available from the composer in image mode.
 2. Start a chat session and type `/image-mode-start`. You can also start and generate in one message, for example:
 
-```text
-/image-mode-start a clean app icon for a local coding agent, glass effect, 1024x1024
-```
+   ```text
+   /image-mode-start a clean app icon for a local coding agent, glass effect, 1024x1024
+   ```
 
 3. While image mode is on, ordinary messages generate images instead of running coding edits. The bottom **Channel** selector switches to image providers, and the model selector appears when image model selection is enabled.
 4. Describe the image you want. FreeUltraCode first asks the coding model to polish the image prompt, then sends it to the configured image provider. The generated image appears in the chat stream with the prompt and provider details.
-
-<p align="center">
-  <img src="app/doc/images/生图/session-2026-06-07-2351.png" alt="Image mode generates images and keeps them in the same FreeUltraCode session" width="720">
-</p>
-
 5. Send `/image-mode-end` to return to the normal coding channel and model. If you only need one image without staying in image mode, send `/image`, `/img`, `/draw`, `/生图`, or `/画图` followed by the prompt.
 
 ## How It Works

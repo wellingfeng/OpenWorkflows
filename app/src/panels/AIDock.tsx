@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
   type ReactNode,
 } from 'react';
 import {
@@ -15,9 +16,17 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  File,
+  Folder,
+  GitBranch,
+  Languages,
+  Loader2,
   Plus,
+  RotateCcw,
   Search,
+  ShieldQuestionMark,
   Square,
+  Trash2,
   X,
 } from 'lucide-react';
 import Select from '@/components/Select';
@@ -91,6 +100,7 @@ import {
 } from '@/lib/threeDGeneration';
 import type { SelectOption } from '@/store/types';
 import {
+  LANGUAGE_SELECT_OPTIONS,
   localizeSelectOption,
   t,
   type Locale,
@@ -112,10 +122,18 @@ import {
   saveDockHeight,
   savePaneWidth,
 } from '@/lib/composerStorage';
+import {
+  describeShortcutBinding,
+  isNativeTextareaNewlineShortcut,
+  loadShortcutSettings,
+  matchesShortcut,
+  subscribeShortcutSettings,
+} from '@/lib/keyboardShortcuts';
 import { shouldRefocusComposerAfterAppend } from '@/lib/composerEntryPolicy';
 import {
   tauriAvailable,
   localModelStatus,
+  listWorkspaceDirectory,
   onSlashCatalogUpdated,
   openExternal,
   openLocalPath,
@@ -123,7 +141,15 @@ import {
   slashCatalog,
   type LocalModelRuntimeStatus,
   type SlashCatalogEntry,
+  type WorkspaceTreeEntry,
 } from '@/lib/tauri';
+import {
+  clearProjectFileDragData,
+  hasProjectFileDragData,
+  PROJECT_FILE_DRAG_END_EVENT,
+  type ProjectFileDragEndDetail,
+  projectFilePathsFromDataTransfer,
+} from '@/lib/projectFileDrag';
 import {
   canRefreshFreeChannelModels,
   freeChannelModelOptions,
@@ -137,6 +163,14 @@ import {
   type ContextUsageTone,
 } from '@/lib/contextUsage';
 import LazyMessageContent from '@/components/ai/LazyMessageContent';
+import CopyButton from '@/components/ai/CopyButton';
+import {
+  answerActionText,
+  cleanMessageText,
+  renderMessageText,
+  routeLabelFromText,
+} from '@/components/ai/lib/messageText';
+import { translatePublicText } from '@/lib/publicTranslation';
 import { captureConversation } from '@/lib/sessionScreenshot';
 import { recordConversationGif } from '@/lib/sessionGif';
 import UltracodeRunCard from '@/panels/UltracodeRunCard';
@@ -144,10 +178,6 @@ import FileText from '@/components/ai/FileText';
 import FilePreviewDrawer from '@/components/ai/FilePreviewDrawer';
 import type { FileRef } from '@/components/ai/lib/filePath';
 import type { OpenFileIntent } from '@/components/ai/FileChip';
-import {
-  extractToolSentinels,
-  hasToolSentinel,
-} from '@/components/ai/lib/toolEvent';
 import { shallow } from 'zustand/shallow';
 import {
   isActiveAiEditingSession,
@@ -163,6 +193,7 @@ const MIN_DOCK_HEIGHT = 120;
  * Sized to comfortably cover the visible bottom of the stream after auto-scroll.
  */
 const EAGER_MESSAGE_TAIL = 6;
+const STREAM_BOTTOM_TOLERANCE = 32;
 /** Fixed height of the bottom input area in 'chat' layout (return fills the rest). */
 const CHAT_INPUT_HEIGHT = 300;
 
@@ -193,6 +224,100 @@ function clampHeight(h: number): number {
   const max =
     typeof window !== 'undefined' ? window.innerHeight * 0.75 : 600;
   return Math.min(Math.max(h, MIN_DOCK_HEIGHT), max);
+}
+
+interface StreamScrollSnapshot {
+  atBottom: boolean;
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  anchorMessageId: string | null;
+  anchorOffsetTop: number;
+}
+
+function streamScrollKey(
+  layout: 'dock' | 'chat',
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+): string {
+  return `${layout}:${workspaceId ?? 'global'}:${sessionId ?? 'none'}`;
+}
+
+function isStreamAtBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= STREAM_BOTTOM_TOLERANCE;
+}
+
+function scrollStreamToBottom(el: HTMLElement): void {
+  if (typeof el.scrollTo === 'function') {
+    el.scrollTo({ top: el.scrollHeight, behavior: 'instant' });
+  } else {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function visibleStreamAnchor(
+  stream: HTMLElement,
+  messageRefs: Map<string, HTMLLIElement>,
+): { messageId: string; offsetTop: number } | null {
+  const streamRect = stream.getBoundingClientRect();
+  if (streamRect.height <= 0 && stream.clientHeight <= 0) return null;
+
+  for (const [messageId, node] of messageRefs) {
+    const rect = node.getBoundingClientRect();
+    const hasLayout =
+      rect.width !== 0 || rect.height !== 0 || rect.top !== 0 || rect.bottom !== 0;
+    if (!hasLayout) continue;
+    if (rect.bottom < streamRect.top) continue;
+    if (rect.top > streamRect.bottom) continue;
+    return { messageId, offsetTop: rect.top - streamRect.top };
+  }
+
+  return null;
+}
+
+function readStreamScrollSnapshot(
+  stream: HTMLElement,
+  messageRefs: Map<string, HTMLLIElement>,
+): StreamScrollSnapshot {
+  const anchor = visibleStreamAnchor(stream, messageRefs);
+  return {
+    atBottom: isStreamAtBottom(stream),
+    scrollTop: stream.scrollTop,
+    scrollHeight: stream.scrollHeight,
+    clientHeight: stream.clientHeight,
+    anchorMessageId: anchor?.messageId ?? null,
+    anchorOffsetTop: anchor?.offsetTop ?? 0,
+  };
+}
+
+function restoreStreamScrollSnapshot(
+  stream: HTMLElement,
+  messageRefs: Map<string, HTMLLIElement>,
+  snapshot: StreamScrollSnapshot | undefined,
+): boolean {
+  if (!snapshot || snapshot.atBottom) {
+    scrollStreamToBottom(stream);
+    return true;
+  }
+
+  if (snapshot.anchorMessageId) {
+    const node = messageRefs.get(snapshot.anchorMessageId);
+    if (!node) {
+      stream.scrollTop = snapshot.scrollTop;
+      return false;
+    }
+    const streamRect = stream.getBoundingClientRect();
+    const nodeRect = node.getBoundingClientRect();
+    const delta =
+      nodeRect.top - streamRect.top - snapshot.anchorOffsetTop;
+    if (Number.isFinite(delta) && Math.abs(delta) > 0.5) {
+      stream.scrollTop += delta;
+    }
+    return true;
+  }
+
+  stream.scrollTop = snapshot.scrollTop;
+  return true;
 }
 
 type ChatTitleState = Pick<
@@ -240,13 +365,55 @@ interface SearchMatch {
   source: SearchMatchSource;
 }
 
+type MessageActionMenu =
+  | { messageId: string; kind: 'model' | 'translate' }
+  | null;
+
 interface SlashTrigger {
   start: number;
   end: number;
   query: string;
 }
 
+interface FileMentionTrigger {
+  start: number;
+  end: number;
+  directory: string;
+  query: string;
+}
+
+type FileMentionListing =
+  | {
+      status: 'idle';
+      rootPath: string;
+      directory: string;
+      entries: WorkspaceTreeEntry[];
+      message?: undefined;
+    }
+  | {
+      status: 'loading';
+      rootPath: string;
+      directory: string;
+      entries: WorkspaceTreeEntry[];
+      message?: undefined;
+    }
+  | {
+      status: 'ready';
+      rootPath: string;
+      directory: string;
+      entries: WorkspaceTreeEntry[];
+      message?: undefined;
+    }
+  | {
+      status: 'error';
+      rootPath: string;
+      directory: string;
+      entries: WorkspaceTreeEntry[];
+      message: string;
+    };
+
 const MAX_SLASH_SUGGESTIONS = 10;
+const MAX_FILE_MENTION_SUGGESTIONS = 12;
 
 function slashSuggestionRankForAdapter(
   suggestion: SlashSuggestion,
@@ -294,6 +461,42 @@ function findSlashTrigger(text: string, caret: number): SlashTrigger | null {
   return { start, end: caret, query };
 }
 
+function normalizeFileMentionPath(value: string): string {
+  return value
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/^\/+/, '');
+}
+
+function splitFileMentionPath(value: string): {
+  directory: string;
+  query: string;
+} {
+  const normalized = normalizeFileMentionPath(value);
+  const slash = normalized.lastIndexOf('/');
+  if (slash === -1) return { directory: '', query: normalized };
+  return {
+    directory: normalized.slice(0, slash).replace(/^\/+|\/+$/g, ''),
+    query: normalized.slice(slash + 1),
+  };
+}
+
+function findFileMentionTrigger(
+  text: string,
+  caret: number,
+): FileMentionTrigger | null {
+  if (caret < 1) return null;
+
+  const beforeCaret = text.slice(0, caret);
+  const match = /(^|\s)@([^\s]*)$/.exec(beforeCaret);
+  if (!match) return null;
+
+  const rawPath = match[2] ?? '';
+  const start = beforeCaret.length - rawPath.length - 1;
+  const { directory, query } = splitFileMentionPath(rawPath);
+  return { start, end: caret, directory, query };
+}
+
 function filterSlashSuggestions(
   suggestions: SlashSuggestion[],
   query: string,
@@ -314,6 +517,40 @@ function filterSlashSuggestions(
   }
 
   return [...starts, ...contains].slice(0, MAX_SLASH_SUGGESTIONS);
+}
+
+function filterFileMentionEntries(
+  entries: WorkspaceTreeEntry[],
+  query: string,
+): WorkspaceTreeEntry[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return entries.slice(0, MAX_FILE_MENTION_SUGGESTIONS);
+
+  const starts: WorkspaceTreeEntry[] = [];
+  const contains: WorkspaceTreeEntry[] = [];
+  for (const entry of entries) {
+    const name = entry.name.toLowerCase();
+    const path = entry.relativePath.toLowerCase();
+    if (name.startsWith(q) || path.startsWith(q)) {
+      starts.push(entry);
+      continue;
+    }
+    if (name.includes(q) || path.includes(q)) contains.push(entry);
+  }
+
+  return [...starts, ...contains].slice(0, MAX_FILE_MENTION_SUGGESTIONS);
+}
+
+function fileMentionInsertText(entry: WorkspaceTreeEntry): string {
+  const relativePath = normalizeFileMentionPath(entry.relativePath);
+  return `@${relativePath}${entry.kind === 'directory' ? '/' : ''}`;
+}
+
+function fileMentionErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message === 'NO_BACKEND') {
+    return '当前浏览器模式不能读取本机文件。请使用桌面端。';
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 
 function findSlashSuggestionForText(
@@ -353,34 +590,14 @@ function normalizeSearchQuery(value: string): string {
   return value.trim().toLowerCase();
 }
 
-const ROUTE_LINE_RE =
-  /^⚙ (?:(?:路由：(?<route>.*?)(?: · 模型：(?<model>.*))?)|(?:模型：(?<modelOnly>.*)))$/m;
-
-function routeLabelFromText(text: string): string {
-  const match = text.match(ROUTE_LINE_RE);
-  const groups = match?.groups;
-  if (!groups) return '';
-  const route = groups.route?.trim() ?? '';
-  const model = (groups.model ?? groups.modelOnly ?? '').trim();
-  return [route, model].filter(Boolean).join(' · ');
-}
-
-function stripRouteLine(text: string): string {
-  return text.replace(ROUTE_LINE_RE, '').replace(/\n{3,}/g, '\n\n').trimStart();
-}
-
-/**
- * Strip inline tool sentinels (`<<FUC_TOOL>>…`) from a message's text so the
- * search index and the search-active plain-text fallback never see/show raw
- * protocol JSON that the rich renderer would otherwise turn into tool cards.
- */
-function cleanMessageText(text: string): string {
-  const visible = hasToolSentinel(text) ? extractToolSentinels(text).text : text;
-  return stripRouteLine(visible);
-}
-
-function renderMessageText(text: string): string {
-  return stripRouteLine(text);
+function previousUserText(messages: Message[], messageId: string): string {
+  const index = messages.findIndex((message) => message.id === messageId);
+  if (index <= 0) return '';
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === 'user') return message.text.trim();
+  }
+  return '';
 }
 
 function contextUsageFillColor(tone: ContextUsageTone): string {
@@ -400,6 +617,12 @@ function assistantHeaderLabel(message: Message): string {
   return message.routeLabel?.trim() || routeLabelFromText(message.text);
 }
 
+function translatedAnswerTitle(target: Locale, locale: Locale): string {
+  const option = LANGUAGE_SELECT_OPTIONS.find((item) => item.id === target);
+  if (!option) return `🌐 翻译为 ${target}`;
+  return `🌐 翻译为 ${localizeSelectOption(option, locale).label}`;
+}
+
 function isCaptureUtilityMessage(message: Message): boolean {
   const text = message.text.trim();
   if (
@@ -412,6 +635,189 @@ function isCaptureUtilityMessage(message: Message): boolean {
     /^✓\s*(?:已截图当前会话|Captured this conversation|已把当前会话录成滚动 GIF|Recorded this conversation as a scrolling GIF)/i.test(text) ||
     /^✗\s*(?:截图失败|Screenshot failed|GIF 录制失败|GIF recording failed)/i.test(text) ||
     /!\[(?:截图预览|screenshot preview|GIF 预览|GIF preview)\]\(/i.test(text)
+  );
+}
+
+function messageActionButtonClass(active = false): string {
+  return (
+    'relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-fg-faint transition-colors hover:bg-border-soft hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-40 ' +
+    (active ? 'bg-border-soft text-fg' : '')
+  );
+}
+
+function MessageActionMenuPanel({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  return (
+    <div className="absolute bottom-[calc(100%+0.25rem)] left-0 z-40 max-h-64 min-w-44 overflow-y-auto rounded-md border border-border bg-panel py-1 shadow-xl">
+      {children}
+    </div>
+  );
+}
+
+function MessageActionToolbar({
+  messageId,
+  text,
+  locale,
+  openMenu,
+  modelOptions,
+  modelValue,
+  canRegenerate,
+  onToggleMenu,
+  onRegenerate,
+  onRegenerateWithModel,
+  onTranslate,
+  onBranch,
+  onDelete,
+}: {
+  messageId: string;
+  text: string;
+  locale: Locale;
+  openMenu: MessageActionMenu;
+  modelOptions: SelectOption[];
+  modelValue: string;
+  canRegenerate: boolean;
+  onToggleMenu: (kind: 'model' | 'translate') => void;
+  onRegenerate: () => void;
+  onRegenerateWithModel: (model: string) => void;
+  onTranslate: (target: Locale) => void;
+  onBranch: () => void;
+  onDelete: () => void;
+}) {
+  const modelMenuOpen =
+    openMenu?.messageId === messageId && openMenu.kind === 'model';
+  const translateMenuOpen =
+    openMenu?.messageId === messageId && openMenu.kind === 'translate';
+  return (
+    <div className="relative mt-1 flex items-center gap-1">
+      <CopyButton
+        value={text}
+        title="复制 AI 回答"
+        className={messageActionButtonClass()}
+      />
+      <button
+        type="button"
+        onClick={onBranch}
+        title="从这里创建分支会话"
+        aria-label="创建会话分支"
+        className={messageActionButtonClass()}
+      >
+        <GitBranch size={14} />
+      </button>
+      <button
+        type="button"
+        onClick={onRegenerate}
+        disabled={!canRegenerate}
+        title="重新生成回答"
+        aria-label="重新生成回答"
+        className={messageActionButtonClass()}
+      >
+        <RotateCcw size={14} />
+      </button>
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => onToggleMenu('model')}
+          disabled={!canRegenerate || modelOptions.length === 0}
+          title="切换模型回答"
+          aria-label="切换模型回答"
+          aria-expanded={modelMenuOpen}
+          className={messageActionButtonClass(modelMenuOpen)}
+        >
+          <span className="font-mono text-sm font-semibold">@</span>
+        </button>
+        {modelMenuOpen && (
+          <MessageActionMenuPanel>
+            {modelOptions.map((option, index) => {
+              const showGroup =
+                !!option.group && option.group !== modelOptions[index - 1]?.group;
+              return (
+                <div key={option.id}>
+                  {showGroup && (
+                    <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-wider text-fg-faint">
+                      {option.group}
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => onRegenerateWithModel(option.id)}
+                    className={
+                      'flex w-full items-center gap-2 whitespace-nowrap px-3 py-1.5 text-left text-xs transition-colors ' +
+                      (option.id === modelValue
+                        ? 'bg-border-soft text-fg'
+                        : 'text-fg-dim hover:bg-border-soft hover:text-fg')
+                    }
+                  >
+                    <span
+                      className={
+                        option.id === modelValue
+                          ? 'text-[10px] text-accent'
+                          : 'text-[10px] text-transparent'
+                      }
+                    >
+                      ●
+                    </span>
+                    <span>{option.label}</span>
+                    {option.hint && (
+                      <span className="ml-auto text-[10px] text-fg-faint">
+                        {option.hint}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+          </MessageActionMenuPanel>
+        )}
+      </div>
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => onToggleMenu('translate')}
+          disabled={!text}
+          title="翻译回答"
+          aria-label="翻译回答"
+          aria-expanded={translateMenuOpen}
+          className={messageActionButtonClass(translateMenuOpen)}
+        >
+          <Languages size={14} />
+        </button>
+        {translateMenuOpen && (
+          <MessageActionMenuPanel>
+            {LANGUAGE_SELECT_OPTIONS.map((option) => {
+              const translations = option.translations as
+                | Partial<Record<Locale, { label: string }>>
+                | undefined;
+              const localized = translations?.[locale]?.label ?? option.label;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => onTranslate(option.id)}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-1.5 text-left text-xs text-fg-dim transition-colors hover:bg-border-soft hover:text-fg"
+                >
+                  <span className="w-6 font-mono text-[10px] text-fg-faint">
+                    {option.hint}
+                  </span>
+                  <span>{localized}</span>
+                </button>
+              );
+            })}
+          </MessageActionMenuPanel>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onDelete}
+        title="删除回答"
+        aria-label="删除回答"
+        className={messageActionButtonClass()}
+      >
+        <Trash2 size={14} />
+      </button>
+    </div>
   );
 }
 
@@ -542,6 +948,19 @@ function pointInsideElement(
   const y = point.y / scale;
   const rect = el.getBoundingClientRect();
   return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+function clientPointInsideElement(
+  point: { clientX: number; clientY: number },
+  el: HTMLElement,
+): boolean {
+  const rect = el.getBoundingClientRect();
+  return (
+    point.clientX >= rect.left &&
+    point.clientX <= rect.right &&
+    point.clientY >= rect.top &&
+    point.clientY <= rect.bottom
+  );
 }
 
 async function pickComposerFiles(title: string): Promise<string[] | null> {
@@ -740,6 +1159,10 @@ function providerSortRank(status: ProviderRuntimeStatus): number {
   return 3;
 }
 
+function interactionOptionCountLabel(locale: Locale, count: number): string {
+  return t(locale, 'interaction.optionCount').replace('{count}', String(count));
+}
+
 function splitInteractionOption(option: string): { title: string; detail: string } {
   const lines = option
     .split(/\r?\n/)
@@ -807,24 +1230,20 @@ function InteractionWidget({
 
   const disabled = !active;
   const trimmedText = text.trim();
-  const canSubmitSelect = selected.length > 0 || trimmedText.length > 0;
+  const canSubmitSelect = selected.length > 0;
   const submitSelect = () => {
-    const values = req.multi
-      ? [...selected, ...(trimmedText ? [trimmedText] : [])]
-      : trimmedText
-        ? [trimmedText]
-        : selected;
-    if (values.length > 0) onAnswer({ kind: 'select', values });
+    if (selected.length > 0) onAnswer({ kind: 'select', values: selected });
   };
   const toggle = (opt: string) => {
     if (req.type !== 'select') return;
+    if (!req.multi) {
+      onAnswer({ kind: 'select', values: [opt] });
+      return;
+    }
     setSelected((cur) => {
-      if (req.multi) {
-        return cur.includes(opt)
-          ? cur.filter((o) => o !== opt)
-          : [...cur, opt];
-      }
-      return cur.includes(opt) ? [] : [opt];
+      return cur.includes(opt)
+        ? cur.filter((o) => o !== opt)
+        : [...cur, opt];
     });
   };
   const submitInput = () => {
@@ -832,9 +1251,27 @@ function InteractionWidget({
   };
 
   return (
-    <div className="flex w-full max-w-[min(760px,100%)] flex-col gap-2 rounded-lg border border-border bg-panel/95 p-3 shadow-lg shadow-black/20">
-      <div className="whitespace-pre-wrap text-sm font-medium leading-relaxed text-fg">
-        {req.prompt}
+    <div className="flex w-full max-w-[min(1040px,100%)] flex-col gap-3 rounded-lg border border-border bg-panel/95 p-3 shadow-lg shadow-black/25">
+      <div className="flex items-start gap-2.5">
+        <span
+          aria-hidden="true"
+          className="mt-5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent text-bg shadow-sm shadow-accent/25"
+        >
+          <ShieldQuestionMark size={14} strokeWidth={2.4} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="mb-1 text-xs font-semibold leading-4 text-accent">
+            {t(locale, 'interaction.title')}
+          </div>
+          <div className="whitespace-pre-wrap break-words text-sm font-semibold leading-relaxed text-fg">
+            {req.prompt}
+          </div>
+          {req.type === 'select' && (
+            <div className="mt-1 text-xs leading-5 text-fg-faint">
+              {interactionOptionCountLabel(locale, req.options?.length ?? 0)}
+            </div>
+          )}
+        </div>
       </div>
 
       {req.type === 'select' && (
@@ -859,21 +1296,22 @@ function InteractionWidget({
                     'group flex min-h-[54px] w-full items-start gap-3 rounded-md border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-55',
                     on
                       ? 'border-accent/70 bg-accent/10 text-fg'
-                      : 'border-border bg-panel-2 text-fg hover:border-accent/45 hover:bg-bg',
+                      : 'border-border bg-panel-2/70 text-fg hover:border-accent/45 hover:bg-bg',
                   )}
                 >
-                  <span
-                    aria-hidden="true"
-                    className={cn(
-                      'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
-                      req.multi ? 'rounded-[4px]' : 'rounded-full',
-                      on
-                        ? 'border-accent bg-accent text-bg'
-                        : 'border-fg-faint/60 bg-bg text-transparent group-hover:border-accent/70',
-                    )}
-                  >
-                    <Check size={12} strokeWidth={3} />
-                  </span>
+                  {req.multi && (
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors',
+                        on
+                          ? 'border-accent bg-accent text-bg'
+                          : 'border-fg-faint/60 bg-bg text-transparent group-hover:border-accent/70',
+                      )}
+                    >
+                      <Check size={12} strokeWidth={3} />
+                    </span>
+                  )}
                   <span className="min-w-0 flex-1">
                     <span className="block break-words text-sm font-medium leading-snug text-fg">
                       {title}
@@ -888,33 +1326,15 @@ function InteractionWidget({
               );
             })}
           </div>
-          <label className="flex flex-col gap-1.5 rounded-md border border-border bg-panel-2 px-3 py-2">
-            <span className="text-xs font-medium text-fg">
-              {t(locale, 'interaction.other')}
-            </span>
-            <input
-              value={text}
-              disabled={disabled}
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey && canSubmitSelect) {
-                  e.preventDefault();
-                  submitSelect();
-                }
-              }}
-              placeholder={t(locale, 'interaction.otherPlaceholder')}
-              className="min-h-9 rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm text-fg outline-none transition-colors placeholder:text-fg-faint focus:border-accent focus:ring-1 focus:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
-            />
-          </label>
           <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
             {!disabled && (
               <button
                 type="button"
                 onClick={onDismiss}
-                className="min-h-8 rounded-md border border-transparent px-2.5 text-xs text-fg-faint transition-colors hover:border-border hover:bg-panel-2 hover:text-fg-dim focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                className="min-h-8 rounded-md bg-accent-3 px-3 text-xs font-medium text-bg transition-colors hover:bg-accent-3/85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-3"
                 title={t(locale, 'interaction.skipTitle')}
               >
-                {t(locale, 'interaction.skip')}
+                {t(locale, 'common.cancel')}
               </button>
             )}
             {disabled && (
@@ -922,14 +1342,16 @@ function InteractionWidget({
                 {t(locale, 'interaction.ended')}
               </span>
             )}
-            <button
-              type="button"
-              disabled={disabled || !canSubmitSelect}
-              onClick={submitSelect}
-              className="min-h-8 rounded-md bg-fg px-3 text-xs font-medium text-bg transition-colors hover:bg-fg-dim disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {t(locale, 'interaction.submit')}
-            </button>
+            {req.multi && (
+              <button
+                type="button"
+                disabled={disabled || !canSubmitSelect}
+                onClick={submitSelect}
+                className="min-h-8 rounded-md bg-fg px-3 text-xs font-medium text-bg transition-colors hover:bg-fg-dim disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {t(locale, 'interaction.submit')}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -1040,8 +1462,8 @@ function InteractionWidget({
  * CONTRACT: default export, no props. Bottom-center AI interaction dock.
  *
  * Left : AI return stream (messages from the store).
- * Right: AI input box. Enter inserts a newline; Ctrl+Enter calls
- *        store.sendPrompt.
+ * Right: AI input box. The configured send shortcut calls store.sendPrompt;
+ *        the configured newline shortcut inserts a line break.
  *
  * The whole dock is vertically resizable: drag the handle on its top edge
  * (cursor becomes row-resize) to change its height; the value is persisted.
@@ -1080,6 +1502,8 @@ export default function AIDock({
   const activeSessionId = useStore((s) => s.activeSessionId);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const renameWorkflowSession = useStore((s) => s.renameWorkflowSession);
+  const deleteMessage = useStore((s) => s.deleteMessage);
+  const branchSessionFromMessage = useStore((s) => s.branchSessionFromMessage);
   const runSelection = useStore((s) => workflowDefaultGatewaySelection(s.workflow), shallow);
   const selectedAdapter =
     RUNTIME_ADAPTERS.find((adapter) => adapter.id === runSelection.adapter)?.id ??
@@ -1089,10 +1513,15 @@ export default function AIDock({
   const draft = useStore((s) => s.composerDraft);
   const composerFocusVersion = useStore((s) => s.composerFocusVersion);
   const locale = useStore((s) => s.locale);
+  const [shortcutSettings, setShortcutSettingsState] = useState(
+    loadShortcutSettings,
+  );
   const gameExpertSettings = useStore((s) => s.gameExpertSettings);
   const setComposer = useStore((s) => s.setComposer);
   const setComposerDraft = useStore((s) => s.setComposerDraft);
   const setWorkspace = useStore((s) => s.setWorkspace);
+  const addWorkspaceFolder = useStore((s) => s.addWorkspaceFolder);
+  const removeWorkspaceFolder = useStore((s) => s.removeWorkspaceFolder);
   const removeWorkspace = useStore((s) => s.removeWorkspace);
   const permissionOptions = useStore((s) => s.permissionOptions);
   const composerModelOptions = useStore((s) => s.modelOptions);
@@ -1155,17 +1584,39 @@ export default function AIDock({
   const chatTitleCommitInFlightRef = useRef(false);
   const skipNextTitleBlurCommitRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputDropRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef(draft);
   const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
   const slashTriggerRef = useRef<SlashTrigger | null>(null);
+  const fileMentionTriggerRef = useRef<FileMentionTrigger | null>(null);
   const lastComposerFocusVersion = useRef(composerFocusVersion);
   const messageRefs = useRef(new Map<string, HTMLLIElement>());
   const activeSearchMatchNodeRef = useRef<HTMLElement | null>(null);
   const searchScrollTopRef = useRef<number | null>(null);
   const lastSearchActiveRef = useRef(false);
   const stickToBottomRef = useRef(true);
+  const streamScrollSnapshotsRef = useRef(new Map<string, StreamScrollSnapshot>());
+  const activeStreamScrollKey = useMemo(
+    () => streamScrollKey(layout, activeWorkspaceId, activeSessionId),
+    [activeSessionId, activeWorkspaceId, layout],
+  );
+  const activeStreamScrollKeyRef = useRef(activeStreamScrollKey);
+  activeStreamScrollKeyRef.current = activeStreamScrollKey;
+  const pendingStreamScrollRestoreKeyRef = useRef<string | null>(
+    activeStreamScrollKey,
+  );
 
   const isReadOnly = mode === 'running';
+  const sendShortcutHint = useMemo(
+    () =>
+      `${describeShortcutBinding(shortcutSettings['composer-send'])} ${t(
+        locale,
+        'dock.sendShortcutAction',
+      )} · ${describeShortcutBinding(
+        shortcutSettings['composer-newline'],
+      )} ${t(locale, 'dock.newlineShortcutAction')}`,
+    [locale, shortcutSettings],
+  );
   const [dropActive, setDropActive] = useState(false);
   const [filePreviewRef, setFilePreviewRef] = useState<FileRef | null>(null);
   const [chatTitleEditing, setChatTitleEditing] = useState(false);
@@ -1176,10 +1627,22 @@ export default function AIDock({
   const [activeSearchMatchIndex, setActiveSearchMatchIndex] = useState(0);
   const [slashTrigger, setSlashTrigger] = useState<SlashTrigger | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
+  const [fileMentionTrigger, setFileMentionTrigger] =
+    useState<FileMentionTrigger | null>(null);
+  const [activeFileMentionIndex, setActiveFileMentionIndex] = useState(0);
+  const [fileMentionListing, setFileMentionListing] =
+    useState<FileMentionListing>({
+      status: 'idle',
+      rootPath: '',
+      directory: '',
+      entries: [],
+    });
   const [slashCatalogEntries, setSlashCatalogEntries] = useState<
     SlashCatalogEntry[]
   >([]);
   const [modelStrategyOpen, setModelStrategyOpen] = useState(false);
+  const [messageActionMenu, setMessageActionMenu] =
+    useState<MessageActionMenu>(null);
   const blockedSendTipText =
     blockedSendTip === 'model-switched-while-chatting'
       ? t(locale, 'dock.modelSwitchBlockedTip')
@@ -1220,6 +1683,12 @@ export default function AIDock({
       unlisten?.();
     };
   }, []);
+
+  useEffect(
+    () => subscribeShortcutSettings(setShortcutSettingsState),
+    [],
+  );
+
   const normalizedSearch = useMemo(
     () => normalizeSearchQuery(returnSearch),
     [returnSearch],
@@ -1288,8 +1757,23 @@ export default function AIDock({
         : [],
     [activeAdapterSlashSuggestions, slashTrigger],
   );
+  const fileMentionOptions = useMemo(
+    () =>
+      fileMentionTrigger
+        ? filterFileMentionEntries(
+            fileMentionListing.entries,
+            fileMentionTrigger.query,
+          )
+        : [],
+    [fileMentionListing.entries, fileMentionTrigger],
+  );
   const slashOpen =
     !isReadOnly && slashTrigger !== null && filteredSlashSuggestions.length > 0;
+  const fileMentionOpen = !isReadOnly && fileMentionTrigger !== null;
+  useEffect(() => {
+    if (activeFileMentionIndex < fileMentionOptions.length) return;
+    setActiveFileMentionIndex(0);
+  }, [activeFileMentionIndex, fileMentionOptions.length]);
   const firstUserMessageText = useMemo(
     () =>
       messages.find((message) => message.role === 'user' && message.text.trim())
@@ -2110,6 +2594,60 @@ export default function AIDock({
   // Open a local file referenced by an AI-message chip in the right preview pane.
   // Paths resolve against the active workspace folder in the Tauri command.
   const workspaceCwd = composer.workspace;
+  useEffect(() => {
+    if (!fileMentionTrigger || isReadOnly) return;
+
+    const rootPath = workspaceCwd.trim();
+    const directory = fileMentionTrigger.directory;
+    if (!rootPath) {
+      setFileMentionListing({
+        status: 'error',
+        rootPath: '',
+        directory,
+        entries: [],
+        message: '请先选择工作区。',
+      });
+      return;
+    }
+
+    let cancelled = false;
+    setFileMentionListing((current) => ({
+      status: 'loading',
+      rootPath,
+      directory,
+      entries:
+        current.rootPath === rootPath && current.directory === directory
+          ? current.entries
+          : [],
+    }));
+
+    void listWorkspaceDirectory(rootPath, directory)
+      .then((listing) => {
+        if (cancelled) return;
+        setFileMentionListing({
+          status: 'ready',
+          rootPath: listing.rootPath,
+          directory: listing.relativePath,
+          entries: listing.entries,
+        });
+        setActiveFileMentionIndex(0);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setFileMentionListing({
+          status: 'error',
+          rootPath,
+          directory,
+          entries: [],
+          message: fileMentionErrorMessage(err),
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileMentionTrigger?.directory, isReadOnly, workspaceCwd]);
+
   const onOpenFile = useCallback(
     (ref: FileRef, intent?: OpenFileIntent) => {
       if (intent?.reveal) {
@@ -2211,17 +2749,33 @@ export default function AIDock({
     });
   }, []);
 
-  // Track whether the user is parked at (or near) the bottom. Used by the
-  // auto-follow effect above so a manual upward scroll pins the viewport in
-  // place even while new messages keep streaming in. The 32px tolerance covers
-  // sub-pixel rounding and the small overflow that lazy-rendered markdown
-  // sometimes adds right after a relayout.
-  const handleStreamScroll = useCallback(() => {
-    const el = streamRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distanceFromBottom <= 32;
+  const rememberStreamScrollSnapshot = useCallback((key?: string) => {
+    if (normalizedSearchRef.current) return;
+    if (searchScrollTopRef.current !== null) return;
+    const stream = streamRef.current;
+    if (!stream) return;
+    const snapshot = readStreamScrollSnapshot(stream, messageRefs.current);
+    streamScrollSnapshotsRef.current.set(
+      key ?? activeStreamScrollKeyRef.current,
+      snapshot,
+    );
+    stickToBottomRef.current = snapshot.atBottom;
   }, []);
+
+  const restoreStreamScrollSnapshotForKey = useCallback((key: string): boolean => {
+    const stream = streamRef.current;
+    if (!stream) return false;
+    const snapshot = streamScrollSnapshotsRef.current.get(key);
+    stickToBottomRef.current = snapshot?.atBottom ?? true;
+    return restoreStreamScrollSnapshot(stream, messageRefs.current, snapshot);
+  }, []);
+
+  // Track whether the user is parked at (or near) the bottom. Manual upward
+  // scroll pins this session to the visible message anchor; bottom stays sticky
+  // and follows new streamed content.
+  const handleStreamScroll = useCallback(() => {
+    rememberStreamScrollSnapshot();
+  }, [rememberStreamScrollSnapshot]);
 
   const scrollToTopic = useCallback(
     (direction: -1 | 1) => {
@@ -2283,6 +2837,17 @@ export default function AIDock({
     setActiveSlashIndex(0);
   }, []);
 
+  const closeFileMentionSuggestions = useCallback(() => {
+    fileMentionTriggerRef.current = null;
+    setFileMentionTrigger(null);
+    setActiveFileMentionIndex(0);
+  }, []);
+
+  const closeComposerSuggestions = useCallback(() => {
+    closeSlashSuggestions();
+    closeFileMentionSuggestions();
+  }, [closeFileMentionSuggestions, closeSlashSuggestions]);
+
   const syncSlashTrigger = useCallback(
     (target: HTMLTextAreaElement | null = inputRef.current) => {
       if (!target || isReadOnly || target.selectionStart !== target.selectionEnd) {
@@ -2305,6 +2870,37 @@ export default function AIDock({
     [closeSlashSuggestions, isReadOnly],
   );
 
+  const syncFileMentionTrigger = useCallback(
+    (target: HTMLTextAreaElement | null = inputRef.current) => {
+      if (!target || isReadOnly || target.selectionStart !== target.selectionEnd) {
+        closeFileMentionSuggestions();
+        return;
+      }
+
+      const next = findFileMentionTrigger(target.value, target.selectionStart);
+      const prev = fileMentionTriggerRef.current;
+      const unchanged =
+        prev?.start === next?.start &&
+        prev?.end === next?.end &&
+        prev?.directory === next?.directory &&
+        prev?.query === next?.query;
+      if (unchanged) return;
+
+      fileMentionTriggerRef.current = next;
+      setFileMentionTrigger(next);
+      setActiveFileMentionIndex(0);
+    },
+    [closeFileMentionSuggestions, isReadOnly],
+  );
+
+  const syncComposerSuggestions = useCallback(
+    (target: HTMLTextAreaElement | null = inputRef.current) => {
+      syncSlashTrigger(target);
+      syncFileMentionTrigger(target);
+    },
+    [syncFileMentionTrigger, syncSlashTrigger],
+  );
+
   const insertComposerText = useCallback(
     (text: string, selection = selectionRef.current) => {
       if (isReadOnly || !text) return;
@@ -2321,7 +2917,7 @@ export default function AIDock({
 
       window.requestAnimationFrame(() => {
         const el = inputRef.current;
-        if (!el) return;
+        if (!(el instanceof HTMLTextAreaElement)) return;
         el.focus();
         el.setSelectionRange(caret, caret);
       });
@@ -2352,12 +2948,61 @@ export default function AIDock({
 
       window.requestAnimationFrame(() => {
         const el = inputRef.current;
-        if (!el) return;
+        if (!(el instanceof HTMLTextAreaElement)) return;
         el.focus();
         el.setSelectionRange(caret, caret);
       });
     },
     [closeSlashSuggestions, isReadOnly, setComposerDraft],
+  );
+
+  const applyFileMentionOption = useCallback(
+    (entry: WorkspaceTreeEntry) => {
+      if (isReadOnly) return;
+
+      const trigger = fileMentionTriggerRef.current;
+      if (!trigger) return;
+
+      const current = draftRef.current;
+      const start = clampSelection(trigger.start, current.length);
+      const end = clampSelection(trigger.end, current.length);
+      const after = current.slice(end);
+      const baseInserted = fileMentionInsertText(entry);
+      const spacer =
+        entry.kind === 'file' && (after.length === 0 || !/^\s/.test(after))
+          ? ' '
+          : '';
+      const inserted = `${baseInserted}${spacer}`;
+      const next = current.slice(0, start) + inserted + after;
+      const caret = start + inserted.length;
+
+      draftRef.current = next;
+      selectionRef.current = { start: caret, end: caret };
+      setComposerDraft(next);
+
+      if (entry.kind === 'directory') {
+        const nextTrigger = findFileMentionTrigger(next, caret);
+        fileMentionTriggerRef.current = nextTrigger;
+        setFileMentionTrigger(nextTrigger);
+        setActiveFileMentionIndex(0);
+      } else {
+        closeFileMentionSuggestions();
+      }
+      closeSlashSuggestions();
+
+      window.requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!(el instanceof HTMLTextAreaElement)) return;
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      });
+    },
+    [
+      closeFileMentionSuggestions,
+      closeSlashSuggestions,
+      isReadOnly,
+      setComposerDraft,
+    ],
   );
 
   const insertFilePaths = useCallback(
@@ -2366,6 +3011,15 @@ export default function AIDock({
     },
     [insertComposerText],
   );
+
+  const startFileMention = useCallback(() => {
+    if (isReadOnly) return;
+    const current = draftRef.current;
+    const start = clampSelection(selectionRef.current.start, current.length);
+    const prefix = start > 0 && !/\s/.test(current[start - 1] ?? '') ? ' ' : '';
+    insertComposerText(`${prefix}@`);
+    window.requestAnimationFrame(() => syncComposerSuggestions(inputRef.current));
+  }, [insertComposerText, isReadOnly, syncComposerSuggestions]);
 
   const handlePaste = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
@@ -2391,11 +3045,78 @@ export default function AIDock({
           )
           .map((result) => result.value);
         if (paths.length === 0) return;
-        closeSlashSuggestions();
+        closeComposerSuggestions();
         insertFilePaths(paths, selection);
       });
     },
-    [closeSlashSuggestions, insertFilePaths, isReadOnly, workspaceCwd],
+    [closeComposerSuggestions, insertFilePaths, isReadOnly, workspaceCwd],
+  );
+
+  const handleComposerDragOver = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      const hasProjectPaths = hasProjectFileDragData(event.dataTransfer);
+      const hasFiles = Array.from(event.dataTransfer?.types ?? []).includes(
+        'Files',
+      );
+      // Project-tree drags use HTML5 DnD. Browser/no-native builds can also
+      // expose external files here, though those may only carry File.name.
+      // Desktop full paths come from the Tauri native drag handler below.
+      if (isReadOnly || (!hasProjectPaths && !hasFiles)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      setDropActive(true);
+    },
+    [isReadOnly],
+  );
+
+  const handleComposerDragLeave = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      const nextTarget = event.relatedTarget;
+      if (
+        nextTarget instanceof Node &&
+        event.currentTarget.contains(nextTarget)
+      ) {
+        return;
+      }
+      setDropActive(false);
+    },
+    [],
+  );
+
+  const handleComposerDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      const hasProjectPaths = hasProjectFileDragData(event.dataTransfer);
+      const projectPaths = projectFilePathsFromDataTransfer(event.dataTransfer);
+      if (isReadOnly) return;
+
+      const targetSelection =
+        event.target instanceof HTMLTextAreaElement
+          ? {
+              start: event.target.selectionStart,
+              end: event.target.selectionEnd,
+            }
+          : selectionRef.current;
+      selectionRef.current = targetSelection;
+
+      if (hasProjectPaths) {
+        event.preventDefault();
+        event.stopPropagation();
+        setDropActive(false);
+        clearProjectFileDragData();
+        if (projectPaths.length > 0) {
+          closeComposerSuggestions();
+          insertFilePaths(projectPaths, targetSelection);
+        }
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setDropActive(false);
+      closeComposerSuggestions();
+      insertFilePaths(pathsFromDataTransfer(event.dataTransfer), targetSelection);
+    },
+    [closeComposerSuggestions, insertFilePaths, isReadOnly],
   );
 
   /** Clamp the input width to keep both panes usable within the dock. */
@@ -2437,11 +3158,7 @@ export default function AIDock({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (keyModalChannel || localSetupChannel) return;
-      if (
-        (event.ctrlKey || event.metaKey) &&
-        !event.altKey &&
-        event.key.toLowerCase() === 'f'
-      ) {
+      if (matchesShortcut(event, shortcutSettings['return-search'])) {
         event.preventDefault();
         openReturnSearch();
         return;
@@ -2460,6 +3177,7 @@ export default function AIDock({
     localSetupChannel,
     openReturnSearch,
     returnSearchOpen,
+    shortcutSettings,
   ]);
 
   useEffect(() => {
@@ -2492,14 +3210,24 @@ export default function AIDock({
     }
   }, [normalizedSearch]);
 
-  // Switching sessions / workspaces should default back to "follow bottom" so
-  // the freshly-loaded conversation lands at the latest message regardless of
-  // where the user had scrolled in the previous one. Runs before the
-  // auto-follow effect below so the very first paint after a session change
-  // already sees the reset flag.
+  // Session/workspace switches restore that conversation's own scroll state:
+  // bottom remains sticky, while a manual non-bottom position is restored by
+  // visible-message anchor so new streamed content below does not move the
+  // user's reading position.
   useLayoutEffect(() => {
-    stickToBottomRef.current = true;
-  }, [activeSessionId, activeWorkspaceId]);
+    pendingStreamScrollRestoreKeyRef.current = activeStreamScrollKey;
+  }, [activeStreamScrollKey]);
+
+  useLayoutEffect(() => {
+    if (pendingStreamScrollRestoreKeyRef.current !== activeStreamScrollKey) return;
+    if (restoreStreamScrollSnapshotForKey(activeStreamScrollKey)) {
+      pendingStreamScrollRestoreKeyRef.current = null;
+    }
+  }, [
+    activeStreamScrollKey,
+    messages.length,
+    restoreStreamScrollSnapshotForKey,
+  ]);
 
   // Keep the latest message in view unless return search is active or the user
   // has scrolled away from the bottom. `stickToBottomRef` is updated by the
@@ -2516,24 +3244,26 @@ export default function AIDock({
   useEffect(() => {
     const el = streamRef.current;
     if (!el) return;
-    const followBottom = () => {
+    const syncScrollAfterLayout = () => {
       if (normalizedSearchRef.current) return;
       if (searchScrollTopRef.current !== null) return;
-      if (!stickToBottomRef.current) return;
-      if (typeof el.scrollTo === 'function') {
-        el.scrollTo({ top: el.scrollHeight, behavior: 'instant' });
-      } else {
-        el.scrollTop = el.scrollHeight;
+      const key = activeStreamScrollKeyRef.current;
+      const snapshot = streamScrollSnapshotsRef.current.get(key);
+      if (snapshot?.atBottom ?? stickToBottomRef.current) {
+        scrollStreamToBottom(el);
+      } else if (snapshot) {
+        restoreStreamScrollSnapshot(el, messageRefs.current, snapshot);
       }
+      rememberStreamScrollSnapshot(key);
     };
     if (typeof ResizeObserver === 'undefined') {
-      followBottom();
+      syncScrollAfterLayout();
       return;
     }
-    const ro = new ResizeObserver(followBottom);
+    const ro = new ResizeObserver(syncScrollAfterLayout);
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [rememberStreamScrollSnapshot]);
 
   useEffect(() => {
     if (!normalizedSearch || !activeSearchMatchId || !activeSearchMatchMessageId) {
@@ -2562,7 +3292,7 @@ export default function AIDock({
     if (composerFocusVersion === lastComposerFocusVersion.current) return;
     lastComposerFocusVersion.current = composerFocusVersion;
     const el = inputRef.current;
-    if (!el || !shouldRefocusComposerAfterAppend(mode)) return;
+    if (!(el instanceof HTMLTextAreaElement) || !shouldRefocusComposerAfterAppend(mode)) return;
     el.focus();
     const end = el.value.length;
     el.setSelectionRange(end, end);
@@ -2572,6 +3302,8 @@ export default function AIDock({
   useEffect(() => {
     if (!tauriAvailable()) return;
 
+    // Desktop OS file drops must use Tauri native DnD: WebView File objects can
+    // expose only file.name on Windows. In-app project drags keep using HTML5.
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
@@ -2580,7 +3312,7 @@ export default function AIDock({
       const dispose = await getCurrentWebview().onDragDropEvent((event) => {
         if (disposed) return;
         const payload = event.payload;
-        const el = inputRef.current;
+        const el = inputDropRef.current ?? inputRef.current;
 
         if (payload.type === 'leave') {
           setDropActive(false);
@@ -2620,6 +3352,28 @@ export default function AIDock({
       unlisten?.();
     };
   }, [insertFilePaths, isReadOnly]);
+
+  useEffect(() => {
+    const onProjectFileDragEnd = (event: Event) => {
+      const { detail } = event as CustomEvent<ProjectFileDragEndDetail>;
+      const el = inputDropRef.current ?? inputRef.current;
+      setDropActive(false);
+
+      if (!el || isReadOnly || !detail?.paths?.length) return;
+      if (!clientPointInsideElement(detail, el)) return;
+
+      closeComposerSuggestions();
+      insertFilePaths(detail.paths);
+    };
+
+    window.addEventListener(PROJECT_FILE_DRAG_END_EVENT, onProjectFileDragEnd);
+    return () => {
+      window.removeEventListener(
+        PROJECT_FILE_DRAG_END_EVENT,
+        onProjectFileDragEnd,
+      );
+    };
+  }, [closeComposerSuggestions, insertFilePaths, isReadOnly]);
 
   // Re-clamp the input width when the window (and thus the dock) resizes so
   // neither pane collapses below its minimum.
@@ -2888,6 +3642,7 @@ export default function AIDock({
   ) => {
     const text = (overrideText ?? draft).trim();
     if (!text) return;
+    closeComposerSuggestions();
     const clearDraftIfNeeded = () => {
       if (overrideText === undefined || options.clearDraft) {
         setComposerDraft('');
@@ -3258,6 +4013,43 @@ export default function AIDock({
         : composer.threeDMode && !dropActive
           ? 'fuc-ai-input--three-d '
           : '';
+  const regenerateMessage = useCallback(
+    (messageId: string) => {
+      if (aiBusy) return;
+      const prompt = previousUserText(messages, messageId);
+      if (!prompt) return;
+      submit(prompt, { clearDraft: false });
+    },
+    [aiBusy, messages, submit],
+  );
+  const regenerateMessageWithModel = useCallback(
+    (messageId: string, model: string) => {
+      handleModelChange(model);
+      setMessageActionMenu(null);
+      window.setTimeout(() => regenerateMessage(messageId), 0);
+    },
+    [handleModelChange, regenerateMessage],
+  );
+  const translateMessage = useCallback(
+    (messageId: string, target: Locale) => {
+      if (aiBusy) return;
+      const message = messages.find((item) => item.id === messageId);
+      const text = message ? answerActionText(message.text) : '';
+      if (!text) return;
+      setMessageActionMenu(null);
+      void (async () => {
+        try {
+          const translated = await translatePublicText(text, target, locale);
+          if (!translated) return;
+          appendChatNote(`${translatedAnswerTitle(target, locale)}\n\n${translated}`);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          appendChatNote(`✗ 翻译失败：${message}`);
+        }
+      })();
+    },
+    [aiBusy, appendChatNote, locale, messages],
+  );
 
   return (
     <div
@@ -3485,6 +4277,18 @@ export default function AIDock({
                       : 'text-accent-2';
                   const preserveRoleCase = !!assistantLabel;
                   const captureUtility = isCaptureUtilityMessage(m);
+                  const assistantActions =
+                    isChat &&
+                    !isUser &&
+                    !isSystem &&
+                    !captureUtility &&
+                    !m.interaction &&
+                    !normalizedSearch;
+                  const actionText = assistantActions ? answerActionText(m.text) : '';
+                  const canRegenerate =
+                    assistantActions &&
+                    !aiBusy &&
+                    previousUserText(messages, m.id).length > 0;
                   return (
                     <li
                       key={m.id}
@@ -3607,6 +4411,38 @@ export default function AIDock({
                           />
                         </div>
                       )}
+                      {assistantActions && actionText && (
+                        <MessageActionToolbar
+                          messageId={m.id}
+                          text={actionText}
+                          locale={locale}
+                          openMenu={messageActionMenu}
+                          modelOptions={modelOptionsForMode}
+                          modelValue={modelValueForMode}
+                          canRegenerate={canRegenerate}
+                          onToggleMenu={(kind) =>
+                            setMessageActionMenu((current) =>
+                              current?.messageId === m.id &&
+                              current.kind === kind
+                                ? null
+                                : { messageId: m.id, kind },
+                            )
+                          }
+                          onRegenerate={() => regenerateMessage(m.id)}
+                          onRegenerateWithModel={(model) =>
+                            regenerateMessageWithModel(m.id, model)
+                          }
+                          onTranslate={(target) => translateMessage(m.id, target)}
+                          onBranch={() => {
+                            setMessageActionMenu(null);
+                            branchSessionFromMessage(m.id);
+                          }}
+                          onDelete={() => {
+                            setMessageActionMenu(null);
+                            deleteMessage(m.id);
+                          }}
+                        />
+                      )}
                     </li>
                   );
                 })}
@@ -3713,7 +4549,87 @@ export default function AIDock({
           </div>
         )}
 
+        {fileMentionOpen && (
+          <div
+            id="fuc-file-mention-suggestions"
+            role="listbox"
+            aria-label="文件建议"
+            className="absolute bottom-[calc(100%+0.375rem)] left-3 right-3 z-50 max-h-72 overflow-y-auto rounded-md border border-border bg-panel shadow-2xl"
+          >
+            {fileMentionOptions.map((entry, index) => {
+              const active = index === activeFileMentionIndex;
+              const isDirectory = entry.kind === 'directory';
+              return (
+                <button
+                  key={entry.path}
+                  id={`fuc-file-mention-suggestion-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveFileMentionIndex(index)}
+                  onClick={() => applyFileMentionOption(entry)}
+                  className={
+                    'flex w-full min-w-0 items-start gap-2 border-l-2 px-2.5 py-2 text-left transition-colors ' +
+                    (active
+                      ? 'border-l-accent bg-accent/20 text-fg ring-1 ring-inset ring-accent/40'
+                      : 'border-l-transparent text-fg-dim hover:border-l-accent/50 hover:bg-border-soft hover:text-fg')
+                  }
+                >
+                  <span
+                    className={
+                      'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border ' +
+                      (active
+                        ? 'border-accent bg-accent text-bg'
+                        : 'border-border bg-bg text-fg-faint')
+                    }
+                  >
+                    {isDirectory ? (
+                      <Folder size={13} strokeWidth={2} />
+                    ) : (
+                      <File size={13} strokeWidth={2} />
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">
+                      {entry.name}
+                      {isDirectory ? '/' : ''}
+                    </span>
+                    <span className="mt-0.5 block truncate font-mono text-xs text-fg-faint">
+                      {normalizeFileMentionPath(entry.relativePath)}
+                      {isDirectory ? '/' : ''}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+            {fileMentionListing.status === 'loading' &&
+              fileMentionOptions.length === 0 && (
+                <div className="flex items-center gap-2 px-3 py-2 text-sm text-fg-faint">
+                  <Loader2 size={14} className="animate-spin text-accent" />
+                  <span>读取中</span>
+                </div>
+              )}
+            {fileMentionListing.status === 'error' &&
+              fileMentionOptions.length === 0 && (
+                <div className="px-3 py-2 text-sm leading-snug text-status-error">
+                  {fileMentionListing.message}
+                </div>
+              )}
+            {fileMentionListing.status === 'ready' &&
+              fileMentionOptions.length === 0 && (
+                <div className="px-3 py-2 text-sm text-fg-faint">
+                  没有匹配的文件
+                </div>
+              )}
+          </div>
+        )}
+
         <div
+          ref={inputDropRef}
+          onDragOver={handleComposerDragOver}
+          onDragLeave={handleComposerDragLeave}
+          onDrop={handleComposerDrop}
           className={
             'fuc-ai-input-card relative flex min-h-0 flex-1 flex-col rounded-lg border bg-bg transition-colors focus-within:border-accent ' +
             (dropActive
@@ -3732,27 +4648,59 @@ export default function AIDock({
               draftRef.current = e.target.value;
               setComposerDraft(e.target.value);
               rememberSelection(e.currentTarget);
-              syncSlashTrigger(e.currentTarget);
+              syncComposerSuggestions(e.currentTarget);
             }}
             onClick={(e) => {
               rememberSelection(e.currentTarget);
-              syncSlashTrigger(e.currentTarget);
+              syncComposerSuggestions(e.currentTarget);
             }}
             onKeyUp={(e) => {
               rememberSelection(e.currentTarget);
-              syncSlashTrigger(e.currentTarget);
+              syncComposerSuggestions(e.currentTarget);
             }}
             onSelect={(e) => {
               rememberSelection(e.currentTarget);
-              syncSlashTrigger(e.currentTarget);
+              syncComposerSuggestions(e.currentTarget);
             }}
             onFocus={(e) => {
               rememberSelection(e.currentTarget);
-              syncSlashTrigger(e.currentTarget);
+              syncComposerSuggestions(e.currentTarget);
             }}
-            onBlur={closeSlashSuggestions}
+            onBlur={closeComposerSuggestions}
             onPaste={handlePaste}
             onKeyDown={(e) => {
+              if (fileMentionOpen) {
+                if (e.key === 'ArrowDown' && fileMentionOptions.length > 0) {
+                  e.preventDefault();
+                  setActiveFileMentionIndex((index) =>
+                    (index + 1) % fileMentionOptions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'ArrowUp' && fileMentionOptions.length > 0) {
+                  e.preventDefault();
+                  setActiveFileMentionIndex(
+                    (index) =>
+                      (index - 1 + fileMentionOptions.length) %
+                      fileMentionOptions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  closeFileMentionSuggestions();
+                  return;
+                }
+                if (
+                  (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey)) &&
+                  fileMentionOptions.length > 0
+                ) {
+                  e.preventDefault();
+                  const option = fileMentionOptions[activeFileMentionIndex];
+                  if (option) applyFileMentionOption(option);
+                  return;
+                }
+              }
               if (slashOpen) {
                 if (e.key === 'ArrowDown') {
                   e.preventDefault();
@@ -3782,24 +4730,27 @@ export default function AIDock({
                   return;
                 }
               }
-              if (e.key === 'Enter' && e.ctrlKey) {
+              if (matchesShortcut(e.nativeEvent, shortcutSettings['composer-send'])) {
                 e.preventDefault();
-                closeSlashSuggestions();
+                closeComposerSuggestions();
                 submit();
+                return;
               }
-            }}
-            onDragOver={(e) => {
-              if (isReadOnly || tauriAvailable()) return;
-              e.preventDefault();
-              setDropActive(true);
-            }}
-            onDragLeave={() => setDropActive(false)}
-            onDrop={(e) => {
-              if (isReadOnly || tauriAvailable()) return;
-              e.preventDefault();
-              setDropActive(false);
-              rememberSelection(e.currentTarget);
-              insertFilePaths(pathsFromDataTransfer(e.dataTransfer));
+              if (
+                matchesShortcut(
+                  e.nativeEvent,
+                  shortcutSettings['composer-newline'],
+                )
+              ) {
+                if (!isNativeTextareaNewlineShortcut(e.nativeEvent)) {
+                  e.preventDefault();
+                  closeComposerSuggestions();
+                  insertComposerText('\n', {
+                    start: e.currentTarget.selectionStart,
+                    end: e.currentTarget.selectionEnd,
+                  });
+                }
+              }
             }}
             readOnly={isReadOnly}
             disabled={isReadOnly}
@@ -3814,10 +4765,20 @@ export default function AIDock({
                       ? t(locale, 'dock.threeDModePlaceholder')
                       : t(locale, 'dock.placeholder')
             }
-            aria-expanded={slashOpen}
-            aria-controls={slashOpen ? 'fuc-slash-suggestions' : undefined}
+            aria-expanded={slashOpen || fileMentionOpen}
+            aria-controls={
+              fileMentionOpen
+                ? 'fuc-file-mention-suggestions'
+                : slashOpen
+                  ? 'fuc-slash-suggestions'
+                  : undefined
+            }
             aria-activedescendant={
-              slashOpen ? `fuc-slash-suggestion-${activeSlashIndex}` : undefined
+              fileMentionOpen && fileMentionOptions.length > 0
+                ? `fuc-file-mention-suggestion-${activeFileMentionIndex}`
+                : slashOpen
+                  ? `fuc-slash-suggestion-${activeSlashIndex}`
+                  : undefined
             }
             className={
               'min-h-0 flex-1 resize-none border-0 bg-transparent px-3 pt-3 pb-2 text-sm leading-relaxed text-fg outline-none placeholder:text-fg-faint ' +
@@ -3927,6 +4888,17 @@ export default function AIDock({
             >
               <Plus size={15} strokeWidth={2} />
             </button>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={startFileMention}
+              disabled={isReadOnly}
+              title="提及工作区文件"
+              aria-label="提及工作区文件"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 font-mono text-sm font-semibold text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              @
+            </button>
             <Select
               title={t(locale, 'dock.permissionTitle')}
               options={permissionOptions.map((opt) => localizeSelectOption(opt, locale))}
@@ -3937,8 +4909,11 @@ export default function AIDock({
             />
             <WorkspaceSelect
               value={composer.workspace}
+              extraFolders={composer.workspaceFolders}
               history={workspaceHistory}
               onSelect={setWorkspace}
+              onAddFolder={addWorkspaceFolder}
+              onRemoveFolder={removeWorkspaceFolder}
               onRemove={removeWorkspace}
               disabled={activeAiEditing}
               className="min-w-0"
@@ -3989,14 +4964,14 @@ export default function AIDock({
                         ? t(locale, 'dock.aiGeneratingTitle')
                         : useChatRunButton
                           ? t(locale, 'dock.runChatTitle')
-                          : t(locale, 'dock.sendShortcut')
+                          : sendShortcutHint
                 }
                 aria-label={
                   chatRunActive
                     ? t(locale, 'dock.stopChatTitle')
                     : useChatRunButton
                       ? t(locale, 'dock.runChatTitle')
-                      : t(locale, 'dock.sendShortcut')
+                      : sendShortcutHint
                 }
                 className={
                   'flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ' +

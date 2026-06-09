@@ -128,7 +128,7 @@ describe('AIDock pasted clipboard images', () => {
     resetStore();
     expect(tauriAvailable()).toBe(true);
     tauriMocks.saveClipboardImage.mockResolvedValue(
-      'E:\\OpenWorkflows\\.omc\\clipboard-images\\shot.png',
+      'E:\\OpenWorkflows\\.freeultracode\\clipboard-images\\shot.png',
     );
     const view = await renderDock();
 
@@ -154,7 +154,7 @@ describe('AIDock pasted clipboard images', () => {
         cwd: 'E:\\OpenWorkflows',
       });
       expect(input.value).toBe(
-        'E:\\OpenWorkflows\\.omc\\clipboard-images\\shot.png',
+        'E:\\OpenWorkflows\\.freeultracode\\clipboard-images\\shot.png',
       );
     } finally {
       await view.cleanup();
@@ -164,7 +164,7 @@ describe('AIDock pasted clipboard images', () => {
   it('deduplicates screenshot images exposed through files and items', async () => {
     resetStore();
     tauriMocks.saveClipboardImage.mockResolvedValue(
-      'E:\\OpenWorkflows\\.omc\\clipboard-images\\shot.png',
+      'E:\\OpenWorkflows\\.freeultracode\\clipboard-images\\shot.png',
     );
     const view = await renderDock();
 
@@ -199,7 +199,7 @@ describe('AIDock pasted clipboard images', () => {
 
       expect(tauriMocks.saveClipboardImage).toHaveBeenCalledTimes(1);
       expect(input.value).toBe(
-        'E:\\OpenWorkflows\\.omc\\clipboard-images\\shot.png',
+        'E:\\OpenWorkflows\\.freeultracode\\clipboard-images\\shot.png',
       );
     } finally {
       await view.cleanup();

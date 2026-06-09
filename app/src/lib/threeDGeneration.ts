@@ -585,7 +585,7 @@ const THREE_D_RIGGING_PROVIDER_BY_ID = new Map<
 >(THREE_D_RIGGING_PROVIDERS.map((provider) => [provider.id, provider]));
 
 export const DEFAULT_THREE_D_AUTO_RIGGING_SETTINGS: ThreeDAutoRiggingSettings = {
-  enabled: true,
+  enabled: false,
   preferredProviderId: 'fal-meshy-rigging',
   fallbackProviderIds: ['meshy-rigging-api', 'local-rigging-server'],
   providerKeys: {},
@@ -1036,7 +1036,7 @@ const THREE_D_PROVIDER_BY_ID = new Map<ThreeDProviderId, ThreeDProviderDefinitio
 );
 
 export const DEFAULT_THREE_D_GENERATION_SETTINGS: ThreeDGenerationSettings = {
-  enabled: true,
+  enabled: false,
   preferredProviderId: 'meshy',
   providerKeys: {},
   providerBaseUrls: {},

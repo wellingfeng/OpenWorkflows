@@ -896,6 +896,7 @@ export const defaultComposer: ComposerSettings = {
   permission: permissionOptions[0].id,
   model: modelOptions[0].id,
   workspace: '',
+  workspaceFolders: [],
   modelStrategy: 'inherit',
   imageMode: false,
   imageModeStartedAt: null,

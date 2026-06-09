@@ -291,7 +291,7 @@ describe('ModelViewer', () => {
       await act(async () => {
         root.render(
           createElement(ModelViewer, {
-            src: 'E:\\OpenWorkflows\\.omc\\model-assets\\model.glb',
+            src: 'E:\\OpenWorkflows\\.freeultracode\\model-assets\\model.glb',
             label: '预览 3D 模型 1',
           }),
         );
@@ -299,7 +299,7 @@ describe('ModelViewer', () => {
       await flushAsyncWork();
 
       expect(tauriMocks.readModelAssetDataUrl).toHaveBeenCalledWith(
-        'E:\\OpenWorkflows\\.omc\\model-assets\\model.glb',
+        'E:\\OpenWorkflows\\.freeultracode\\model-assets\\model.glb',
         { cwd: undefined },
       );
       expect(loaderState.urls).toEqual(['data:model/gltf-binary;base64,BBBB']);

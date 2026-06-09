@@ -24,6 +24,12 @@ export interface WorkspaceSelectProps {
   history: string[];
   /** Commit a chosen path (sets current + records in history). */
   onSelect: (path: string) => void;
+  /** Session-only additional folders, excluding the primary workspace. */
+  extraFolders?: string[];
+  /** Add a folder to the current session without replacing the primary cwd. */
+  onAddFolder?: (path: string) => void;
+  /** Remove one session-only folder, without deleting it from history. */
+  onRemoveFolder?: (path: string) => void;
   /** Remove a folder from history (optional). */
   onRemove?: (path: string) => void;
   disabled?: boolean;
@@ -34,6 +40,9 @@ export default function WorkspaceSelect({
   value,
   history,
   onSelect,
+  extraFolders = [],
+  onAddFolder,
+  onRemoveFolder,
   onRemove,
   disabled = false,
   className,
@@ -64,15 +73,31 @@ export default function WorkspaceSelect({
     if (path) onSelect(path);
   };
 
-  const label = value ? basename(value) : t(locale, 'workspace.choose');
+  const addFolder = async () => {
+    if (disabled) return;
+    const path = await pickFolder(t(locale, 'workspace.addFolder'));
+    setOpen(false);
+    if (path) (onAddFolder ?? onSelect)(path);
+  };
+
+  const activeFolders = uniqueWorkspaceHistory([value, ...extraFolders]);
+  const extraCount = Math.max(0, activeFolders.length - 1);
+  const label = value
+    ? `${basename(value)}${extraCount > 0 ? ` +${extraCount}` : ''}`
+    : t(locale, 'workspace.choose');
   const historyOptions = uniqueWorkspaceHistory(history);
   const valueKey = value ? workspacePathKey(value) : '';
+  const activeKeys = new Set(activeFolders.map(workspacePathKey));
 
   return (
     <div ref={rootRef} className={cn('relative', className)}>
       <button
         type="button"
-        title={value || t(locale, 'workspace.chooseFolder')}
+        title={
+          activeFolders.length > 0
+            ? activeFolders.join('\n')
+            : t(locale, 'workspace.chooseFolder')
+        }
         disabled={disabled}
         onClick={() => setOpen((v) => !v)}
         className={cn(
@@ -98,6 +123,69 @@ export default function WorkspaceSelect({
             <span className="text-[11px]">📁</span>
             <span>{t(locale, 'workspace.pickFolder')}</span>
           </button>
+          <button
+            type="button"
+            onClick={addFolder}
+            className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-1.5 text-left text-xs text-fg transition-colors hover:bg-border-soft"
+          >
+            <span className="text-[11px]">＋</span>
+            <span>{t(locale, 'workspace.addFolder')}</span>
+          </button>
+
+          {activeFolders.length > 0 && (
+            <>
+              <div className="my-1 border-t border-border-soft" />
+              <div className="px-3 pb-0.5 text-[10px] uppercase tracking-wider text-fg-faint">
+                {t(locale, 'workspace.activeFolders')}
+              </div>
+              <ul>
+                {activeFolders.map((path, index) => {
+                  const removable = index > 0 && !!onRemoveFolder;
+                  return (
+                    <li
+                      key={`active-${workspacePathKey(path)}`}
+                      className="group relative"
+                    >
+                      <div
+                        title={path}
+                        className={cn(
+                          'flex w-full items-center gap-2 whitespace-nowrap py-1.5 pl-3 text-left text-xs text-fg-dim',
+                          removable ? 'pr-8' : 'pr-3',
+                        )}
+                      >
+                        <span className="text-[10px] leading-none text-accent">
+                          ●
+                        </span>
+                        <span className="max-w-[12rem] truncate">
+                          {basename(path)}
+                        </span>
+                        <span className="ml-auto rounded border border-border-soft px-1 py-0.5 text-[9px] leading-none text-fg-faint">
+                          {index === 0
+                            ? t(locale, 'workspace.primaryFolder')
+                            : t(locale, 'workspace.extraFolder')}
+                        </span>
+                      </div>
+                      {removable && (
+                        <button
+                          type="button"
+                          title={t(locale, 'workspace.removeFromSession')}
+                          aria-label={t(locale, 'workspace.removeFromSession')}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (disabled) return;
+                            onRemoveFolder?.(path);
+                          }}
+                          className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-fg-faint opacity-0 transition-opacity hover:bg-border hover:text-fg group-hover:opacity-100 focus:opacity-100"
+                        >
+                          <span className="text-[11px] leading-none">✕</span>
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
 
           <div className="my-1 border-t border-border-soft" />
 
@@ -112,7 +200,8 @@ export default function WorkspaceSelect({
             <ul role="listbox">
               {historyOptions.map((path) => {
                 const active =
-                  valueKey !== '' && workspacePathKey(path) === valueKey;
+                  (valueKey !== '' && workspacePathKey(path) === valueKey) ||
+                  activeKeys.has(workspacePathKey(path));
                 return (
                   <li key={workspacePathKey(path)} className="group relative">
                     <button

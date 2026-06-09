@@ -244,7 +244,7 @@ process.stdin.resume();
 process.stdin.on('end', () => {
   process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'codex-progress' } }) + '\\n');
   if (outPath) fs.writeFileSync(outPath, 'CODEX_FINAL');
-  process.stdout.write(JSON.stringify({ type: 'turn.completed', status: 'completed' }) + '\\n');
+  process.stdout.write(JSON.stringify({ type: 'turn.completed', status: 'completed', usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 5 } }) + '\\n');
 });
 `;
   }
@@ -252,13 +252,18 @@ process.stdin.on('end', () => {
   it('assembles codex exec argv and returns the sidecar final message', async () => {
     const argvOut = join(dir, 'argv-codex.json');
     const bin = makeFakeCli('fake-codex', fakeCodexBody(argvOut));
+    const usage: unknown[] = [];
     const out = await spawnCliAgent('codex-prompt', {
       adapter: 'codex',
       cliCommand: bin,
       permission: 'full',
       cwd: dir,
+      onUsage: (payload) => usage.push(payload),
     });
     expect(out).toBe('CODEX_FINAL');
+    expect(usage).toEqual([
+      { input_tokens: 100, cached_input_tokens: 40, output_tokens: 5 },
+    ]);
     const argv: string[] = JSON.parse(readFileSync(argvOut, 'utf8'));
     expect(argv).toContain('exec');
     expect(argv).toContain('--json');

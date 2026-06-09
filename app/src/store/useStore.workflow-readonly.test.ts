@@ -3,6 +3,8 @@ import { defaultBlueprint } from '@/core/defaultBlueprint';
 import { EXEC, type IRGraph } from '@/core/ir';
 import {
   isWorkflowReadOnly,
+  sessionChangesBaselineAtForSession,
+  sessionChangesRootPathForSession,
   sessionLiveStatus,
   useStore,
   workflowDeleteProtectionReason,
@@ -164,6 +166,85 @@ afterEach(() => {
   vi.restoreAllMocks();
   resetStore('design', false);
   window.localStorage.clear();
+});
+
+describe('session changes root path', () => {
+  it('uses the active session composer cwd before the workspace bucket path', () => {
+    const state = useStore.getState();
+    const workspace = testWorkspace('ws_open', 1);
+    expect(
+      sessionChangesRootPathForSession(
+        {
+          activeWorkspaceId: workspace.id,
+          activeSessionId: 's1',
+          composer: {
+            ...state.composer,
+            workspace: 'E:\\MoonEngine',
+          },
+          composerBySession: {},
+          workspaces: [workspace],
+        },
+        { workspaceId: workspace.id, sessionId: 's1' },
+      ),
+    ).toBe('E:\\MoonEngine');
+  });
+
+  it('uses stored per-session composer cwd for a background session', () => {
+    const state = useStore.getState();
+    const workspace = testWorkspace('ws_open', 1);
+    expect(
+      sessionChangesRootPathForSession(
+        {
+          activeWorkspaceId: workspace.id,
+          activeSessionId: 's_visible',
+          composer: {
+            ...state.composer,
+            workspace: workspace.path,
+          },
+          composerBySession: {
+            [`${workspace.id}::s_background`]: {
+              composer: {
+                ...state.composer,
+                workspace: 'E:\\MoonEngine',
+              },
+              gatewaySelection: workflowDefaultGatewaySelection(
+                defaultBlueprint('Background'),
+                state.composer.model,
+              ),
+            },
+          },
+          workspaces: [workspace],
+        },
+        { workspaceId: workspace.id, sessionId: 's_background' },
+      ),
+    ).toBe('E:\\MoonEngine');
+  });
+
+  it('uses the session creation time as the change cutoff', () => {
+    const workspace = testWorkspace('ws_open', 1);
+    const session: Session = {
+      id: 's1',
+      workspaceId: workspace.id,
+      title: 'Moon task',
+      createdAt: 1234,
+      isWorkflow: false,
+      simple: true,
+    };
+    expect(
+      sessionChangesBaselineAtForSession(
+        {
+          activeWorkspaceId: workspace.id,
+          activeSessionId: session.id,
+          composer: useStore.getState().composer,
+          composerBySession: {},
+          workspaces: [workspace],
+          sessions: [session],
+          sessionTree: { [workspace.id]: [session] },
+        },
+        { workspaceId: workspace.id, sessionId: session.id },
+      ),
+    ).toBe(1234);
+  });
 });
 
 describe('workflow read-only guard', () => {
@@ -657,6 +738,7 @@ describe('workflow read-only guard', () => {
         permission: 'full',
         model: 'claude-sonnet-4',
         workspace: '',
+        workspaceFolders: [],
         modelStrategy: 'inherit',
         imageMode: false,
         musicMode: false,

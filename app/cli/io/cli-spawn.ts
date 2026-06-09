@@ -40,6 +40,7 @@ import {
   codexProgressLine,
   codexStatusSuccess,
   codexTurnCompletionStatus,
+  codexTurnUsage,
   encodeToolPatch,
   toolSubject,
 } from './stream';
@@ -91,6 +92,8 @@ export interface SpawnCliAgentOpts {
   idleTimeoutSeconds?: number;
   /** Live progress callback (assistant text + tool breadcrumbs). */
   onProgress?: (text: string) => void;
+  /** Raw model usage payload emitted by supported CLI adapters. */
+  onUsage?: (usage: unknown) => void;
   /** Claude session continuity. */
   sessionId?: string;
   resume?: boolean;
@@ -480,6 +483,8 @@ export function spawnCliAgent(prompt: string, opts: SpawnCliAgentOpts): Promise<
         return;
       }
       if (isCodex) {
+        const usage = codexTurnUsage(v);
+        if (usage) opts.onUsage?.(usage);
         const status = codexTurnCompletionStatus(v);
         if (status != null) {
           codexTurnStatus = status;

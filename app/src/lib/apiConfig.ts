@@ -6,7 +6,8 @@
  * optional custom base URL + optional model. Codex/Gemini are local CLI
  * runtimes today, but the stored shape is typed so older Claude entries keep
  * their meaning and future non-Claude provider records do not get mistaken for
- * Anthropic API endpoints. The list lives only in this device's `localStorage`.
+ * Anthropic API endpoints. In the Tauri desktop shell API keys live in the OS
+ * keychain; localStorage keeps only provider metadata.
  * Exactly one provider may be "active"; direct API readers only expose the
  * active provider when it is Anthropic-backed.
  *
@@ -21,6 +22,13 @@
  * When no Anthropic provider is active, `readApiKey()` returns '' and the app
  * falls back to the selected system CLI where available.
  */
+
+import {
+  PROVIDER_API_KEYS_SECRET,
+  readSecureRecordValue,
+  secureStorageAvailable,
+  writeSecureRecord,
+} from '@/lib/secureStorage';
 
 export type ProviderKind = 'anthropic' | 'codex' | 'gemini';
 export type ProviderTransport = 'direct' | 'cli';
@@ -124,6 +132,15 @@ function rawSet(key: string, value: string): void {
   }
 }
 
+function rawRemove(key: string): void {
+  try {
+    if (!hasWindow()) return;
+    window.localStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
+
 function notifyProviderConfigChanged(): void {
   try {
     if (!hasWindow()) return;
@@ -219,9 +236,21 @@ function loadProviders(): Provider[] {
     try {
       const parsed = JSON.parse(stored);
       if (Array.isArray(parsed)) {
-        return parsed
+        const providers = parsed
           .map(normalizeStoredProvider)
           .filter((p): p is Provider => p !== null);
+        if (
+          secureStorageAvailable() &&
+          parsed.some(
+            (value) =>
+              typeof value === 'object' &&
+              value !== null &&
+              typeof (value as Record<string, unknown>).apiKey === 'string',
+          )
+        ) {
+          saveProviders(providers);
+        }
+        return providers;
       }
     } catch {
       /* corrupt — fall through to empty */
@@ -244,7 +273,8 @@ function loadProviders(): Provider[] {
     migrated = [p];
     rawSet(ACTIVE_PROVIDER_STORAGE, p.id);
   }
-  rawSet(PROVIDERS_STORAGE, JSON.stringify(migrated));
+  saveProviders(migrated);
+  rawRemove(API_KEY_STORAGE);
   return migrated;
 }
 
@@ -254,11 +284,15 @@ function normalizeStoredProvider(value: unknown): Provider | null {
   if (typeof v.id !== 'string') {
     return null;
   }
+  const rawApiKey = typeof v.apiKey === 'string' ? v.apiKey : '';
+  const secureApiKey = secureStorageAvailable()
+    ? readSecureRecordValue(PROVIDER_API_KEYS_SECRET, v.id)
+    : '';
   return {
     id: v.id,
     kind: normalizeProviderKind(v.kind ?? v.adapter),
     name: typeof v.name === 'string' ? v.name : 'Claude',
-    apiKey: typeof v.apiKey === 'string' ? v.apiKey : '',
+    apiKey: secureApiKey || rawApiKey,
     baseUrl: typeof v.baseUrl === 'string' ? v.baseUrl : '',
     transport: normalizeProviderTransport(
       normalizeProviderKind(v.kind ?? v.adapter),
@@ -286,8 +320,23 @@ function normalizeProviderTransport(
 }
 
 function saveProviders(list: Provider[]): void {
-  rawSet(PROVIDERS_STORAGE, JSON.stringify(list));
+  if (secureStorageAvailable()) {
+    const apiKeys: Record<string, string> = {};
+    for (const provider of list) {
+      const key = provider.apiKey.trim();
+      if (key) apiKeys[provider.id] = key;
+    }
+    writeSecureRecord(PROVIDER_API_KEYS_SECRET, apiKeys);
+  }
+  rawSet(PROVIDERS_STORAGE, JSON.stringify(list.map(providerForStorage)));
   notifyProviderConfigChanged();
+}
+
+function providerForStorage(provider: Provider): Omit<Provider, 'apiKey'> | Provider {
+  if (!secureStorageAvailable()) return provider;
+  const stored = { ...provider };
+  delete (stored as Partial<Provider>).apiKey;
+  return stored;
 }
 
 function normalizeImportProvider(value: unknown): Provider | null {

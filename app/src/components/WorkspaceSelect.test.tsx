@@ -9,7 +9,10 @@ import WorkspaceSelect from '@/components/WorkspaceSelect';
 async function renderWorkspaceSelect(props: {
   value: string;
   history: string[];
+  extraFolders?: string[];
   onSelect?: (path: string) => void;
+  onAddFolder?: (path: string) => void;
+  onRemoveFolder?: (path: string) => void;
   onRemove?: (path: string) => void;
 }): Promise<{ container: HTMLDivElement; cleanup: () => Promise<void> }> {
   const container = document.createElement('div');
@@ -126,6 +129,46 @@ describe('WorkspaceSelect', () => {
         'li button:not([role="option"])',
       );
       expect(removeButtons).toHaveLength(0);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('shows session-added folders and removes them without deleting history', async () => {
+    const onRemoveFolder = vi.fn();
+    const onRemove = vi.fn();
+    const view = await renderWorkspaceSelect({
+      value: 'E:\\MoonEngine',
+      extraFolders: ['E:\\Game'],
+      history: ['E:\\MoonEngine', 'E:\\Game'],
+      onRemoveFolder,
+      onRemove,
+    });
+
+    try {
+      const trigger = view.container.querySelector('button');
+      expect(trigger?.textContent).toContain('MoonEngine +1');
+
+      await act(async () => {
+        trigger?.click();
+      });
+
+      expect(view.container.textContent).toMatch(/当前会话|Current session/);
+      expect(view.container.textContent).toMatch(/附加|Extra/);
+
+      const removeButtons = Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>(
+          'button[aria-label="从本会话移除"], button[aria-label="Remove from this session"]',
+        ),
+      );
+      expect(removeButtons).toHaveLength(1);
+
+      await act(async () => {
+        removeButtons[0]?.click();
+      });
+
+      expect(onRemoveFolder).toHaveBeenCalledWith('E:\\Game');
+      expect(onRemove).not.toHaveBeenCalled();
     } finally {
       await view.cleanup();
     }

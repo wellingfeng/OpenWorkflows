@@ -13,5 +13,6 @@ export async function completeAnthropic(
     maxTokens: request.maxTokens,
     signal: request.signal,
     onDelta: request.onDelta,
+    onUsage: request.onUsage,
   });
 }

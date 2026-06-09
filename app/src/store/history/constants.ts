@@ -1,7 +1,7 @@
 /** Display fallback for the FreeUltraCode history root; Tauri resolves the real path. */
-export const HISTORY_ROOT_DIR = '~/.worktree';
+export const HISTORY_ROOT_DIR = '~/.freeultracode';
 
-/** Alias used by code that talks about the physical worktree root. */
+/** Alias used by code that talks about the physical global history root. */
 export const WORKTREE_ROOT_DIR = HISTORY_ROOT_DIR;
 
 /** Top-level schema version. Bump on a breaking on-disk change + migration. */

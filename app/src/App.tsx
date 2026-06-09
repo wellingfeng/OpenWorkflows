@@ -1,7 +1,9 @@
 import { useEffect } from 'react';
 import Sidebar from '@/panels/Sidebar';
 import AIDock from '@/panels/AIDock';
+import ProjectFileTree from '@/panels/ProjectFileTree';
 import ScheduledTaskRunner from '@/components/ScheduledTaskRunner';
+import StatusBar from '@/components/StatusBar';
 import { primeCliRuntime } from '@/lib/cliConfig';
 import { onSingleInstanceWarning } from '@/lib/tauri';
 import { useStore } from '@/store/useStore';
@@ -37,14 +39,20 @@ export default function App() {
   }, []);
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-bg text-fg">
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-fg">
       <ScheduledTaskRunner />
-      <div className="hidden md:block">
-        <Sidebar />
+      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        <div className="hidden md:block">
+          <Sidebar />
+        </div>
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <AIDock layout="chat" />
+        </main>
+        <div className="hidden lg:block">
+          <ProjectFileTree />
+        </div>
       </div>
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <AIDock layout="chat" />
-      </main>
+      <StatusBar />
     </div>
   );
 }

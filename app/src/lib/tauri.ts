@@ -78,6 +78,7 @@ export interface SlashCatalogSnapshot {
 
 export interface UltracodeRunOptions {
   cwd?: string;
+  extraWorkspacePaths?: string[];
   adapter?: string;
   model?: string;
   provider?: string;
@@ -127,6 +128,131 @@ export interface LocalFilePreview {
   truncated: boolean;
   text?: string | null;
   base64?: string | null;
+}
+
+export interface WorkspaceTreeEntry {
+  name: string;
+  path: string;
+  relativePath: string;
+  kind: 'directory' | 'file';
+  hidden: boolean;
+  sizeBytes?: number | null;
+  modifiedAtMs?: number | null;
+}
+
+export interface WorkspaceDirectoryListing {
+  rootPath: string;
+  relativePath: string;
+  entries: WorkspaceTreeEntry[];
+  truncated: boolean;
+  totalEntries: number;
+}
+
+export type ProjectEngineKind = 'unreal' | 'unity' | 'godot' | 'unknown';
+
+export interface ProjectEngineDetection {
+  engine: ProjectEngineKind;
+  label: string;
+  confidence: number;
+  projectFile?: string | null;
+  version?: string | null;
+  markers: string[];
+}
+
+export interface ProjectSkillRootSnapshot {
+  id: string;
+  label: string;
+  path: string;
+  exists: boolean;
+  skillCount: number;
+  skills: string[];
+}
+
+export interface ProjectMcpServerSuggestion {
+  id: string;
+  label: string;
+  description: string;
+  transport: 'stdio' | string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  available: boolean;
+  availabilityNote: string;
+  requiresUserApproval: boolean;
+}
+
+export interface ProjectEnvironmentScan {
+  rootPath: string;
+  scannedAtMs: number;
+  engine: ProjectEngineDetection;
+  skillRoots: ProjectSkillRootSnapshot[];
+  suggestedMcpServers: ProjectMcpServerSuggestion[];
+}
+
+export interface ProjectMcpProbeServerConfig {
+  id: string;
+  transport: 'stdio' | 'streamable-http' | string;
+  command?: string | null;
+  args?: string[] | null;
+  env?: Record<string, string> | null;
+  url?: string | null;
+}
+
+export interface ProjectMcpProbeResult {
+  serverId: string;
+  ok: boolean;
+  status: string;
+  message: string;
+  toolsCount?: number | null;
+  checkedAtMs: number;
+}
+
+export type WorkspaceChangeLineKind =
+  | 'added'
+  | 'deleted'
+  | 'replacedAdded'
+  | 'replacedDeleted';
+
+export interface WorkspaceChangeLine {
+  kind: WorkspaceChangeLineKind;
+  oldLine?: number | null;
+  newLine?: number | null;
+  content: string;
+}
+
+export type WorkspaceChangeFileStatus = 'added' | 'modified' | 'deleted' | 'renamed';
+
+export interface WorkspaceChangeFile {
+  path: string;
+  oldPath?: string | null;
+  status: WorkspaceChangeFileStatus;
+  binary: boolean;
+  truncated: boolean;
+  lines: WorkspaceChangeLine[];
+}
+
+export interface WorkspaceChanges {
+  rootPath: string;
+  generatedAtMs: number;
+  source?: string;
+  files: WorkspaceChangeFile[];
+  truncated: boolean;
+}
+
+export interface WorkspaceChangeSnapshotFile {
+  path: string;
+  sizeBytes: number;
+  modifiedAtMs?: number | null;
+  binary: boolean;
+  truncated: boolean;
+  content?: string | null;
+}
+
+export interface WorkspaceChangeBaseline {
+  rootPath: string;
+  generatedAtMs: number;
+  fileCount: number;
+  truncated: boolean;
 }
 
 export interface ModelAssetDownload {
@@ -184,6 +310,16 @@ const REMOTE_MODEL_FETCH_TIMEOUT_MS = 6000;
 /** Disposer returned by the event listeners. */
 export type UnlistenFn = () => void;
 
+export interface SessionNotificationClickPayload {
+  workspaceId: string | null;
+  sessionId: string | null;
+}
+
+export interface DesktopSessionNotificationInput extends SessionNotificationClickPayload {
+  title: string;
+  body: string;
+}
+
 /**
  * True when running inside the Tauri desktop shell. Wraps the SDK's own
  * detection and never throws (older/edge runtimes may lack the global).
@@ -221,6 +357,39 @@ async function getInvoke() {
 async function getListen() {
   const { listen } = await import('@tauri-apps/api/event');
   return listen;
+}
+
+/** Bring the main desktop window to the foreground. No-op outside Tauri. */
+export async function focusMainWindow(): Promise<void> {
+  if (!tauriAvailable()) return;
+  const invoke = await getInvoke();
+  await invoke('focus_main_window');
+}
+
+/** Send a native desktop session notification that can emit a click event. */
+export async function notifySessionCompleteDesktop(
+  input: DesktopSessionNotificationInput,
+): Promise<boolean> {
+  if (!tauriAvailable()) return false;
+  const invoke = await getInvoke();
+  return invoke<boolean>('notify_session_complete', {
+    title: input.title,
+    body: input.body,
+    workspaceId: input.workspaceId,
+    sessionId: input.sessionId,
+  });
+}
+
+/** Listen for native notification clicks from the desktop backend. */
+export async function onSessionNotificationClicked(
+  cb: (payload: SessionNotificationClickPayload) => void,
+): Promise<UnlistenFn> {
+  if (!tauriAvailable()) return () => {};
+  const listen = await getListen();
+  return listen<SessionNotificationClickPayload>(
+    'session-notification-clicked',
+    (event) => cb(event.payload),
+  );
 }
 
 /**
@@ -262,6 +431,8 @@ export interface CliOpts {
   cliCommand?: string;
   /** Working directory for the agent (the run's workspace). */
   cwd?: string;
+  /** Additional workspace directories exposed to the agent for this call. */
+  extraWorkspacePaths?: string[];
   /** Permission mode: 'full' | 'readonly' | 'ask' (from the AIDock dropdown). */
   permission?: string;
   /** Per-call environment overrides used by the model gateway route. */
@@ -274,6 +445,8 @@ export interface CliOpts {
   runId?: string;
   /** Live progress callback — receives streamed text/tool-use chunks. */
   onProgress?: (text: string) => void;
+  /** Raw model usage payload emitted by supported CLI adapters. */
+  onUsage?: (usage: unknown) => void;
   /**
    * Claude session id for context continuity (claude adapter only). With
    * `resume: false` the call creates this session; with `resume: true` it
@@ -285,6 +458,19 @@ export interface CliOpts {
 }
 
 let __cliSeq = 0;
+
+interface AiCliResult {
+  text: string;
+  usage?: unknown;
+}
+
+function isAiCliResult(value: unknown): value is AiCliResult {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { text?: unknown }).text === 'string'
+  );
+}
 
 export async function aiEditViaCli(
   prompt: string,
@@ -299,25 +485,46 @@ export async function aiEditViaCli(
 
   // Subscribe to per-run progress events (best-effort; the final result is
   // returned regardless of whether any progress chunks arrive).
-  let unlisten: UnlistenFn | undefined;
-  if (opts.onProgress) {
+  const unlisteners: UnlistenFn[] = [];
+  let usageSeen = false;
+  if (opts.onProgress || opts.onUsage) {
     const listen = await getListen();
-    unlisten = await listen<{ runId: string; text: string }>(
-      'ai-cli-progress',
-      (event) => {
-        if (event.payload?.runId === runId) opts.onProgress!(event.payload.text);
-      },
-    );
+    if (opts.onProgress) {
+      unlisteners.push(
+        await listen<{ runId: string; text: string }>(
+          'ai-cli-progress',
+          (event) => {
+            if (event.payload?.runId === runId) {
+              opts.onProgress!(event.payload.text);
+            }
+          },
+        ),
+      );
+    }
+    if (opts.onUsage) {
+      unlisteners.push(
+        await listen<{ runId: string; usage: unknown }>(
+          'ai-cli-usage',
+          (event) => {
+            if (event.payload?.runId === runId) {
+              usageSeen = true;
+              opts.onUsage!(event.payload.usage);
+            }
+          },
+        ),
+      );
+    }
   }
 
   try {
     const invoke = await getInvoke();
-    return await invoke<string>('ai_cli', {
+    const result = await invoke<string | AiCliResult>('ai_cli', {
       prompt,
       adapter,
       cliCommand: opts.cliCommand ?? null,
       model: opts.model ?? null,
       cwd: opts.cwd ?? null,
+      extraWorkspacePaths: opts.extraWorkspacePaths ?? [],
       permission: opts.permission ?? null,
       envVars: opts.env ?? null,
       timeoutSeconds: opts.timeoutSeconds ?? null,
@@ -327,8 +534,16 @@ export async function aiEditViaCli(
       resume: opts.resume ?? null,
       shell: runShellPayload(),
     });
+    if (isAiCliResult(result)) {
+      if (result.usage != null && !usageSeen) {
+        usageSeen = true;
+        opts.onUsage?.(result.usage);
+      }
+      return result.text;
+    }
+    return result;
   } finally {
-    unlisten?.();
+    for (const unlisten of unlisteners) unlisten();
   }
 }
 
@@ -367,6 +582,29 @@ export async function freeChannelAutoKeys(): Promise<Record<string, string>> {
   if (!tauriAvailable()) return {};
   const invoke = await getInvoke();
   return invoke<Record<string, string>>('free_channel_auto_keys');
+}
+
+/** Read multiple named secrets from the desktop OS keychain. */
+export async function secureSecretGetMany(
+  keys: string[],
+): Promise<Record<string, string>> {
+  if (!tauriAvailable()) return {};
+  const invoke = await getInvoke();
+  return invoke<Record<string, string>>('secure_secret_get_many', { keys });
+}
+
+/** Write one named secret to the desktop OS keychain. */
+export async function secureSecretSet(key: string, value: string): Promise<void> {
+  if (!tauriAvailable()) return;
+  const invoke = await getInvoke();
+  await invoke('secure_secret_set', { key, value });
+}
+
+/** Delete one named secret from the desktop OS keychain. */
+export async function secureSecretDelete(key: string): Promise<void> {
+  if (!tauriAvailable()) return;
+  const invoke = await getInvoke();
+  await invoke('secure_secret_delete', { key });
 }
 
 /** Read rough local hardware for choosing an Ollama model. */
@@ -534,6 +772,108 @@ export async function openExternal(url: string): Promise<void> {
   await invoke('open_external', { url });
 }
 
+/** Open a local directory in the OS file browser. Desktop-only. */
+export async function openWorkspaceDirectory(path: string): Promise<boolean> {
+  if (!tauriAvailable()) return false;
+  try {
+    const invoke = await getInvoke();
+    await invoke('open_workspace_directory', { path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** List one workspace directory for the right-side project tree. Desktop-only. */
+export async function listWorkspaceDirectory(
+  rootPath: string,
+  relativePath = '',
+): Promise<WorkspaceDirectoryListing> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<WorkspaceDirectoryListing>('list_workspace_dir', {
+    rootPath,
+    relativePath,
+  });
+}
+
+/** Detect game-engine project metadata and project-local skill roots. */
+export async function scanProjectEnvironment(
+  rootPath: string,
+): Promise<ProjectEnvironmentScan> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<ProjectEnvironmentScan>('project_environment_scan', { rootPath });
+}
+
+/** Probe one project MCP server with initialize + tools/list. */
+export async function probeProjectMcpServer(
+  rootPath: string,
+  server: ProjectMcpProbeServerConfig,
+): Promise<ProjectMcpProbeResult> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<ProjectMcpProbeResult>('project_mcp_probe', {
+    rootPath,
+    server,
+  });
+}
+
+/** Ensure this session has a filesystem baseline. No VCS dependency. */
+export async function ensureWorkspaceChangesBaseline(
+  rootPath: string,
+  cacheKey: string,
+  baselineAtMs?: number | null,
+): Promise<WorkspaceChangeBaseline> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<WorkspaceChangeBaseline>('workspace_changes_baseline', {
+    rootPath,
+    cacheKey,
+    baselineAtMs,
+  });
+}
+
+/** Read changed lines since this session's filesystem baseline. */
+export async function listWorkspaceChanges(
+  rootPath: string,
+  cacheKey: string,
+  baselineAtMs?: number | null,
+): Promise<WorkspaceChanges> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<WorkspaceChanges>('workspace_changes', {
+    rootPath,
+    cacheKey,
+    baselineAtMs,
+  });
+}
+
+/** Read the last persisted session-change snapshot without rescanning files. */
+export async function readWorkspaceChangesCache(
+  rootPath: string,
+  cacheKey: string,
+): Promise<WorkspaceChanges | null> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<WorkspaceChanges | null>('workspace_changes_cached', {
+    rootPath,
+    cacheKey,
+  });
+}
+
 /** Read a local file for the in-app right-side preview drawer. Desktop-only. */
 export async function previewLocalFile(
   path: string,
@@ -686,6 +1026,7 @@ export async function runUltracode(
     return await invoke<UltracodeRunResult>('run_ultracode', {
       task,
       cwd: opts.cwd ?? null,
+      extraWorkspacePaths: opts.extraWorkspacePaths ?? [],
       adapter: opts.adapter ?? null,
       model: opts.model ?? null,
       provider: opts.provider ?? null,

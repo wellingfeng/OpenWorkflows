@@ -6,6 +6,7 @@ import CopyButton from './CopyButton';
 import ToolCard from './ToolCard';
 import type { ToolEvent } from './lib/toolEvent';
 import type { OpenFileFn } from './FileChip';
+import { answerActionText } from './lib/messageText';
 
 /** Group tool events into parents + their `parentId` children (one level). */
 function nestTools(events: ToolEvent[]): Array<{ event: ToolEvent; children: ToolEvent[] }> {
@@ -65,11 +66,7 @@ function MessageContentImpl({
   // The very last segment overall — a trailing caret goes after it while live.
   const lastIdx = segments.length - 1;
 
-  // Plain-text copy payload: the answer text without reasoning/tool segments.
-  const copyText = segments
-    .map((s) => (s.type === 'answer' ? s.text : ''))
-    .join('')
-    .trim();
+  const copyText = answerActionText(text);
 
   return (
     <div className="ai-message group/msg relative flex flex-col">

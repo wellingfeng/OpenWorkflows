@@ -6,6 +6,7 @@
  *   - `codex_progress_line`         -> {@link codexProgressLine}
  *   - `codex_completed_item`        -> {@link codexCompletedItem}
  *   - `codex_turn_completion_status`-> {@link codexTurnCompletionStatus}
+ *   - `codex_turn_usage`            -> {@link codexTurnUsage}
  *   - `codex_status_success`        -> {@link codexStatusSuccess}
  *
  * Pure (no spawn): consumed by `cli/io/cli-spawn.ts` while it walks the JSONL
@@ -167,6 +168,36 @@ export function codexTurnCompletionStatus(
       (typeof event.status === 'string' ? event.status : undefined) ??
       'completed';
     return status;
+  }
+  return undefined;
+}
+
+/** Extract a codex turn-completion usage payload, when the JSONL event includes one. */
+export function codexTurnUsage(
+  event: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const kind = codexEventKind(event);
+  if (kind !== 'turn.completed' && kind !== 'turn/completed' && kind !== 'turn_complete') {
+    return undefined;
+  }
+  if (typeof event.usage === 'object' && event.usage !== null) {
+    return event.usage as Record<string, unknown>;
+  }
+  const params =
+    typeof event.params === 'object' && event.params !== null
+      ? (event.params as Record<string, unknown>)
+      : undefined;
+  if (params && typeof params.usage === 'object' && params.usage !== null) {
+    return params.usage as Record<string, unknown>;
+  }
+  const turn =
+    params && typeof params.turn === 'object' && params.turn !== null
+      ? (params.turn as Record<string, unknown>)
+      : typeof event.turn === 'object' && event.turn !== null
+        ? (event.turn as Record<string, unknown>)
+        : undefined;
+  if (turn && typeof turn.usage === 'object' && turn.usage !== null) {
+    return turn.usage as Record<string, unknown>;
   }
   return undefined;
 }

@@ -27,6 +27,28 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+type ThreeDSettingsOverrides = Partial<
+  Omit<typeof DEFAULT_THREE_D_GENERATION_SETTINGS, 'rigging'>
+> & {
+  rigging?: Partial<typeof DEFAULT_THREE_D_GENERATION_SETTINGS.rigging>;
+};
+
+function enabledThreeDSettings(
+  overrides: ThreeDSettingsOverrides = {},
+): typeof DEFAULT_THREE_D_GENERATION_SETTINGS {
+  const { rigging, ...rest } = overrides;
+  return {
+    ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+    enabled: true,
+    ...rest,
+    rigging: {
+      ...DEFAULT_THREE_D_GENERATION_SETTINGS.rigging,
+      enabled: true,
+      ...rigging,
+    },
+  };
+}
+
 describe('3D generation settings and routing', () => {
   it('detects explicit 3D generation requests', () => {
     expect(looksLikeThreeDGenerationRequest('/3d a game-ready sword')).toBe(true);
@@ -226,15 +248,14 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 一个低多边形宝箱',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: {},
         providerBaseUrls: {
           'local-3d-server': 'http://127.0.0.1:8080/generate',
         },
         providerModels: {},
-      },
+      }),
     );
 
     expect(result.providerId).toBe('local-3d-server');
@@ -277,15 +298,14 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 人形机器人角色',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: {},
         providerBaseUrls: {
           'local-3d-server': 'http://127.0.0.1:8080/generate',
         },
         providerModels: {},
-      },
+      }),
     );
 
     expect(result.rigging.enabled).toBe(true);
@@ -337,8 +357,7 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 人形机器人角色',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: { 'fal-tripo-h31': 'fal_key' },
         providerBaseUrls: {
@@ -346,7 +365,7 @@ describe('3D generation settings and routing', () => {
           'fal-meshy-v6': 'https://queue.test',
         },
         providerModels: {},
-      },
+      }),
     );
 
     expect(result.sourceAssets).toEqual(['https://assets.example.com/out/character.glb']);
@@ -405,8 +424,7 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 人形机器人角色',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: {},
         providerBaseUrls: {
@@ -414,11 +432,10 @@ describe('3D generation settings and routing', () => {
         },
         providerModels: {},
         rigging: {
-          ...DEFAULT_THREE_D_GENERATION_SETTINGS.rigging,
           providerKeys: { 'fal-meshy-rigging': 'rig_fal_key' },
           providerBaseUrls: { 'fal-meshy-rigging': 'https://rigging-queue.test' },
         },
-      },
+      }),
     );
 
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -450,15 +467,14 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 人形机器人角色',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: {},
         providerBaseUrls: {
           'local-3d-server': 'http://127.0.0.1:8080/generate',
         },
         providerModels: {},
-      },
+      }),
     );
 
     expect(result.assets).toEqual(['https://assets.example.com/out/character.glb']);
@@ -510,8 +526,7 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 人形机器人角色',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: {},
         providerBaseUrls: {
@@ -519,10 +534,9 @@ describe('3D generation settings and routing', () => {
         },
         providerModels: {},
         rigging: {
-          ...DEFAULT_THREE_D_GENERATION_SETTINGS.rigging,
           providerKeys: { 'meshy-rigging-api': 'msy_test' },
         },
-      },
+      }),
     );
 
     expect(result.assets).toEqual([
@@ -571,15 +585,14 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d 人形角色跳舞',
         providerId: 'local-3d-server',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'local-3d-server',
         providerKeys: {},
         providerBaseUrls: {
           'local-3d-server': 'http://127.0.0.1:8080/generate',
         },
         providerModels: {},
-      },
+      }),
     );
 
     expect(result.rigging.defaultAnimations).toEqual(['Idle', 'Walk', 'Run']);
@@ -644,13 +657,12 @@ describe('3D generation settings and routing', () => {
         prompt: '/3d cartoon doll',
         providerId: 'meshy',
       },
-      {
-        ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+      enabledThreeDSettings({
         preferredProviderId: 'meshy',
         providerKeys: { meshy: 'msy_test' },
         providerBaseUrls: {},
         providerModels: { meshy: 'meshy-6' },
-      },
+      }),
     );
 
     expect(result.assets).toEqual(['https://assets.meshy.ai/tasks/refined/model.glb']);

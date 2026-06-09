@@ -1166,6 +1166,29 @@ html.fuc-stream-scheme-solarized-dark {
   text-align: center;
   backdrop-filter: blur(8px);
 }
+.ai-mermaid {
+  color: var(--stream-fg);
+}
+.ai-mermaid__body {
+  min-height: 5rem;
+  background:
+    linear-gradient(color-mix(in oklab, var(--stream-surface-border) 26%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in oklab, var(--stream-surface-border) 26%, transparent) 1px, transparent 1px),
+    var(--code-bg);
+  background-size: 22px 22px, 22px 22px, 100% 100%;
+}
+.ai-mermaid__body svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+.ai-mermaid__status {
+  display: block;
+  padding: 1.25rem;
+  text-align: center;
+  color: var(--fg-faint);
+}
 .ai-file-chip--interactive {
   color: var(--file-preview-link);
   transition:

@@ -10,6 +10,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::storage_paths;
+
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
@@ -30,21 +32,6 @@ const ROOT_DIRS: &[&str] = &[
 ];
 
 const INTERNAL_TOP_LEVEL_DIRS: &[&str] = &["backups", "quarantine", "tmp", "deleted", "migrations"];
-
-/// Locate the user's home directory in a platform-neutral way.
-fn home_dir() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.is_empty() {
-            return Some(PathBuf::from(h));
-        }
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            return Some(PathBuf::from(h));
-        }
-    }
-    None
-}
 
 fn ensure_dir(path: &Path, label: &str) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|e| format!("创建 {label} 失败: {e}"))
@@ -225,22 +212,8 @@ fn replace_file(src: &Path, dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("替换文件失败 {} -> {}: {e}", src.display(), dest.display()))
 }
 
-fn worktree_root() -> Result<PathBuf, String> {
-    let root = if let Ok(env) = std::env::var("FUC_HOME") {
-        if !env.trim().is_empty() {
-            PathBuf::from(env)
-        } else {
-            home_dir().ok_or("无法定位用户目录")?.join(".worktree")
-        }
-    } else {
-        home_dir().ok_or("无法定位用户目录")?.join(".worktree")
-    };
-
-    ensure_dir(&root, ".worktree 根目录")?;
-    for dir in ROOT_DIRS {
-        ensure_dir(&root.join(dir), &format!(".worktree/{dir}"))?;
-    }
-    Ok(root)
+fn global_history_root() -> Result<PathBuf, String> {
+    storage_paths::ensure_global_root_with_dirs(ROOT_DIRS)
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
@@ -289,20 +262,20 @@ fn validate_json(json: &str) -> Result<(), String> {
         .map_err(|e| format!("JSON 无效: {e}"))
 }
 
-/// Return the absolute path of the `.worktree` root, creating it on first
+/// Return the absolute path of the `.freeultracode` root, creating it on first
 /// access. The frontend uses this for diagnostics; it must not hardcode the
 /// path.
 #[tauri::command]
 pub async fn history_root() -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(|| -> Result<String, String> {
-        let root = worktree_root()?;
+        let root = global_history_root()?;
         Ok(root.to_string_lossy().into_owned())
     })
     .await
     .map_err(|e| format!("history_root 调度失败: {e}"))?
 }
 
-/// Read a JSON file under `.worktree`, returning `None` if it does not exist.
+/// Read a JSON file under `.freeultracode`, returning `None` if it does not exist.
 /// Corrupt JSON is moved into `quarantine/` so a parse failure never keeps
 /// re-crashing the UI on every load.
 #[tauri::command]
@@ -311,7 +284,7 @@ pub async fn history_read_json(rel_path: String) -> Result<Option<String>, Strin
         if !rel_path.ends_with(".json") {
             return Err("history_read_json 只接受 .json 路径".into());
         }
-        let root = worktree_root()?;
+        let root = global_history_root()?;
         let path = safe_join(&root, &rel_path)?;
         match fs::read_to_string(&path) {
             Ok(s) => {
@@ -331,7 +304,7 @@ pub async fn history_read_json(rel_path: String) -> Result<Option<String>, Strin
     .map_err(|e| format!("history_read_json 调度失败: {e}"))?
 }
 
-/// Atomically write JSON to a path under `.worktree`. The data is staged into
+/// Atomically write JSON to a path under `.freeultracode`. The data is staged into
 /// a temp file in the same directory and then renamed over the target. If the
 /// target already exists, a copy is saved under `backups/` first.
 #[tauri::command]
@@ -342,7 +315,7 @@ pub async fn history_write_json(rel_path: String, json: String) -> Result<(), St
         }
         validate_json(&json)?;
 
-        let root = worktree_root()?;
+        let root = global_history_root()?;
         let path = safe_join(&root, &rel_path)?;
         if path.exists() && path.is_dir() {
             return Err(format!("目标是目录，不能写入 JSON: {}", path.display()));
@@ -378,14 +351,14 @@ pub async fn history_write_json(rel_path: String, json: String) -> Result<(), St
     .map_err(|e| format!("history_write_json 调度失败: {e}"))?
 }
 
-/// Remove a file or directory under `.worktree`. `soft=true` (the default
+/// Remove a file or directory under `.freeultracode`. `soft=true` (the default
 /// from the UI) moves the target into `trash/<unix-ms>-<flattened-relpath>`;
 /// `soft=false` deletes it outright. A missing target is treated as success
 /// so callers can be idempotent.
 #[tauri::command]
 pub async fn history_remove(rel_path: String, soft: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let root = worktree_root()?;
+        let root = global_history_root()?;
         let path = safe_join(&root, &rel_path)?;
         if !path.exists() {
             return Ok(());
@@ -413,13 +386,13 @@ pub async fn history_remove(rel_path: String, soft: bool) -> Result<(), String> 
     .map_err(|e| format!("history_remove 调度失败: {e}"))?
 }
 
-/// List the direct children inside `rel_path` under `.worktree`. Empty
+/// List the direct children inside `rel_path` under `.freeultracode`. Empty
 /// `rel_path` lists the root itself. Temp and corrupt files are filtered out so
 /// the caller sees only well-formed entries.
 #[tauri::command]
 pub async fn history_list_dir(rel_path: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
-        let root = worktree_root()?;
+        let root = global_history_root()?;
         let path = if rel_path.is_empty() {
             root.clone()
         } else {

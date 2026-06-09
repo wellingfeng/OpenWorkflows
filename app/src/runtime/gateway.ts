@@ -75,6 +75,7 @@ export async function invokeAgent(
     omitModel?: boolean;
     cliCommand?: string;
     cwd?: string;
+    extraWorkspacePaths?: string[];
     permission?: string;
     timeoutSeconds?: number;
     idleTimeoutSeconds?: number;
@@ -124,9 +125,12 @@ export async function invokeAgent(
   let firstProgressAt: number | undefined;
   try {
     const text = await gateway.spawnCliAgent(prompt, cli.adapter, {
+      selection,
       model: opts.omitModel ? undefined : opts.model ?? cli.model,
       env: cli.env,
       cwd: opts.cwd,
+      extraWorkspacePaths:
+        opts.extraWorkspacePaths ?? context.extraWorkspacePaths,
       permission: opts.permission,
       timeoutSeconds: opts.timeoutSeconds,
       idleTimeoutSeconds: opts.idleTimeoutSeconds,
@@ -181,6 +185,7 @@ export async function runAgentWithInteraction(opts: {
     omitModel?: boolean;
     cliCommand?: string;
     cwd?: string;
+    extraWorkspacePaths?: string[];
     permission?: string;
     timeoutSeconds?: number;
     idleTimeoutSeconds?: number;
@@ -238,6 +243,8 @@ export async function runAgentWithInteraction(opts: {
           omitModel: opts.cli.omitModel,
           cliCommand: opts.cli.cliCommand,
           cwd: opts.cli.cwd,
+          extraWorkspacePaths:
+            opts.cli.extraWorkspacePaths ?? context.extraWorkspacePaths,
           permission: opts.cli.permission,
           timeoutSeconds: opts.cli.timeoutSeconds ?? timeoutPolicy.timeoutSeconds,
           idleTimeoutSeconds:

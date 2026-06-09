@@ -1,7 +1,7 @@
 {
   "name": "freeultracode-app",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.2",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -26,6 +26,7 @@
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-fs": "^2.5.1",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "@xyflow/react": "^12.3.5",
     "gifenc": "^1.0.3",
@@ -33,6 +34,7 @@
     "katex": "^0.16.47",
     "lowlight": "^3.3.0",
     "lucide-react": "^1.17.0",
+    "mermaid": "^11.15.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.1.0",

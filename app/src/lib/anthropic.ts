@@ -19,10 +19,55 @@
  *     prompt) — used by the "apply advice to graph" step.
  */
 
+import type { ModelUsageReport } from '@/lib/usageMeter';
+
 /** Default Anthropic model id (kept in sync with the Rust backend). */
 export const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
+
+function usageNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  return undefined;
+}
+
+function usageReportFromAnthropic(value: unknown): ModelUsageReport | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const raw = value as Record<string, unknown>;
+  const report: ModelUsageReport = {
+    inputTokens: usageNumber(raw.input_tokens),
+    outputTokens: usageNumber(raw.output_tokens),
+    cacheReadInputTokens:
+      usageNumber(raw.cache_read_input_tokens) ??
+      usageNumber(raw.cache_read_tokens),
+    cacheCreationInputTokens:
+      usageNumber(raw.cache_creation_input_tokens) ??
+      usageNumber(raw.cache_creation_tokens),
+  };
+  const input = report.inputTokens ?? 0;
+  const output = report.outputTokens ?? 0;
+  if (input || output) report.totalTokens = input + output;
+  return Object.values(report).some((item) => item !== undefined) ? report : null;
+}
+
+function mergeUsageReports(
+  current: ModelUsageReport | null,
+  next: ModelUsageReport | null,
+): ModelUsageReport | null {
+  if (!next) return current;
+  if (!current) return next;
+  return {
+    inputTokens: next.inputTokens ?? current.inputTokens,
+    outputTokens: next.outputTokens ?? current.outputTokens,
+    totalTokens: next.totalTokens ?? current.totalTokens,
+    cacheReadInputTokens:
+      next.cacheReadInputTokens ?? current.cacheReadInputTokens,
+    cacheCreationInputTokens:
+      next.cacheCreationInputTokens ?? current.cacheCreationInputTokens,
+  };
+}
 
 export interface StreamArgs {
   apiKey?: string;
@@ -37,6 +82,8 @@ export interface StreamArgs {
   signal?: AbortSignal;
   /** Invoked with each incremental text chunk as it streams in. */
   onDelta?: (chunk: string) => void;
+  /** Best-effort parsed provider token usage. Called once when stream ends. */
+  onUsage?: (usage: ModelUsageReport) => void;
 }
 
 /**
@@ -44,7 +91,17 @@ export interface StreamArgs {
  * the full text once the stream ends; calls `onDelta` for each text delta.
  */
 export async function streamAnthropic(args: StreamArgs): Promise<string> {
-  const { apiKey, baseUrl, system, userContent, model, maxTokens, signal, onDelta } = args;
+  const {
+    apiKey,
+    baseUrl,
+    system,
+    userContent,
+    model,
+    maxTokens,
+    signal,
+    onDelta,
+    onUsage,
+  } = args;
   if (!apiKey || !apiKey.trim()) throw new Error('NO_API_KEY');
 
   const res = await fetch(resolveEndpoint(baseUrl), {
@@ -75,6 +132,7 @@ export async function streamAnthropic(args: StreamArgs): Promise<string> {
   const decoder = new TextDecoder();
   let buffer = '';
   let full = '';
+  let usage: ModelUsageReport | null = null;
 
   // Parse the Server-Sent Events stream. Each event is a block of lines; we
   // only care about `data:` lines carrying `content_block_delta` text deltas.
@@ -92,11 +150,21 @@ export async function streamAnthropic(args: StreamArgs): Promise<string> {
       try {
         const evt = JSON.parse(data) as {
           type?: string;
+          message?: { usage?: unknown };
+          usage?: unknown;
           delta?: { type?: string; text?: string };
           error?: { message?: string };
         };
         if (evt.type === 'error') {
           throw new Error(evt.error?.message ?? 'stream error');
+        }
+        if (evt.type === 'message_start') {
+          usage = mergeUsageReports(
+            usage,
+            usageReportFromAnthropic(evt.message?.usage),
+          );
+        } else if (evt.type === 'message_delta') {
+          usage = mergeUsageReports(usage, usageReportFromAnthropic(evt.usage));
         }
         if (
           evt.type === 'content_block_delta' &&
@@ -111,6 +179,7 @@ export async function streamAnthropic(args: StreamArgs): Promise<string> {
       }
     }
   }
+  if (usage) onUsage?.(usage);
   return full;
 }
 

@@ -67,6 +67,7 @@ type MockStoreState = {
     title?: string,
   ) => void;
   importWorkflowToWorkspace: (workspaceId: string, title?: string) => void;
+  setWorkspace: (path: string) => void;
   selectSession: (sessionId: string, workspaceId?: string) => void;
   deleteSession: (sessionId: string, workspaceId?: string) => void;
   renameWorkflowSession: (
@@ -165,6 +166,18 @@ vi.mock('./SettingsModal', () => ({
   default: () => null,
 }));
 
+vi.mock('@/lib/tauri', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/tauri')>();
+  return {
+    ...actual,
+    openWorkspaceDirectory: vi.fn(async () => true),
+    scanProjectEnvironment: vi.fn(async () => {
+      throw new Error('NO_BACKEND');
+    }),
+  };
+});
+
+import { openWorkspaceDirectory } from '@/lib/tauri';
 import Sidebar from './Sidebar';
 
 const WORKSPACE: MockWorkspace = {
@@ -208,6 +221,7 @@ function resetSidebarStore(): void {
     newSession: vi.fn(),
     exportWorkflowSession: vi.fn(),
     importWorkflowToWorkspace: vi.fn(),
+    setWorkspace: vi.fn(),
     selectSession: vi.fn(),
     deleteSession: vi.fn(),
     renameWorkflowSession: vi.fn(async () => undefined),
@@ -297,6 +311,17 @@ function sessionButton(
   return button as HTMLButtonElement;
 }
 
+function workspaceButton(
+  container: HTMLElement,
+  title: string,
+): HTMLButtonElement {
+  const button = Array.from(container.querySelectorAll('button')).find((item) =>
+    item.textContent?.includes(title),
+  );
+  expect(button).toBeInstanceOf(HTMLButtonElement);
+  return button as HTMLButtonElement;
+}
+
 function sessionTitleOrder(container: HTMLElement, titles: string[]): string[] {
   return Array.from(container.querySelectorAll('button'))
     .map((button) =>
@@ -328,6 +353,21 @@ async function openSessionContextMenu(
         cancelable: true,
         clientX: 120,
         clientY: 140,
+      }),
+    );
+  });
+}
+
+async function openWorkspaceContextMenu(
+  button: HTMLButtonElement,
+): Promise<void> {
+  await act(async () => {
+    button.dispatchEvent(
+      new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 88,
+        clientY: 108,
       }),
     );
   });
@@ -432,6 +472,8 @@ async function pressInputKey(
 }
 
 afterEach(() => {
+  vi.mocked(openWorkspaceDirectory).mockReset();
+  vi.mocked(openWorkspaceDirectory).mockResolvedValue(true);
   window.localStorage.clear();
   document.body.innerHTML = '';
   resetSidebarStore();
@@ -514,6 +556,54 @@ describe('Sidebar workflow rename', () => {
       expect(queryContextMenuExportButton(view.container)).toBeNull();
       expect(mockState.exportWorkflowSession).not.toHaveBeenCalled();
     } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('opens a workspace folder from the workspace context menu', async () => {
+    resetSidebarStore();
+    const view = await renderSidebar();
+
+    try {
+      await openWorkspaceContextMenu(workspaceButton(view.container, WORKSPACE.name));
+
+      const openButton = Array.from(view.container.querySelectorAll('button')).find(
+        (button) => button.textContent?.includes('打开工作区目录'),
+      );
+      expect(openButton).toBeInstanceOf(HTMLButtonElement);
+
+      await clickButton(openButton as HTMLButtonElement);
+
+      expect(openWorkspaceDirectory).toHaveBeenCalledWith(WORKSPACE.path);
+      expect(view.container.textContent).not.toContain('打开工作区目录');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('shows a fallback message when the desktop file browser cannot open', async () => {
+    resetSidebarStore();
+    vi.mocked(openWorkspaceDirectory).mockResolvedValueOnce(false);
+    const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+    const view = await renderSidebar();
+
+    try {
+      await openWorkspaceContextMenu(workspaceButton(view.container, WORKSPACE.name));
+      const openButton = Array.from(view.container.querySelectorAll('button')).find(
+        (button) => button.textContent?.includes('打开工作区目录'),
+      );
+      expect(openButton).toBeInstanceOf(HTMLButtonElement);
+
+      await clickButton(openButton as HTMLButtonElement);
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(alertSpy).toHaveBeenCalledWith(
+        '当前环境不能打开系统文件浏览器。请使用桌面端。',
+      );
+    } finally {
+      alertSpy.mockRestore();
       await view.cleanup();
     }
   });
@@ -1848,6 +1938,63 @@ describe('Sidebar session search', () => {
       expect(view.container.textContent).not.toContain('Bulk Session 6');
       expect(view.container.textContent).not.toContain('Bulk Session 25');
       expect(view.container.textContent).toContain('加载更多');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('selects a workspace from the header and toggles only from the chevron', async () => {
+    resetSidebarStore();
+    const toggleSessions = [
+      { ...SESSION, id: 's_toggle_1', title: 'Workspace Toggle 1' },
+      { ...SESSION, id: 's_toggle_2', title: 'Workspace Toggle 2' },
+    ];
+    mockState.sessionTree = { [WORKSPACE.id]: toggleSessions };
+    mockState.sessions = toggleSessions;
+    mockState.workspaces = [
+      { ...WORKSPACE, sessionCount: toggleSessions.length },
+    ];
+
+    const view = await renderSidebar();
+    const workspaceHeader = () => {
+      const button = Array.from(view.container.querySelectorAll('button')).find(
+        (item) => item.textContent?.includes(WORKSPACE.name),
+      );
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      return button as HTMLButtonElement;
+    };
+    const workspaceToggle = () => {
+      const button = view.container.querySelector(
+        'button[aria-label="收起工作区会话"], button[aria-label="展开工作区会话"]',
+      );
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      return button as HTMLButtonElement;
+    };
+
+    try {
+      expect(workspaceToggle().getAttribute('aria-expanded')).toBe('true');
+      expect(view.container.textContent).toContain('Workspace Toggle 1');
+      expect(view.container.textContent).toContain('Workspace Toggle 2');
+
+      await clickButton(workspaceHeader());
+
+      expect(mockState.setWorkspace).toHaveBeenCalledWith(WORKSPACE.path);
+      expect(workspaceToggle().getAttribute('aria-expanded')).toBe('true');
+      expect(view.container.textContent).toContain('Workspace Toggle 1');
+      expect(view.container.textContent).toContain('Workspace Toggle 2');
+
+      await clickButton(workspaceToggle());
+
+      expect(workspaceToggle().getAttribute('aria-expanded')).toBe('false');
+      expect(view.container.textContent).not.toContain('Workspace Toggle 1');
+      expect(view.container.textContent).not.toContain('Workspace Toggle 2');
+      expect(mockState.selectSession).not.toHaveBeenCalled();
+
+      await clickButton(workspaceToggle());
+
+      expect(workspaceToggle().getAttribute('aria-expanded')).toBe('true');
+      expect(view.container.textContent).toContain('Workspace Toggle 1');
+      expect(view.container.textContent).toContain('Workspace Toggle 2');
     } finally {
       await view.cleanup();
     }

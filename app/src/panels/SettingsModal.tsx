@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from 'react';
 import {
@@ -153,6 +154,23 @@ import {
   resolveStylePresetId,
   type StylePresetDefinition,
 } from '@/lib/appearance';
+import {
+  DEFAULT_SHORTCUT_SETTINGS,
+  SHORTCUT_ACTION_IDS,
+  describeShortcutBinding,
+  loadShortcutSettings,
+  matchesShortcut,
+  resetAllShortcutSettings,
+  resetShortcutBinding,
+  saveShortcutSettings,
+  setShortcutBinding,
+  shortcutConflict,
+  shortcutFromKeyboardEvent,
+  shortcutParts,
+  subscribeShortcutSettings,
+  type ShortcutActionId,
+  type ShortcutSettings,
+} from '@/lib/keyboardShortcuts';
 import { useStore } from '@/store/useStore';
 import {
   CONSENSUS_LIMITS,
@@ -256,9 +274,6 @@ const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = 
   { id: 'models', labelKey: 'settings.tabs.models', Icon: Cpu },
   { id: 'imageGeneration', labelKey: 'settings.tabs.imageGeneration', Icon: Sparkles },
   { id: 'musicGeneration', labelKey: 'settings.tabs.musicGeneration', Icon: Music },
-  { id: 'threeDGeneration', labelKey: 'settings.tabs.threeDGeneration', Icon: Box },
-  { id: 'rigging', labelKey: 'settings.tabs.rigging', Icon: Bone },
-  { id: 'gameExperts', labelKey: 'settings.tabs.gameExperts', Icon: Gamepad2 },
   { id: 'commands', labelKey: 'settings.tabs.commands', Icon: SlashSquare },
   { id: 'shortcuts', labelKey: 'settings.tabs.shortcuts', Icon: Keyboard },
   { id: 'appearance', labelKey: 'settings.tabs.appearance', Icon: Palette },
@@ -369,6 +384,9 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const setPersonalInstructions = useStore((s) => s.setPersonalInstructions);
   const gameExpertSettings = useStore((s) => s.gameExpertSettings);
   const setGameExpertSettings = useStore((s) => s.setGameExpertSettings);
+  const [shortcutSettings, setShortcutSettingsState] = useState(
+    loadShortcutSettings,
+  );
 
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const dragState = useRef<{
@@ -381,13 +399,22 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (!matchesShortcut(event, shortcutSettings['modal-close'])) return;
+      if (document.querySelector('[data-shortcut-recorder-active="true"]')) {
+        return;
+      }
       if (document.querySelector('[data-settings-child-modal="true"]')) return;
+      event.preventDefault();
       onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [onClose, shortcutSettings]);
+
+  useEffect(
+    () => subscribeShortcutSettings(setShortcutSettingsState),
+    [],
+  );
 
   const handleHeaderPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
@@ -570,7 +597,11 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               ) : tab === 'commands' ? (
                 <CommandsSettings locale={locale} />
               ) : tab === 'shortcuts' ? (
-                <ShortcutsSettings locale={locale} />
+                <ShortcutsSettings
+                  locale={locale}
+                  settings={shortcutSettings}
+                  onSettingsChange={setShortcutSettingsState}
+                />
               ) : tab === 'appearance' ? (
                 <AppearanceSettings locale={locale} />
               ) : tab === 'about' ? (
@@ -2447,6 +2478,9 @@ function ProviderEditor({
   onDelete?: () => void;
   onSaved: () => void;
 }) {
+  const [shortcutSettings, setShortcutSettingsState] = useState(
+    loadShortcutSettings,
+  );
   const [keyVisible, setKeyVisible] = useState(false);
   const [modelRefresh, setModelRefresh] = useState<{
     loading: boolean;
@@ -2467,13 +2501,18 @@ function ProviderEditor({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (!matchesShortcut(event, shortcutSettings['modal-close'])) return;
       event.preventDefault();
       onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [onClose, shortcutSettings]);
+
+  useEffect(
+    () => subscribeShortcutSettings(setShortcutSettingsState),
+    [],
+  );
 
   const patchDraft = (patch: Partial<ProviderDraft>) => {
     setSaveError(null);
@@ -4674,61 +4713,207 @@ function CommandRow({
   );
 }
 
-function ShortcutsSettings({ locale }: { locale: Locale }) {
-  const shortcuts: {
-    id: string;
-    keys: string[];
-    titleKey: TranslationKey;
-    descriptionKey: TranslationKey;
-  }[] = [
-    {
-      id: 'composer-send',
-      keys: ['Ctrl', 'Enter'],
-      titleKey: 'settings.shortcutsComposerSendTitle',
-      descriptionKey: 'settings.shortcutsComposerSendDescription',
-    },
-    {
-      id: 'composer-newline',
-      keys: ['Enter'],
-      titleKey: 'settings.shortcutsComposerNewlineTitle',
-      descriptionKey: 'settings.shortcutsComposerNewlineDescription',
-    },
-    {
-      id: 'modal-close',
-      keys: ['Esc'],
-      titleKey: 'settings.shortcutsCloseModalTitle',
-      descriptionKey: 'settings.shortcutsCloseModalDescription',
-    },
-  ];
+const SHORTCUT_ACTION_META: Record<
+  ShortcutActionId,
+  { titleKey: TranslationKey; descriptionKey: TranslationKey }
+> = {
+  'composer-send': {
+    titleKey: 'settings.shortcutsComposerSendTitle',
+    descriptionKey: 'settings.shortcutsComposerSendDescription',
+  },
+  'composer-newline': {
+    titleKey: 'settings.shortcutsComposerNewlineTitle',
+    descriptionKey: 'settings.shortcutsComposerNewlineDescription',
+  },
+  'return-search': {
+    titleKey: 'settings.shortcutsReturnSearchTitle',
+    descriptionKey: 'settings.shortcutsReturnSearchDescription',
+  },
+  'modal-close': {
+    titleKey: 'settings.shortcutsCloseModalTitle',
+    descriptionKey: 'settings.shortcutsCloseModalDescription',
+  },
+};
+
+function shortcutActionTitle(locale: Locale, id: ShortcutActionId): string {
+  return t(locale, SHORTCUT_ACTION_META[id].titleKey);
+}
+
+function ShortcutsSettings({
+  locale,
+  settings,
+  onSettingsChange,
+}: {
+  locale: Locale;
+  settings: ShortcutSettings;
+  onSettingsChange: (settings: ShortcutSettings) => void;
+}) {
+  const [recordingId, setRecordingId] = useState<ShortcutActionId | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savedId, setSavedId] = useState<ShortcutActionId | null>(null);
+
+  useEffect(() => {
+    if (!savedId) return;
+    const timeout = window.setTimeout(() => setSavedId(null), 1400);
+    return () => window.clearTimeout(timeout);
+  }, [savedId]);
+
+  const commitSettings = (
+    next: ShortcutSettings,
+    savedActionId: ShortcutActionId | null,
+  ) => {
+    onSettingsChange(next);
+    saveShortcutSettings(next);
+    setRecordingId(null);
+    setError(null);
+    setSavedId(savedActionId);
+  };
+
+  const conflictMessage = (conflictId: ShortcutActionId) =>
+    formatStatusMessage(t(locale, 'settings.shortcutsConflict'), {
+      title: shortcutActionTitle(locale, conflictId),
+    });
+
+  const recordShortcut = (
+    id: ShortcutActionId,
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const binding = shortcutFromKeyboardEvent(event.nativeEvent);
+    if (!binding) {
+      setError(t(locale, 'settings.shortcutsInvalid'));
+      return;
+    }
+    const conflictId = shortcutConflict(settings, id, binding);
+    if (conflictId) {
+      setError(conflictMessage(conflictId));
+      return;
+    }
+    commitSettings(setShortcutBinding(settings, id, binding), id);
+  };
+
+  const resetShortcut = (id: ShortcutActionId) => {
+    const conflictId = shortcutConflict(
+      settings,
+      id,
+      DEFAULT_SHORTCUT_SETTINGS[id],
+    );
+    if (conflictId) {
+      setRecordingId(null);
+      setError(conflictMessage(conflictId));
+      return;
+    }
+    commitSettings(resetShortcutBinding(settings, id), id);
+  };
 
   return (
     <div className="space-y-5">
-      <div>
-        <h3 className="text-lg font-semibold text-fg">
-          {t(locale, 'settings.shortcutsTitle')}
-        </h3>
-        <p className="mt-1 text-xs leading-relaxed text-fg-faint">
-          {t(locale, 'settings.shortcutsDescription')}
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="text-lg font-semibold text-fg">
+            {t(locale, 'settings.shortcutsTitle')}
+          </h3>
+          <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+            {t(locale, 'settings.shortcutsDescription')}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => commitSettings(resetAllShortcutSettings(), null)}
+          className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-border bg-bg px-3 text-xs font-medium text-fg-dim transition-colors hover:border-accent hover:text-fg"
+        >
+          <RefreshCw size={13} strokeWidth={2} />
+          {t(locale, 'settings.shortcutsResetAll')}
+        </button>
       </div>
 
       <div className="space-y-2">
-        {shortcuts.map((shortcut) => (
-          <div
-            key={shortcut.id}
-            className="grid gap-3 rounded-lg border border-border bg-bg-alt px-4 py-3 md:grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)] md:items-center"
-          >
-            <ShortcutKeys keys={shortcut.keys} />
-            <div className="min-w-0">
-              <div className="text-sm font-medium text-fg">
-                {t(locale, shortcut.titleKey)}
+        {SHORTCUT_ACTION_IDS.map((id) => {
+          const binding = settings[id];
+          const currentLabel = describeShortcutBinding(binding);
+          const recording = recordingId === id;
+          const meta = SHORTCUT_ACTION_META[id];
+          return (
+            <div
+              key={id}
+              className="grid gap-3 rounded-lg border border-border bg-bg-alt px-4 py-3 lg:grid-cols-[minmax(9rem,13rem)_minmax(0,1fr)_minmax(12rem,auto)] lg:items-center"
+            >
+              <ShortcutKeys keys={shortcutParts(binding)} />
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-medium text-fg">
+                    {t(locale, meta.titleKey)}
+                  </div>
+                  {savedId === id && (
+                    <span className="rounded border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                      {t(locale, 'settings.shortcutsSaved')}
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+                  {t(locale, meta.descriptionKey)}
+                </p>
               </div>
-              <p className="mt-1 text-xs leading-relaxed text-fg-faint">
-                {t(locale, shortcut.descriptionKey)}
-              </p>
+              <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+                {recording ? (
+                  <>
+                    <button
+                      type="button"
+                      autoFocus
+                      data-shortcut-recorder-active="true"
+                      onKeyDown={(event) => recordShortcut(id, event)}
+                      className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-accent bg-accent/10 px-3 text-xs font-medium text-accent outline-none ring-1 ring-accent/30"
+                    >
+                      <Keyboard size={13} strokeWidth={2} />
+                      {t(locale, 'settings.shortcutsRecording')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRecordingId(null);
+                        setError(null);
+                      }}
+                      className="min-h-8 rounded-md border border-border bg-bg px-3 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+                    >
+                      {t(locale, 'common.cancel')}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRecordingId(id);
+                        setError(null);
+                      }}
+                      aria-label={`${t(locale, 'common.edit')}: ${currentLabel}`}
+                      className="min-h-8 rounded-md border border-border bg-bg px-3 text-xs font-medium text-fg-dim transition-colors hover:border-accent hover:text-fg"
+                    >
+                      {t(locale, 'common.edit')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => resetShortcut(id)}
+                      className="min-h-8 rounded-md border border-border bg-bg px-3 text-xs text-fg-faint transition-colors hover:border-accent hover:text-fg"
+                    >
+                      {t(locale, 'settings.shortcutsReset')}
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
+      </div>
+
+      <div className="space-y-1">
+        {error && (
+          <p className="text-xs font-medium text-rose-300">{error}</p>
+        )}
+        <p className="text-xs leading-relaxed text-fg-faint">
+          {t(locale, 'settings.shortcutsRecordingHelp')}
+        </p>
       </div>
     </div>
   );

@@ -90,6 +90,13 @@ describe('parseFileRef', () => {
     });
   });
 
+  it('parses @ file mentions as workspace-relative paths', () => {
+    expect(parseFileRef('@src/App.tsx')).toEqual({
+      path: 'src/App.tsx',
+      basename: 'App.tsx',
+    });
+  });
+
   it('parses a line range', () => {
     const r = parseFileRef('file.ts:10-20');
     expect(r?.startLine).toBe(10);

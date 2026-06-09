@@ -139,14 +139,17 @@ export interface RunStreamHandle {
 
 /** Options passed to {@link RunGateway.spawnCliAgent}. */
 export interface SpawnCliAgentOpts {
+  selection?: GatewaySelection;
   model?: string;
   cliCommand?: string;
   cwd?: string;
+  extraWorkspacePaths?: string[];
   permission?: string;
   env?: Record<string, string>;
   timeoutSeconds?: number;
   idleTimeoutSeconds?: number;
   onProgress?: (text: string) => void;
+  onUsage?: (usage: unknown) => void;
   sessionId?: string;
   resume?: boolean;
 }
@@ -256,6 +259,7 @@ export interface RunContext {
   /** Same instructions, keyed by adapter/provider/channel/model selection. */
   personalInstructionsByModel?: PersonalInstructionsByModel;
   cwd?: string;
+  extraWorkspacePaths?: string[];
   permission?: string;
   /** Bounded-concurrency cap for independent nodes (already host-configured). */
   concurrency: number;

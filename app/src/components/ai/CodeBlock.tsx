@@ -1,5 +1,6 @@
 import { useMemo, type ReactNode } from 'react';
 import RawCodeBlock from './RawCodeBlock';
+import MermaidBlock from './MermaidBlock';
 
 /**
  * Recursively collect the plain text of a hast node (rehype-highlight wraps the
@@ -50,10 +51,15 @@ export default function CodeBlock({
 }) {
   const raw = useMemo(() => nodeText(node).replace(/\n$/, ''), [node]);
   const lang = languageOf(node);
+  const normalizedLang = lang?.toLowerCase();
 
   // Defensive: react-markdown normally supplies `node`, but if a future plugin
   // strips it we still render the (highlighted) children without chrome.
   if (!node) return <pre className="ai-code__scroll">{children}</pre>;
+
+  if (normalizedLang === 'mermaid' || normalizedLang === 'mmd') {
+    return <MermaidBlock code={raw} />;
+  }
 
   return <RawCodeBlock raw={raw} language={lang}>{children}</RawCodeBlock>;
 }

@@ -1,5 +1,12 @@
 import { primeCliRuntime, resolveCliInvocation } from '@/lib/cliConfig';
 import { aiEditViaCli, isTauri } from '@/lib/tauri';
+import {
+  estimateGatewayUsage,
+  mergeUsageReports,
+  recordModelUsageForRoute,
+  type ModelUsageReport,
+  usageReportFromCodex,
+} from '@/lib/usageMeter';
 import { completeAnthropic } from './adapters/anthropic';
 import { completeOpenAICompatible } from './adapters/openaiCompatible';
 import {
@@ -19,7 +26,7 @@ export async function completeGatewayText(
 ): Promise<string> {
   if (request.route.transport === 'anthropic' && request.route.apiKey) {
     try {
-      return await completeAnthropic(request);
+      return await completeDirectWithUsage(request, completeAnthropic);
     } catch (error) {
       if (!shouldFallbackDirectFetchToCli(error, request.route)) {
         throw error;
@@ -32,7 +39,7 @@ export async function completeGatewayText(
     request.route.apiKey
   ) {
     try {
-      return await completeOpenAICompatible(request);
+      return await completeDirectWithUsage(request, completeOpenAICompatible);
     } catch (error) {
       if (!shouldFallbackDirectFetchToCli(error, request.route)) {
         throw error;
@@ -42,6 +49,26 @@ export async function completeGatewayText(
   }
 
   return completeGatewayTextViaCli(request);
+}
+
+async function completeDirectWithUsage(
+  request: GatewayTextRequest,
+  complete: (request: GatewayTextRequest) => Promise<string>,
+): Promise<string> {
+  let usage: ModelUsageReport | null = null;
+  const text = await complete({
+    ...request,
+    onUsage: (report) => {
+      usage = mergeUsageReports(usage, report);
+      request.onUsage?.(report);
+    },
+  });
+  recordModelUsageForRoute(
+    request.route,
+    usage ?? estimateGatewayUsage(request.system, request.userContent, text),
+    { estimated: !usage, context: request.usageContext },
+  );
+  return text;
 }
 
 async function completeGatewayTextViaCli(
@@ -57,7 +84,8 @@ async function completeGatewayTextViaCli(
 
   const cli = await resolveCliForRoute(request.route);
   const prompt = `${request.system}\n\n${request.userContent}`;
-  return aiEditViaCli(prompt, request.route.adapter, {
+  let usage: ModelUsageReport | null = null;
+  const text = await aiEditViaCli(prompt, request.route.adapter, {
     permission: request.permission ?? 'full',
     cwd: request.cwd,
     model: request.route.model,
@@ -68,7 +96,19 @@ async function completeGatewayTextViaCli(
     timeoutSeconds: request.timeoutSeconds,
     idleTimeoutSeconds: request.idleTimeoutSeconds,
     runId: request.runId,
+    onUsage: (rawUsage) => {
+      const report = usageReportFromCodex(rawUsage);
+      if (!report) return;
+      usage = mergeUsageReports(usage, report);
+      request.onUsage?.(report);
+    },
   });
+  recordModelUsageForRoute(
+    request.route,
+    usage ?? estimateGatewayUsage(request.system, request.userContent, text),
+    { estimated: !usage, context: request.usageContext },
+  );
+  return text;
 }
 
 function shouldFallbackDirectFetchToCli(

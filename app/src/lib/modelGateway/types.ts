@@ -5,6 +5,7 @@ import type {
 } from '@/core/ir';
 import type { ProviderRuntimeStatus } from '@/lib/apiConfig';
 import type { RuntimeAdapterId } from '@/lib/adapters';
+import type { UsageMeterContext } from '@/lib/usageMeter';
 
 export type { GatewaySelection, ModelClass, NodeGatewayOverride };
 
@@ -100,7 +101,15 @@ export interface GatewayTextRequest {
   maxTokens?: number;
   signal?: AbortSignal;
   runId?: string;
+  usageContext?: UsageMeterContext;
   onDelta?: (chunk: string) => void;
+  onUsage?: (usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+  }) => void;
   permission?: string;
   cwd?: string;
   timeoutSeconds?: number;

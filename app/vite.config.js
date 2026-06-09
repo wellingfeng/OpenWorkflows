@@ -25,7 +25,7 @@ export default defineConfig({
             // (Editing source under src/ still reloads — to self-edit the source, run
             // a packaged build as the runner; see SELF-DEV.md.)
             ignored: [
-                '**/.omc/**',
+                '**/.freeultracode/**',
                 '**/*.fuc.json',
                 '**/src-tauri/target/**',
                 '**/dist/**',

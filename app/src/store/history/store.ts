@@ -35,6 +35,10 @@ export interface HistoryStore {
   getWorkspace(id: string): Promise<WorkspaceRecord | null>;
   resolveWorkspaceByPath(path: string): Promise<WorkspaceRecord>;
   renameWorkspace(id: string, name: string): Promise<WorkspaceRecord>;
+  patchWorkspaceMetadata(
+    id: string,
+    patch: WorkspaceRecord['metadata'],
+  ): Promise<WorkspaceRecord>;
   deleteWorkspace(id: string, soft?: boolean): Promise<void>;
 
   listSessions(workspaceId: string): Promise<SessionSummary[]>;
@@ -301,6 +305,7 @@ function workspaceSummary(record: WorkspaceRecord): WorkspaceSummary {
     updatedAt: record.updatedAt,
     sessionCount: record.sessionCount,
     lastActiveSessionId: record.lastActiveSessionId,
+    metadata: record.metadata,
   };
 }
 
@@ -1065,6 +1070,20 @@ export const historyStore: HistoryStore = {
         ...workspace,
         name: name.trim() || workspace.name,
         updatedAt: now(),
+      });
+    });
+  },
+
+  patchWorkspaceMetadata(id, patch) {
+    return enqueue(async () => {
+      const workspace = await getWorkspaceInternal(id);
+      if (!workspace) throw new Error(`Workspace not found: ${id}`);
+      return writeWorkspaceInternal({
+        ...workspace,
+        metadata: {
+          ...(workspace.metadata ?? {}),
+          ...(patch ?? {}),
+        },
       });
     });
   },

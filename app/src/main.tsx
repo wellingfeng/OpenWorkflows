@@ -5,19 +5,28 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import '@xyflow/react/dist/style.css';
 import './styles/global.css';
-import App from './App';
-import { applyAppearance } from '@/lib/appearance';
-import { useStore } from '@/store/useStore';
+import { initializeSecureStorage } from '@/lib/secureStorage';
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {
   throw new Error('Root element #root not found');
 }
 
-applyAppearance(useStore.getState().appearance);
+async function bootstrap(): Promise<void> {
+  await initializeSecureStorage();
+  const [{ default: App }, { applyAppearance }, { useStore }] = await Promise.all([
+    import('./App'),
+    import('@/lib/appearance'),
+    import('@/store/useStore'),
+  ]);
 
-createRoot(rootEl).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+  applyAppearance(useStore.getState().appearance);
+
+  createRoot(rootEl!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}
+
+void bootstrap();

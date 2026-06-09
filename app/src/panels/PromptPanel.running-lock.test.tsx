@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import AIDock from './AIDock';
 import PromptPanel from './PromptPanel';
+import { encodeToolPatch } from '@/components/ai/lib/toolEvent';
 import { defaultBlueprint, simpleBlueprint } from '@/core/defaultBlueprint';
 import {
   ACTIVE_PROVIDER_BY_KIND_STORAGE,
@@ -11,9 +12,14 @@ import {
 } from '@/lib/apiConfig';
 import { isFreeChannelSelection } from '@/lib/freeChannels';
 import { workflowDefaultGatewaySelection } from '@/lib/modelGateway/resolver';
+import { translatePublicText } from '@/lib/publicTranslation';
 import { defaultComposer, samplePromptGroups } from '@/store/sampleSessions';
 import type { Message } from '@/store/types';
 import { useStore } from '@/store/useStore';
+
+vi.mock('@/lib/publicTranslation', () => ({
+  translatePublicText: vi.fn(),
+}));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -243,7 +249,12 @@ function typeIntoInput(input: HTMLInputElement, value: string): void {
   input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+function flushAsync(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
 afterEach(() => {
+  vi.clearAllMocks();
   window.localStorage.clear();
   document.body.innerHTML = '';
 });
@@ -840,6 +851,137 @@ describe('PromptPanel running lock', () => {
       expect(optionalSearchInput(view.container)).toBeNull();
       expect(view.container.querySelectorAll('mark[data-search-match-id]')).toHaveLength(0);
       expect(view.container.textContent).not.toContain('1/2');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('shows assistant action buttons for every answer and regenerates from that turn', async () => {
+    resetStoreForPromptLock('design');
+    const originalSendPrompt = useStore.getState().sendPrompt;
+    const originalBranchSessionFromMessage =
+      useStore.getState().branchSessionFromMessage;
+    const sendPrompt = vi.fn();
+    const branchSessionFromMessage = vi.fn();
+    useStore.setState({
+      workflow: simpleBlueprint('Plain chat'),
+      sendPrompt,
+      branchSessionFromMessage,
+      messages: [
+        { id: 'm_user_1', role: 'user', text: '第一个问题', createdAt: 1 },
+        { id: 'm_ai_1', role: 'assistant', text: '第一个回答', createdAt: 2 },
+        { id: 'm_user_2', role: 'user', text: '第二个问题', createdAt: 3 },
+        { id: 'm_ai_2', role: 'assistant', text: '第二个回答', createdAt: 4 },
+      ] as Message[],
+    });
+    const view = await renderChatDock();
+
+    try {
+      expect(view.container.querySelectorAll('button[aria-label="复制 AI 回答"]')).toHaveLength(2);
+      expect(view.container.querySelectorAll('button[aria-label="创建会话分支"]')).toHaveLength(2);
+      expect(view.container.querySelectorAll('button[aria-label="重新生成回答"]')).toHaveLength(2);
+      expect(view.container.querySelectorAll('button[aria-label="切换模型回答"]')).toHaveLength(2);
+      expect(view.container.querySelectorAll('button[aria-label="翻译回答"]')).toHaveLength(2);
+      expect(view.container.querySelectorAll('button[aria-label="删除回答"]')).toHaveLength(2);
+
+      await act(async () => {
+        buttonByAriaLabel(view.container, '创建会话分支').click();
+      });
+
+      expect(branchSessionFromMessage).toHaveBeenCalledWith('m_ai_1');
+
+      await act(async () => {
+        buttonByAriaLabel(view.container, '重新生成回答').click();
+        await flushAsync();
+      });
+
+      expect(sendPrompt).toHaveBeenCalledWith('第一个问题');
+    } finally {
+      await view.cleanup();
+      useStore.setState({
+        sendPrompt: originalSendPrompt,
+        branchSessionFromMessage: originalBranchSessionFromMessage,
+      });
+    }
+  });
+
+  it('translates the final assistant answer through the public translation service', async () => {
+    resetStoreForPromptLock('design');
+    const originalSendPrompt = useStore.getState().sendPrompt;
+    const sendPrompt = vi.fn();
+    vi.mocked(translatePublicText).mockResolvedValue('This is translated.');
+    useStore.setState({
+      workflow: simpleBlueprint('Plain chat'),
+      sendPrompt,
+      messages: [
+        { id: 'm_user', role: 'user', text: '解释', createdAt: 1 },
+        {
+          id: 'm_ai',
+          role: 'assistant',
+          text:
+            '⚙ 模型：sonnet\n' +
+            '⏱ 10:00:00 → 10:00:01 · 耗时 1s\n' +
+            '<think>不要翻译这段</think>\n' +
+            '这是回答。\n' +
+            '🔧 command_execution: npm run typecheck\n' +
+            '这是后续。' +
+            encodeToolPatch({
+              id: 'tool-translate',
+              name: 'Read',
+              status: 'done',
+              result: '工具输出',
+            }),
+          createdAt: 2,
+        },
+      ] as Message[],
+    });
+    const view = await renderChatDock();
+
+    try {
+      await act(async () => {
+        buttonByAriaLabel(view.container, '翻译回答').click();
+      });
+
+      await act(async () => {
+        buttonByText(view.container, '英语').click();
+        await flushAsync();
+      });
+
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(translatePublicText).toHaveBeenCalledWith(
+        '这是回答。\n\n这是后续。',
+        'en-US',
+        'zh-CN',
+      );
+      expect(useStore.getState().messages.at(-1)).toMatchObject({
+        role: 'assistant',
+        text: '🌐 翻译为 英语\n\nThis is translated.',
+      });
+    } finally {
+      await view.cleanup();
+      useStore.setState({ sendPrompt: originalSendPrompt });
+    }
+  });
+
+  it('deletes the final assistant answer and its prompt from the active conversation', async () => {
+    resetStoreForPromptLock('design');
+    useStore.setState({
+      workflow: simpleBlueprint('Plain chat'),
+      messages: [
+        { id: 'm_user', role: 'user', text: '问题', createdAt: 1 },
+        { id: 'm_ai', role: 'assistant', text: '待删除回答', createdAt: 2 },
+      ] as Message[],
+    });
+    const view = await renderChatDock();
+
+    try {
+      await act(async () => {
+        buttonByAriaLabel(view.container, '删除回答').click();
+      });
+
+      expect(useStore.getState().messages.map((message) => message.id)).toEqual([]);
+      expect(view.container.textContent).not.toContain('待删除回答');
+      expect(view.container.textContent).not.toContain('问题');
     } finally {
       await view.cleanup();
     }

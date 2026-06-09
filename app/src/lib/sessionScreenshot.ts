@@ -9,7 +9,7 @@
  * instead of being silently clipped.
  *
  * Saving: inside the Tauri desktop shell images are written automatically under
- * the active workspace's `.omc/session-captures` folder (or a temp fallback when
+ * the active workspace's `.freeultracode/session-captures` folder (or a temp fallback when
  * no workspace is selected). In a plain browser the image is offered as a normal
  * download. Multi-page captures save each page as `<base>-1.png`,
  * `<base>-2.png`, … so the pieces can be viewed/stitched in order.
@@ -68,7 +68,7 @@ export interface CaptureResult {
 export interface CaptureOptions {
   /** Optional file base name (no extension). */
   baseName?: string;
-  /** Active workspace path; desktop saves under `<cwd>/.omc/session-captures`. */
+  /** Active workspace path; desktop saves under `<cwd>/.freeultracode/session-captures`. */
   cwd?: string;
 }
 

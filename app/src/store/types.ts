@@ -159,6 +159,8 @@ export interface ComposerSettings {
   model: string;
   /** absolute path of the selected workspace folder ('' = none chosen yet) */
   workspace: string;
+  /** Additional workspace folders attached to the current session. */
+  workspaceFolders: string[];
   /** AI 改图时为每个节点自动选模型的策略 */
   modelStrategy: ModelStrategy;
   /**

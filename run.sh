@@ -18,6 +18,7 @@ APP_DIR="$SCRIPT_DIR/app"
 TAURI_DIR="$APP_DIR/src-tauri"
 # macOS/Linux native binary built by Tauri (no .exe suffix). Named via [[bin]] in Cargo.toml.
 EXE="$TAURI_DIR/target/release/FreeUltraCode"
+STAMP="$SCRIPT_DIR/.fuc-run/build-fingerprint.txt"
 PORT=5173
 
 c_ok()   { printf '\033[32m[OK]\033[0m %s\n' "$*"; }
@@ -56,11 +57,11 @@ ensure_deps() {
   cd "$APP_DIR"
   if [ ! -d node_modules ]; then
     c_info "installing dependencies (npm install) ..."
-    npm install || { c_err "npm install failed"; exit 1; }
-    c_ok "dependencies installed"
   else
-    c_ok "dependencies present"
+    c_info "checking dependencies (npm install) ..."
   fi
+  npm install || { c_err "npm install failed"; exit 1; }
+  c_ok "dependencies installed"
 }
 
 open_browser() {
@@ -125,21 +126,86 @@ override_windows_toolchain() {
 }
 
 # Decide whether a rebuild is needed (mirrors needs-rebuild.ps1):
-# rebuild if the binary is missing, or any source/config file is newer than it.
-sources_newer_than_exe() {
+# rebuild if the binary is missing, no build fingerprint exists, or source
+# content changed. This survives copying files from another machine with older
+# timestamps.
+hash_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  else shasum -a 256
+  fi
+}
+
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+source_files() {
+  find "$APP_DIR/src" "$APP_DIR/cli" "$APP_DIR/scripts" "$APP_DIR/public" \
+       "$TAURI_DIR/src" "$TAURI_DIR/capabilities" "$TAURI_DIR/resources" "$TAURI_DIR/icons" \
+       -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' \
+                  -o -name '*.mjs' -o -name '*.cjs' -o -name '*.json' \
+                  -o -name '*.css' -o -name '*.html' -o -name '*.rs' \
+                  -o -name '*.toml' -o -name '*.svg' -o -name '*.png' \
+                  -o -name '*.ico' -o -name '*.icns' -o -name '*.md' \) \
+       -print 2>/dev/null
+
+  for file in \
+    "$APP_DIR/index.html" \
+    "$APP_DIR/package.json" \
+    "$APP_DIR/package-lock.json" \
+    "$APP_DIR/vite.config.ts" \
+    "$APP_DIR/vite.config.js" \
+    "$APP_DIR/tailwind.config.ts" \
+    "$APP_DIR/postcss.config.js" \
+    "$APP_DIR/tsconfig.json" \
+    "$APP_DIR/tsconfig.node.json" \
+    "$APP_DIR/tsconfig.cli.json" \
+    "$TAURI_DIR/tauri.conf.json" \
+    "$TAURI_DIR/tauri.macos.conf.json" \
+    "$TAURI_DIR/tauri.linux.conf.json" \
+    "$TAURI_DIR/Cargo.toml" \
+    "$TAURI_DIR/Cargo.lock" \
+    "$TAURI_DIR/rust-toolchain.toml" \
+    "$TAURI_DIR/build.rs" \
+    "$TAURI_DIR/app-icon.svg" \
+    "$TAURI_DIR/app-icon-round.svg" \
+    "$SCRIPT_DIR/build.bat" \
+    "$SCRIPT_DIR/run.bat" \
+    "$SCRIPT_DIR/run.sh"; do
+    [ -f "$file" ] && printf '%s\n' "$file"
+  done
+}
+
+source_fingerprint() {
+  source_files | sort -u | while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    rel="${file#$SCRIPT_DIR/}"
+    printf '%s\t%s\n' "$rel" "$(hash_file "$file")"
+  done | hash_stream | awk '{print $1}'
+}
+
+stored_fingerprint() {
+  [ -f "$STAMP" ] || return 0
+  sed -n 's/^fingerprint=//p' "$STAMP" | head -n 1
+}
+
+write_build_fingerprint() {
+  mkdir -p "$(dirname "$STAMP")"
+  {
+    printf 'version=2\n'
+    printf 'fingerprint=%s\n' "$(source_fingerprint)"
+    printf 'writtenAt=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'exe=%s\n' "$EXE"
+  } > "$STAMP"
+  c_ok "build fingerprint saved: $STAMP"
+}
+
+source_changed_since_build() {
   [ -f "$EXE" ] || return 0   # no binary yet -> needs build
-  local newer
-  newer="$(find "$APP_DIR/src" "$TAURI_DIR/src" \
-              "$APP_DIR/index.html" "$APP_DIR/vite.config.ts" \
-              "$APP_DIR/tailwind.config.ts" "$TAURI_DIR/tauri.conf.json" \
-              "$TAURI_DIR/tauri.macos.conf.json" "$TAURI_DIR/tauri.linux.conf.json" \
-              "$TAURI_DIR/Cargo.toml" "$TAURI_DIR/rust-toolchain.toml" \
-              "$TAURI_DIR/capabilities/default.json" \
-              -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.rs' \
-                         -o -name '*.css' -o -name '*.html' -o -name '*.json' \
-                         -o -name '*.toml' \) \
-              -newer "$EXE" -print 2>/dev/null | head -n 1)"
-  [ -n "$newer" ]
+  [ -f "$STAMP" ] || return 0 # no fingerprint yet -> needs build
+  [ "$(source_fingerprint)" != "$(stored_fingerprint)" ]
 }
 
 # Decide whether we need to build, before requiring Rust — so `run` with an
@@ -154,8 +220,8 @@ case "$MODE" in
     if [ ! -f "$EXE" ]; then
       c_info "no built app yet — first build required."
       NEED_BUILD=1
-    elif sources_newer_than_exe; then
-      c_info "sources newer than the app — will rebuild."
+    elif source_changed_since_build; then
+      c_info "source changed since last build — will rebuild."
       NEED_BUILD=1
     else
       c_ok "app up to date — skip build."
@@ -206,6 +272,7 @@ build_native() {
   echo "------------------------------------------------------------"
   ( cd "$APP_DIR" && npm run tauri -- build --no-bundle ) || { c_err "build failed — see errors above"; exit 1; }
   [ -f "$EXE" ] || { c_err "build finished but binary not found at $EXE"; exit 1; }
+  write_build_fingerprint
   c_ok "build done: $EXE"
 }
 

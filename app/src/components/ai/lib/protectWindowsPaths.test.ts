@@ -3,11 +3,11 @@ import { protectWindowsPaths } from './protectWindowsPaths';
 
 // Build backslash-bearing strings without fighting source-escaping noise.
 const B = String.fromCharCode(92);
-const winPath = `E:${B}OpenWorkflow${B}.omc${B}clipboard-images${B}shot.png`;
+const winPath = `E:${B}OpenWorkflow${B}.freeultracode${B}clipboard-images${B}shot.png`;
 
 describe('protectWindowsPaths', () => {
   it('returns input unchanged when there is no backslash', () => {
-    const md = 'see .omc/clipboard-images/shot.png here';
+    const md = 'see .freeultracode/clipboard-images/shot.png here';
     expect(protectWindowsPaths(md)).toBe(md);
   });
 
@@ -35,7 +35,7 @@ describe('protectWindowsPaths', () => {
     expect(protectWindowsPaths(md)).toBe(md);
   });
 
-  it('protects a path token that ends a sentence with .omc segment', () => {
+  it('protects a path token that ends a sentence with .freeultracode segment', () => {
     const out = protectWindowsPaths(`图片 ${winPath} 完成`);
     expect(out.replace(/\\\\/g, '\\')).toContain(winPath);
   });
